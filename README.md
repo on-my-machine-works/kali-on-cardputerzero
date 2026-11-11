@@ -1,5 +1,9 @@
 # Kali Linux for M5Stack CardputerZero (`arm64`)
 
+[![Latest Release](https://img.shields.io/github/v/release/on-my-machine-works/kali-on-cardputerzero?label=release)](https://github.com/on-my-machine-works/kali-on-cardputerzero/releases/latest)
+[![Weekly Image Release](https://github.com/on-my-machine-works/kali-on-cardputerzero/actions/workflows/build.yml/badge.svg)](https://github.com/on-my-machine-works/kali-on-cardputerzero/actions/workflows/build.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 Reproducible **Kali Linux Rolling (`arm64`)** microSD image and build pipeline for the **M5Stack CardputerZero** handheld computer (Raspberry Pi Compute Module Zero Lite / `RP3A0` / Hardware Rev `v5`).
 
 Built on the [Kali Linux Custom Raspberry Pi Image](https://www.kali.org/docs/development/custom-raspberry-pi-image/) workflow (`mmdebstrap`/`debootstrap` -> sparse MBR `FAT32` + `ext4` image -> loop-mount chroot -> CM0 bootloader & Raspberry Pi `rpt-rpi-v8` kernel -> out-of-tree M5Stack hardware drivers & Device Tree overlays -> native `320x170` LCD utilities & `APPLaunch` integration).
@@ -7,6 +11,21 @@ Built on the [Kali Linux Custom Raspberry Pi Image](https://www.kali.org/docs/de
 ---
 
 ## Quick Start
+
+### Option 1: Flash Prebuilt Release Image *(Recommended)*
+
+1. Download `kali-cardputerzero-arm64.img.xz` and `kali-cardputerzero-arm64.img.xz.sha256` from [**Releases**](https://github.com/on-my-machine-works/kali-on-cardputerzero/releases/latest).
+2. Flash to a **16 GB+ microSD card**:
+   - **GUI**: **Raspberry Pi Imager** (*Choose OS -> Use custom*, and **skip OS customization** so `config.txt` / `cmdline.txt` remain intact) or **BalenaEtcher**.
+   - **CLI (Linux / macOS)**:
+     ```bash
+     sha256sum -c kali-cardputerzero-arm64.img.xz.sha256
+     xzcat kali-cardputerzero-arm64.img.xz | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync
+     sync
+     ```
+3. Insert the microSD card and power on (first boot automatically expands the root filesystem). Default login: **`kali` / `kali`**.
+
+### Option 2: Build From Source
 
 [`build-kali-cardputerzero.sh`](build-kali-cardputerzero.sh), [`upstream.lock.json`](upstream.lock.json), [`src/`](src), and [`scripts/`](scripts) are self-contained—all Kali, Raspberry Pi, Debian, and M5Stack packages/commits are resolved and cryptographically verified automatically into `cache/`.
 
@@ -23,7 +42,7 @@ sudo apt install -y qemu-user-static binfmt-support arch-test
 # 2. Build, verify, finalize & compress:
 sudo ./build-kali-cardputerzero.sh
 ```
-Output is written to `output/kali-cardputerzero-arm64.img.xz` (+ `.img` and `.sha256`).
+Output is written to `output/kali-cardputerzero-arm64.img.xz` (+ `.img` and `.sha256`). To build or test only the native `320x170` C utilities standalone, run `make -C src && make -C src check`.
 
 ---
 
@@ -56,6 +75,7 @@ Every onboard component and expansion bus of the CardputerZero is configured and
 - [`build-kali-cardputerzero.sh`](build-kali-cardputerzero.sh) — Stage-resumable Kali ARM64 image builder, verifier, SD flasher, and SSH key deployer.
 - [`upstream.lock.json`](upstream.lock.json) — Verified lockfile for M5Stack kernel manifests, driver commits, and `.deb` releases used for per-component fallback.
 - [`scripts/resolve-upstream.py`](scripts/resolve-upstream.py) — Resolves `InRelease`-verified Kali/RPi/Debian APT packages and validates M5Stack upstream updates with automatic fallback to `upstream.lock.json`.
+- [`src/Makefile`](src/Makefile) — Standalone build, `320x170` headless render self-test (`make check`), and `install` rules for the native C apps and framebuffer shim.
 - [`src/cz_ui.h`](src/cz_ui.h) — Shared `320x170` RGB565 framebuffer UI toolkit with `st_rdev`-deduplicated `evdev` input, battery/clock header, and physical **`4`–`8` bottom softkey bar** (`x = 48, 104, 160, 216, 272` px).
 - [`src/cz-wifiscan.c`](src/cz-wifiscan.c) — **`WiFiScan`**: Native `320x170` wireless AP analyzer, 2.4G/5G channel occupancy graph, `wlan0`/`wlan1` switcher, and `monstart`/`monstop` toggle.
 - [`src/cz-term80.c`](src/cz-term80.c) — **`Term80x24`**: Native `80x24` (`4x7` cell) `xterm-256color`/truecolor PTY terminal emulator for full-screen TUIs (`btop`, `htop`, `kismet`, `nmtui`, `tmux`) on the 1.9" LCD.
@@ -104,6 +124,9 @@ You can also flash `kali-cardputerzero-arm64.img.xz` using **Raspberry Pi Imager
 - **Username**: `kali`
 - **Password**: `kali` (passwordless `sudo` enabled)
 - **Hostname**: `kali-cardputerzero` (`ssh kali@kali-cardputerzero.local`)
+
+> [!IMPORTANT]
+> Matching official Kali Linux ARM images, the SSH server and passwordless `sudo` are enabled out of the box with the default credentials `kali` / `kali`. Run `passwd` on first login (and optionally disable password SSH logins in `/etc/ssh/sshd_config`) before connecting to untrusted networks.
 
 ---
 
@@ -209,3 +232,10 @@ sudo ./build-kali-cardputerzero.sh finalize compress
 ```
 
 > **Upgrading Packages on Device**: `sudo apt update && sudo apt full-upgrade` is safe to run — the Raspberry Pi kernel, `raspi-firmware`, and CM0 wireless firmware packages are pinned and held so `apt` preserves the out-of-tree CardputerZero `.ko` modules and `wlan0`/`hci0` firmware.
+
+---
+
+## 7. License
+
+- The build scripts, configuration utilities, and native `320x170` C applications in this repository are released under the [**MIT License**](LICENSE).
+- Generated microSD images distribute operating system packages, kernel modules, drivers, firmware, and applications from **Kali Linux**, **Debian**, **Raspberry Pi**, and **M5Stack** under their respective upstream licenses (including `GPL-2.0`, `GPL-3.0`, `LGPL`, `BSD-3-Clause`, `MIT`, and redistributable hardware firmware licenses).
