@@ -1,0 +1,218 @@
+{
+  "schema_version": 1,
+  "pigen": {
+    "repo": "CardputerZero/pi-gen",
+    "branch": "cardputerzero_v1.0",
+    "commit": "791a985d4efca7327ae1fdb6c48230ac0d1ee1bc",
+    "assets": {
+      "stage0/02-firmware/files/kernel.pref": "a5de6a4e9b8fe512ea479ae1c7bc64a584cad394b79d7719b718c7ff2bfac084",
+      "stage2/05-cardputerzero/files/splash.bmp": "21466ad04871484b878dc18b409a61ba97e5e08880a0e48f35f3f7420a270091",
+      "stage2/05-cardputerzero/files/fb-mirror.py": "f10e719380975375ea9cbf0ae118ca575495e884d1442e521bae354697f5f833",
+      "stage2/05-cardputerzero/files/fb-mirror.desktop": "6ddf944f334f2a3211dfffee4b053411c9c9848a31f3467141924c663adf76a9",
+      "stage2/05-cardputerzero/files/20-rtkit-direct.conf": "445a196fad82d1a8bde8c52557ffe60810cd181fb03f936fe0b388dcd71934a9",
+      "stage2/05-cardputerzero/files/20-rtkit-order.conf": "2657764fd14feac5389f0e409381497fc9dec1e6ccbb2308bddc67c1e8ea9af5",
+      "stage2/05-cardputerzero/files/20-audio-rlimits.conf": "2dc1ea649c75ce97726380651e5044edf0e203351cc9f243ab9935088ba005b0",
+      "stage2/05-cardputerzero/files/50-cardputerzero-default-volume.conf": "144e80d6242a074f3a6c03c3d51d6be761ad39b25ea52047de11c7dca7b452ca"
+    }
+  },
+  "kernel": {
+    "kver": "6.18.39+rpt-rpi-v8",
+    "pool_base": "https://archive.raspberrypi.com/debian/pool/main/l/linux",
+    "debs": [
+      {
+        "filename": "linux-base-6.18.39+rpt-rpi-v8_6.18.39-1+rpt1_arm64.deb",
+        "sha256": "cead9306c9f655af09cb5517477113406b070e26e55f167704e6ba45e4582370"
+      },
+      {
+        "filename": "linux-base-rpi-v8_6.18.39-1+rpt1_arm64.deb",
+        "sha256": "cde690792efd906ce1c3fac9a2c4e82d79a654704ccce65da25db9688b25206f"
+      },
+      {
+        "filename": "linux-headers-6.18.39+rpt-common-rpi_6.18.39-1+rpt1_all.deb",
+        "sha256": "5904d2c6a3e8fafe75ce3d53d86220b8057290d86cb95a96ad787a6900f4b344"
+      },
+      {
+        "filename": "linux-headers-6.18.39+rpt-rpi-v8_6.18.39-1+rpt1_arm64.deb",
+        "sha256": "e5e5619d9d048dd43ec5db90a09aeb563596a7b1c4d2bbeeae3f69cec1301813"
+      },
+      {
+        "filename": "linux-headers-rpi-v8_6.18.39-1+rpt1_arm64.deb",
+        "sha256": "9c2a7f10a09f24d4dd1fcacbf1e12d8eb00342a86d989e2d75090bd35f3cb149"
+      },
+      {
+        "filename": "linux-image-6.18.39+rpt-rpi-v8_6.18.39-1+rpt1_arm64.deb",
+        "sha256": "b007b959f853ca4d26c53d42d166ca7e8619a31f885d52b334c4cab557965265"
+      },
+      {
+        "filename": "linux-image-rpi-v8_6.18.39-1+rpt1_arm64.deb",
+        "sha256": "b46b50c6167f5cef33a5ecf7f5555daaa25551fa032d4c2cab2525da7dcd8406"
+      },
+      {
+        "filename": "linux-kbuild-6.18.39+rpt_6.18.39-1+rpt1_arm64.deb",
+        "sha256": "e3deb75129c67f0eafe5cec64eccc7ec4601890c25788487209fec1a3f605dad"
+      }
+    ]
+  },
+  "dtoverlays": {
+    "repo": "m5stack/m5stack-linux-dtoverlays",
+    "branch": "main",
+    "commit": "4f7aeee9fc103ebb03d22cac476bb191ecfb321e"
+  },
+  "apps": [
+    {
+      "slug": "launcher",
+      "pkg_name": "applaunch",
+      "repos": [
+        "CardputerZero/launcher"
+      ],
+      "asset_regex": "^applaunch_.+_arm64\\.deb$",
+      "locked": {
+        "tag": "launcher-v0.6.105",
+        "filename": "applaunch_0.6.105-m5stack1_arm64.deb",
+        "url": "https://github.com/CardputerZero/launcher/releases/download/launcher-v0.6.105/applaunch_0.6.105-m5stack1_arm64.deb",
+        "sha256": "a38cffde9cb4d60f4ff2d6c95323c64f66cc705fdf315b0550e123ca7b5a9544"
+      }
+    },
+    {
+      "slug": "camera",
+      "pkg_name": "camera",
+      "repos": [
+        "CardputerZero/CameraApp",
+        "CardputerZero/Camera"
+      ],
+      "asset_regex": "^(CameraApp|Camera)_[^/]+_m5stack1_arm64\\.deb$",
+      "locked": {
+        "tag": "v1.0.3",
+        "filename": "Camera_1.0.3_m5stack1_arm64.deb",
+        "url": "https://github.com/CardputerZero/Camera/releases/download/v1.0.3/Camera_1.0.3_m5stack1_arm64.deb",
+        "sha256": "1f0f0394d3d850762db840ae4c0f3fc242c55b1eb8c8367fba0f8daa39f94330"
+      }
+    },
+    {
+      "slug": "compass",
+      "pkg_name": "m5cardputerzero-compass",
+      "repos": [
+        "CardputerZero/Compass"
+      ],
+      "asset_regex": "^m5cardputerzero-compass_[^/]+_m5stack1_arm64\\.deb$",
+      "locked": {
+        "tag": "v1.0.0",
+        "filename": "m5cardputerzero-compass_0.2.4_m5stack1_arm64.deb",
+        "url": "https://github.com/CardputerZero/Compass/releases/download/v1.0.0/m5cardputerzero-compass_0.2.4_m5stack1_arm64.deb",
+        "sha256": "11ab1e4a0a1089dd48ae5c5c73248ea9d289b321c457bff225ae41c9529270bc"
+      }
+    },
+    {
+      "slug": "ir-chat",
+      "pkg_name": "m5cardputerzero-ir-chat",
+      "repos": [
+        "CardputerZero/IR-Chat"
+      ],
+      "asset_regex": "^m5cardputerzero-ir-chat_[^/]+_m5stack1_arm64\\.deb$",
+      "locked": {
+        "tag": "v1.0.0",
+        "filename": "m5cardputerzero-ir-chat_0.1.3_m5stack1_arm64.deb",
+        "url": "https://github.com/CardputerZero/IR-Chat/releases/download/v1.0.0/m5cardputerzero-ir-chat_0.1.3_m5stack1_arm64.deb",
+        "sha256": "aa1ed146b088f6c9bb52c9328614b01e018cb8d9014ee083651ed404c64210cd"
+      }
+    },
+    {
+      "slug": "ir-remote",
+      "pkg_name": "m5cardputerzero-ir-remote",
+      "repos": [
+        "CardputerZero/IR-Remote"
+      ],
+      "asset_regex": "^m5cardputerzero-ir-remote_[^/]+_m5stack1_arm64\\.deb$",
+      "locked": {
+        "tag": "v1.0.0",
+        "filename": "m5cardputerzero-ir-remote_0.1.4_m5stack1_arm64.deb",
+        "url": "https://github.com/CardputerZero/IR-Remote/releases/download/v1.0.0/m5cardputerzero-ir-remote_0.1.4_m5stack1_arm64.deb",
+        "sha256": "10be7020d2f2e3cd7cf0c5ede98443f8940efbfffb4aba801b87329409d67137"
+      }
+    },
+    {
+      "slug": "cap-cc1101-nfc",
+      "pkg_name": "m5cardputerzero-cap-cc1101-nfc",
+      "repos": [
+        "CardputerZero/Cap-CC1101-NFC"
+      ],
+      "asset_regex": "^[Cc]ap-[Cc][Cc]1101-[Nn][Ff][Cc].*_m5stack1_arm64\\.deb$|^m5cardputerzero-cap-cc1101-nfc_[^/]+_m5stack1_arm64\\.deb$",
+      "locked": {
+        "tag": "v1.0.1",
+        "filename": "m5cardputerzero-cap-cc1101-nfc_1.0.1_m5stack1_arm64.deb",
+        "url": "https://github.com/CardputerZero/Cap-CC1101-NFC/releases/download/v1.0.1/m5cardputerzero-cap-cc1101-nfc_1.0.1_m5stack1_arm64.deb",
+        "sha256": "d779d4949741a6fd6d5f005c7e29efd768996ceeb39c187c8008548d9fdd8095"
+      }
+    },
+    {
+      "slug": "cap-cc1101-subg-chat",
+      "pkg_name": "m5cardputerzero-cap-cc1101-subg-chat",
+      "repos": [
+        "CardputerZero/Cap-CC1101-SubG-Chat"
+      ],
+      "asset_regex": "^[Cc]ap-[Cc][Cc]1101-[Ss]ub[Gg]-[Cc]hat.*_m5stack1_arm64\\.deb$|^m5cardputerzero-cap-cc1101-subg-chat_[^/]+_m5stack1_arm64\\.deb$",
+      "locked": {
+        "tag": "v1.0.1",
+        "filename": "m5cardputerzero-cap-cc1101-subg-chat_1.0.1_m5stack1_arm64.deb",
+        "url": "https://github.com/CardputerZero/Cap-CC1101-SubG-Chat/releases/download/v1.0.1/m5cardputerzero-cap-cc1101-subg-chat_1.0.1_m5stack1_arm64.deb",
+        "sha256": "8ba26d9a513488673b5e8d9c3af5bc1ec6a04a4c3f859d256e420ee425e8c534"
+      }
+    },
+    {
+      "slug": "recorder",
+      "pkg_name": "m5cardputerzero-recorder",
+      "repos": [
+        "CardputerZero/Recorder"
+      ],
+      "asset_regex": "^m5cardputerzero-recorder_[^/]+_m5stack1_arm64\\.deb$",
+      "locked": {
+        "tag": "v1.0.0",
+        "filename": "m5cardputerzero-recorder_0.1.8_m5stack1_arm64.deb",
+        "url": "https://github.com/CardputerZero/Recorder/releases/download/v1.0.0/m5cardputerzero-recorder_0.1.8_m5stack1_arm64.deb",
+        "sha256": "ed3fb90fbf84097138d0d30c11eaa132a4f8695ece4bec48ca2a1f8ea04727e7"
+      }
+    },
+    {
+      "slug": "files",
+      "pkg_name": "m5cardputerzero-files",
+      "repos": [
+        "CardputerZero/Files"
+      ],
+      "asset_regex": "^m5cardputerzero-files_[^/]+_m5stack1_arm64\\.deb$",
+      "locked": {
+        "tag": "v1.0.2",
+        "filename": "m5cardputerzero-files_1.0.2_m5stack1_arm64.deb",
+        "url": "https://github.com/CardputerZero/Files/releases/download/v1.0.2/m5cardputerzero-files_1.0.2_m5stack1_arm64.deb",
+        "sha256": "6994a3f2b1152beb9cc734808103e7d59cb7c7b63856f95c836c401511b8c060"
+      }
+    },
+    {
+      "slug": "cap-lora-1262",
+      "pkg_name": "m5cardputerzero-cap-lora-1262",
+      "repos": [
+        "CardputerZero/Cap-LoRa-1262"
+      ],
+      "asset_regex": "^m5cardputerzero-cap-lora-1262_[^/]+_m5stack1_arm64\\.deb$",
+      "locked": {
+        "tag": "v1.0.1",
+        "filename": "m5cardputerzero-cap-lora-1262_1.0.1_m5stack1_arm64.deb",
+        "url": "https://github.com/CardputerZero/Cap-LoRa-1262/releases/download/v1.0.1/m5cardputerzero-cap-lora-1262_1.0.1_m5stack1_arm64.deb",
+        "sha256": "5238fa7e20a5c63e8eb4e3ff38d6ee730c797e2afdeebfd18da200584ef84f5c"
+      }
+    },
+    {
+      "slug": "cap-lora-1262-gps",
+      "pkg_name": "m5cardputerzero-cap-lora-1262-gps",
+      "repos": [
+        "CardputerZero/Cap-LoRa-1262-GPS"
+      ],
+      "asset_regex": "^[Cc]ap-[Ll]o[Rr]a-1262-[Gg][Pp][Ss].*_m5stack1_arm64\\.deb$|^m5cardputerzero-cap-lora-1262-gps_[^/]+_m5stack1_arm64\\.deb$",
+      "locked": {
+        "tag": "v1.0.0",
+        "filename": "m5cardputerzero-cap-lora-1262-gps_1.0.0_m5stack1_arm64.deb",
+        "url": "https://github.com/CardputerZero/Cap-LoRa-1262-GPS/releases/download/v1.0.0/m5cardputerzero-cap-lora-1262-gps_1.0.0_m5stack1_arm64.deb",
+        "sha256": "4da7984c97effa75c36ee6d4fd93e0ee49f251781586d5dc4542b09b0b88eaa7"
+      }
+    }
+  ]
+}
