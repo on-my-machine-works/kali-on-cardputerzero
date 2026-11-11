@@ -17,7 +17,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_BUNDLE="$(mktemp -d)"
 trap 'rm -rf "$TMP_BUNDLE"' EXIT
 
-cp "$SCRIPT_DIR/src/libcz_fb_lcd.c" \
+cp "$SCRIPT_DIR/src/Makefile" \
+   "$SCRIPT_DIR/src/libcz_fb_lcd.c" \
    "$SCRIPT_DIR/src/cz_ui.h" \
    "$SCRIPT_DIR/src/cz-sysmon.c" \
    "$SCRIPT_DIR/src/cz-term80.c" \
@@ -81,14 +82,7 @@ if [ "${#missing_pkgs[@]}" -gt 0 ]; then
 fi
 
 # 4. Compile native 320x170 RGB565 Kali LCD apps + helper scripts
-gcc -O2 -Wall -Wextra -shared -fPIC libcz_fb_lcd.c -o /usr/lib/cz-kali/libcz_fb_lcd.so -ldl
-chmod 755 /usr/lib/cz-kali/libcz_fb_lcd.so
-for app in cz-sysmon cz-term80 cz-wifiscan cz-lanscan cz-pktsniff cz-usbgadget; do
-    extra=""
-    [ "$app" = "cz-term80" ] && extra="-lutil"
-    gcc -O2 -Wall -Wextra -Werror -I. "${app}.c" -o "/usr/local/bin/${app}" $extra
-    chmod 755 "/usr/local/bin/${app}"
-done
+make install
 install -m 755 cz-kali-menu  /usr/local/bin/cz-kali-menu
 install -m 755 cz-kali-pkgs  /usr/local/bin/cz-kali-pkgs
 install -m 755 cz-usb-gadget /usr/local/bin/cz-usb-gadget

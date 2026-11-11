@@ -6,3 +6,14 @@
 # Python bytecode
 __pycache__/
 *.py[cod]
+
+# Local C build artifacts & OS metadata
+*.o
+*.so
+/src/cz-sysmon
+/src/cz-term80
+/src/cz-wifiscan
+/src/cz-lanscan
+/src/cz-pktsniff
+/src/cz-usbgadget
+.DS_Store

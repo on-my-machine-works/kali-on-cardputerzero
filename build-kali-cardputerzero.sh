@@ -867,7 +867,7 @@ CHROOT
     local stage="$MNT_ROOT/var/cache/cz-build/apps"
     rm -rf "$stage"
     mkdir -p "$stage/active" "$stage/locked" "$MNT_ROOT/usr/src/cz-kali"
-    cp -f "$SCRIPT_DIR/src/libcz_fb_lcd.c" "$MNT_ROOT/usr/src/cz-kali/libcz_fb_lcd.c"
+    cp -f "$SCRIPT_DIR/src/Makefile" "$SCRIPT_DIR/src/libcz_fb_lcd.c" "$MNT_ROOT/usr/src/cz-kali/"
 
     local bsp_install=()
     for pkg in raspi-utils-core raspi-utils-dt libgpiolib0 libdtovl0; do
@@ -960,15 +960,14 @@ if [ ! -f /usr/lib/cz-kali/camera_app.real ]; then
 fi
 
 # Build libcz_fb_lcd.so framebuffer redirect helper
-gcc -O2 -Wall -Wextra -shared -fPIC /usr/src/cz-kali/libcz_fb_lcd.c -o /usr/lib/cz-kali/libcz_fb_lcd.so -ldl
-chmod 755 /usr/lib/cz-kali/libcz_fb_lcd.so
+make -C /usr/src/cz-kali install-shim
 
 # Keep ADB off by default at boot (can be toggled in APPLaunch -> Settings -> ADB)
 systemctl disable cardputer-adb-hotplug.service adbd.service 2>/dev/null || true
 rm -f /etc/systemd/system/multi-user.target.wants/cardputer-adb-hotplug.service \
       /etc/systemd/system/multi-user.target.wants/adbd.service
 
-rm -rf /var/cache/cz-build/apps /usr/src/cz-kali/libcz_fb_lcd.c
+rm -rf /var/cache/cz-build/apps /usr/src/cz-kali
 apt-get clean
 CHROOT
 
@@ -1037,7 +1036,8 @@ stage_launcher() {
     install -m 755 "$SCRIPT_DIR/scripts/cz-kali-menu"  "$MNT_ROOT/usr/local/bin/cz-kali-menu"
     install -m 755 "$SCRIPT_DIR/scripts/cz-kali-pkgs"  "$MNT_ROOT/usr/local/bin/cz-kali-pkgs"
 
-    cp -f "$SCRIPT_DIR/src/cz_ui.h" \
+    cp -f "$SCRIPT_DIR/src/Makefile" \
+          "$SCRIPT_DIR/src/cz_ui.h" \
           "$SCRIPT_DIR/src/cz-sysmon.c" \
           "$SCRIPT_DIR/src/cz-term80.c" \
           "$SCRIPT_DIR/src/cz-wifiscan.c" \
@@ -1048,12 +1048,7 @@ stage_launcher() {
 
     run_chroot <<'CHROOT'
 set -e
-for app in cz-sysmon cz-term80 cz-wifiscan cz-lanscan cz-pktsniff cz-usbgadget; do
-    extra=""
-    [ "$app" = "cz-term80" ] && extra="-lutil"
-    gcc -O2 -Wall -Wextra -Werror -I/usr/src/cz-kali "/usr/src/cz-kali/${app}.c" -o "/usr/local/bin/${app}" $extra
-    chmod 755 "/usr/local/bin/${app}"
-done
+make -C /usr/src/cz-kali install-apps
 rm -rf /usr/src/cz-kali
 CHROOT
 
