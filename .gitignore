@@ -1,0 +1,8 @@
+# Build-time download cache, chroot mounts & generated disk images
+/cache/
+/work/
+/output/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
