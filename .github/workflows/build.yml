@@ -1,0 +1,180 @@
+name: Weekly Image Release
+
+on:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner image'
+        required: false
+        default: 'ubuntu-24.04-arm'
+        type: choice
+        options:
+          - ubuntu-24.04-arm
+          - ubuntu-24.04
+      m5_update_mode:
+        description: 'M5 upstream resolution mode'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - locked
+      keep_weekly_releases:
+        description: 'Recent weekly-* releases to retain (0 = keep all)'
+        required: false
+        default: '3'
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: weekly-kali-cardputerzero-release
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    name: Build and Release
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 150
+    env:
+      M5_UPDATE_MODE: ${{ inputs.m5_update_mode || 'auto' }}
+      KEEP_WEEKLY_RELEASES: ${{ inputs.keep_weekly_releases || '3' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Prepare runner disk space
+        run: |
+          avail_gb=$(df -BG / | awk 'NR==2 {gsub("G","",$4); print $4}')
+          if (( avail_gb < 28 )); then
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          fi
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          pkgs=(
+            parted dosfstools e2fsprogs util-linux rsync xz-utils zstd binutils
+            dpkg curl git gnupg kmod ca-certificates device-tree-compiler python3
+            mmdebstrap debootstrap zerofree
+          )
+          if [[ "$(uname -m)" != "aarch64" ]]; then
+            pkgs+=(qemu-user-static binfmt-support arch-test)
+          fi
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${pkgs[@]}"
+          sudo modprobe loop || true
+          if [[ "$(uname -m)" != "aarch64" ]]; then
+            sudo systemctl restart systemd-binfmt || sudo update-binfmts --enable qemu-aarch64 || true
+            arch-test arm64
+          fi
+
+      - name: Build, verify, finalize and compress image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sudo -E ./build-kali-cardputerzero.sh fetch rootfs image
+          sudo rm -rf work/rootfs
+          sudo -E ./build-kali-cardputerzero.sh kernel drivers packages apps launcher boot configs tweaks verify finalize compress
+          sudo chown -R "$(id -u):$(id -g)" output work upstream.lock.json
+          ls -lh output/
+
+      - name: Update upstream lockfile
+        id: lockfile
+        run: |
+          target_sha="${GITHUB_SHA}"
+          if [[ "${GITHUB_REF}" == "refs/heads/main" && "${M5_UPDATE_MODE}" == "auto" ]] && ! git diff --quiet -- upstream.lock.json; then
+            git config user.name "Lwrless"
+            git config user.email "happy.lwr@gmail.com"
+            git add upstream.lock.json
+            git commit -m "🔒 chore(deps): update verified upstream lockfile [skip ci]"
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              target_sha="$(git rev-parse HEAD)"
+            else
+              git reset --hard "${GITHUB_SHA}"
+            fi
+          fi
+          echo "target_sha=${target_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          date_slug="$(date -u +%Y.%m.%d)"
+          base_tag="weekly-${date_slug}"
+          tag="$base_tag"
+          suffix=2
+          while gh release view "$tag" >/dev/null 2>&1; do
+            tag="${base_tag}-${suffix}"
+            suffix=$((suffix + 1))
+          done
+
+          kver="$(python3 -c 'import json; print(json.load(open("upstream.lock.json"))["kernel"]["kver"])')"
+          xz_sha="$(awk '{print $1}' output/kali-cardputerzero-arm64.img.xz.sha256)"
+          raw_sha="$(awk '/kali-cardputerzero-arm64\.img$/{print $1}' output/kali-cardputerzero-arm64.img.sha256)"
+          xz_size="$(du -h output/kali-cardputerzero-arm64.img.xz | awk '{print $1}')"
+
+          cat <<'EOF' | sed \
+            -e "s|__TAG__|${tag}|g" \
+            -e "s|__KVER__|${kver}|g" \
+            -e "s|__XZ_SIZE__|${xz_size}|g" \
+            -e "s|__XZ_SHA__|${xz_sha}|g" \
+            -e "s|__RAW_SHA__|${raw_sha}|g" \
+            > /tmp/release-notes.md
+          ## Kali Linux (`arm64`) for M5Stack CardputerZero — `__TAG__`
+
+          Scheduled Kali Rolling (`arm64`) microSD image for **M5Stack CardputerZero (`v5` / CM0)** with **Linux `__KVER__`**, M5Stack hardware drivers and overlays, `APPLaunch` integration, and native `320x170` LCD utilities.
+
+          ### Checksums (`SHA-256`)
+          | File | Size | SHA-256 |
+          | :--- | :---: | :--- |
+          | `kali-cardputerzero-arm64.img.xz` | `__XZ_SIZE__` | `__XZ_SHA__` |
+          | `kali-cardputerzero-arm64.img` *(uncompressed)* | `7.0G` | `__RAW_SHA__` |
+
+          ### Verify & Flash
+          ```bash
+          sha256sum -c kali-cardputerzero-arm64.img.xz.sha256
+          xzcat kali-cardputerzero-arm64.img.xz | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync
+          ```
+          *(Default login: `kali` / `kali` — see `README.md` for LCD, HDMI Desktop, USB OTG Gadget, and External Wi-Fi usage.)*
+          EOF
+          sed -i 's/^          //' /tmp/release-notes.md
+
+          if [[ -s work/m5-warnings.md ]]; then
+            {
+              echo ""
+              echo "### Upstream Component Notes"
+              cat work/m5-warnings.md
+            } >> /tmp/release-notes.md
+          fi
+
+          gh release create "$tag" \
+            output/kali-cardputerzero-arm64.img.xz \
+            output/kali-cardputerzero-arm64.img.xz.sha256 \
+            --target "${{ steps.lockfile.outputs.target_sha }}" \
+            --title "Kali CardputerZero (${date_slug})" \
+            --notes-file /tmp/release-notes.md \
+            --latest
+
+      - name: Apply release retention policy
+        if: env.KEEP_WEEKLY_RELEASES != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          keep="${KEEP_WEEKLY_RELEASES}"
+          if ! [[ "$keep" =~ ^[0-9]+$ ]] || (( keep < 1 )); then
+            exit 0
+          fi
+
+          mapfile -t old_tags < <(
+            gh release list --limit 100 --json tagName,createdAt \
+              --jq '[.[] | select(.tagName | startswith("weekly-"))] | sort_by(.createdAt) | reverse | .['"$keep"':] | .[].tagName'
+          )
+
+          for old in "${old_tags[@]}"; do
+            [[ -n "$old" ]] || continue
+            gh release delete "$old" --yes --cleanup-tag
+          done
