@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# cz-kali-menu — Terminal quick-launch menu formatted for CardputerZero's
+# 320x170 LCD viewport (45 columns x 10 rows in APPLaunch).
+
+set -u
+
+toggle_led() {
+    local led="/sys/class/leds/$1/brightness"
+    if [[ ! -e "$led" ]]; then
+        echo "Rail $1 not present."
+        return
+    fi
+    local cur next
+    cur=$(cat "$led" 2>/dev/null || echo 0)
+    next=$(( cur == 0 ? 1 : 0 ))
+    echo "$next" > "$led" 2>/dev/null || sudo sh -c "echo $next > $led"
+    echo "$1 -> $next"
+}
+
+pause_key() {
+    read -r -n 1 -p "[Any key] " _ || true
+}
+
+wifi_join_compact() {
+    local cols
+    cols=$(tput cols 2>/dev/null || echo 45)
+    if (( cols >= 70 )) && command -v nmtui >/dev/null 2>&1; then
+        nmtui
+        return
+    fi
+    clear || true
+    echo "Scanning Wi-Fi..."
+    mapfile -t ssids < <(nmcli -t -f SSID,SIGNAL,SECURITY dev wifi list --rescan yes 2>/dev/null \
+        | awk -F: 'NF && $1!="" && !seen[$1]++ {printf "%s (%s%% %s)\n", $1, $2, ($3==""?"OPEN":$3)}' \
+        | head -n 6)
+    clear || true
+    if [[ ${#ssids[@]} -eq 0 ]]; then
+        echo "No APs found on wlan0."
+        pause_key
+        return
+    fi
+    local i=1
+    for s in "${ssids[@]}"; do
+        printf "%d) %.39s\n" "$i" "$s"
+        i=$((i + 1))
+    done
+    read -r -p "Pick [1-${#ssids[@]},q]: " idx || return
+    [[ "$idx" =~ ^[1-9]$ ]] || return
+    (( idx >= 1 && idx <= ${#ssids[@]} )) || return
+    local raw_ssid="${ssids[$((idx - 1))]}"
+    raw_ssid="${raw_ssid% (*}"
+    read -r -s -p "Pass (blank=open): " psk || true
+    echo ""
+    if [[ -n "$psk" ]]; then
+        sudo nmcli dev wifi connect "$raw_ssid" password "$psk" || true
+    else
+        sudo nmcli dev wifi connect "$raw_ssid" || true
+    fi
+    pause_key
+}
+
+# Every main screen renders in <= 8 lines x <= 44 chars so nothing scrolls off 45x10
+while true; do
+    clear || true
+    echo "=== KALI TOOLS [CardputerZero] ==="
+    echo "1)HW/Batt   2)WiFi Join  3)WiFi Scan"
+    echo "4)Wifite    5)Bettercap  6)Nmap Scan"
+    echo "7)BT Scan   8)GPS View   9)5V Rails"
+    echo "0)USB OTG   m)MonMode    y)SysMon GUI"
+    echo "b)btop 80x  p)Kali Pkgs  s)Zsh  q)Quit"
+    read -r -p "Select> " choice || exit 0
+    case "$choice" in
+        1)
+            clear
+            cz-hw-status | less -R
+            ;;
+        2)
+            wifi_join_compact
+            ;;
+        3)
+            clear
+            nmcli -f SSID,CHAN,SIGNAL,SECURITY dev wifi list --rescan yes 2>/dev/null \
+                | cut -c1-44 | less -S
+            ;;
+        4)
+            clear
+            sudo wifite
+            pause_key
+            ;;
+        5)
+            clear
+            sudo bettercap
+            ;;
+        6)
+            clear
+            subnet=$(ip -4 route show default 2>/dev/null | awk 'NR==1{print $3}' | sed 's/\.[0-9]*$/.0\/24/')
+            read -r -p "Net[${subnet:-192.168.1.0/24}]:" tgt
+            tgt="${tgt:-${subnet:-192.168.1.0/24}}"
+            sudo nmap -sn "$tgt" | less
+            ;;
+        7)
+            clear
+            bluetoothctl --timeout 5 scan on >/dev/null 2>&1 || true
+            bluetoothctl devices | cut -c1-44 | less
+            ;;
+        8)
+            clear
+            echo "Ctrl-C exits gpspipe"
+            gpspipe -r -n 20 2>/dev/null | cut -c1-44 || true
+            pause_key
+            ;;
+        9)
+            clear
+            g5=$(cat /sys/class/leds/grove_5v_out/brightness 2>/dev/null || echo "-")
+            e5=$(cat /sys/class/leds/ext_5v_out/brightness 2>/dev/null || echo "-")
+            gf=$(cat /sys/class/leds/grove_fun/brightness 2>/dev/null || echo "-")
+            echo "5V & Mux Rails:"
+            echo "a) grove_5v_out [$g5]"
+            echo "b) ext_5v_out   [$e5] (14P Cap)"
+            echo "c) grove_fun    [$gf] (0=I2C,1=UART)"
+            read -r -p "Toggle [a/b/c]: " rsel
+            case "$rsel" in
+                a) toggle_led grove_5v_out ;;
+                b) toggle_led ext_5v_out ;;
+                c) toggle_led grove_fun ;;
+            esac
+            pause_key
+            ;;
+        0)
+            clear
+            cz-usb-gadget status | head -n 5 | cut -c1-44
+            echo "n=Net(10.55.0.1) h=HID c=Combo o=Off"
+            read -r -p "USB Mode: " gmode
+            case "$gmode" in
+                n) sudo cz-usb-gadget net ;;
+                h) sudo cz-usb-gadget hid ;;
+                c) sudo cz-usb-gadget combo ;;
+                o) sudo cz-usb-gadget off ;;
+            esac
+            pause_key
+            ;;
+        m|M)
+            clear
+            echo "1) monstart   2) monstop"
+            read -r -p "Mode: " mm
+            case "$mm" in
+                1) sudo monstart ;;
+                2) sudo monstop ;;
+            esac
+            pause_key
+            ;;
+        y|Y)
+            /usr/local/bin/cz-sysmon || true
+            ;;
+        b|B)
+            /usr/local/bin/cz-term80 btop || btop || true
+            ;;
+        p|P)
+            /usr/local/bin/cz-kali-pkgs || true
+            ;;
+        h|H)
+            /usr/local/bin/cz-term80 htop || htop || true
+            ;;
+        s|S)
+            clear
+            exec /usr/bin/zsh -l
+            ;;
+        q|Q)
+            exit 0
+            ;;
+    esac
+done

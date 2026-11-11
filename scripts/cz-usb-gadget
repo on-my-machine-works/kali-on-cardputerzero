@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# cz-usb-gadget — Switchable USB OTG Gadget helper for M5Stack CardputerZero
+# Supports:
+#   net   — USB ECM/RNDIS Ethernet tether (10.55.0.1/24) over USB-C
+#   hid   — USB HID Keyboard + Mouse composite gadget (/dev/hidg0, /dev/hidg1)
+#   combo — USB Ethernet + HID Keyboard composite gadget
+#   off   — Tear down USB gadget and return USB mux to Host mode
+#   status — Show UDC, gadget, and ext_usb_gpio_fun mux state
+
+set -euo pipefail
+
+GADGET_DIR="/sys/kernel/config/usb_gadget/kali_cz"
+USB_MUX_LED="/sys/class/leds/ext_usb_gpio_fun/brightness"
+NET_CONN_NAME="kali-usb-gadget"
+USB_IP_CIDR="10.55.0.1/24"
+
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        exec sudo "$0" "$@"
+    fi
+}
+
+get_udc() {
+    if [[ -d /sys/class/udc ]]; then
+        ls /sys/class/udc 2>/dev/null | head -n 1 || true
+    fi
+}
+
+device_serial() {
+    if [[ -r /etc/machine-id ]]; then
+        printf "CZKALI-%s\n" "$(sha256sum < /etc/machine-id | cut -c1-8)"
+    else
+        printf "CZKALI-0001\n"
+    fi
+}
+
+teardown_gadget() {
+    if [[ -d "$GADGET_DIR" ]]; then
+        echo "" > "$GADGET_DIR/UDC" 2>/dev/null || true
+        rm -f "$GADGET_DIR/configs/c.1/ecm.usb0" \
+              "$GADGET_DIR/configs/c.1/rndis.usb0" \
+              "$GADGET_DIR/configs/c.1/hid.usb0" \
+              "$GADGET_DIR/configs/c.1/hid.usb1" 2>/dev/null || true
+        rmdir "$GADGET_DIR/configs/c.1/strings/0x409" 2>/dev/null || true
+        rmdir "$GADGET_DIR/configs/c.1" 2>/dev/null || true
+        rmdir "$GADGET_DIR/functions/ecm.usb0" \
+              "$GADGET_DIR/functions/rndis.usb0" \
+              "$GADGET_DIR/functions/hid.usb0" \
+              "$GADGET_DIR/functions/hid.usb1" 2>/dev/null || true
+        rmdir "$GADGET_DIR/strings/0x409" 2>/dev/null || true
+        rmdir "$GADGET_DIR" 2>/dev/null || true
+    fi
+    if command -v nmcli >/dev/null 2>&1; then
+        nmcli connection down "$NET_CONN_NAME" >/dev/null 2>&1 || true
+    fi
+}
+
+init_base_gadget() {
+    local product="$1" pid="$2"
+    modprobe libcomposite
+    mountpoint -q /sys/kernel/config || mount -t configfs none /sys/kernel/config
+
+    mkdir -p "$GADGET_DIR/strings/0x409" "$GADGET_DIR/configs/c.1/strings/0x409"
+    echo "0x1d6b" > "$GADGET_DIR/idVendor"   # Linux Foundation
+    echo "$pid"   > "$GADGET_DIR/idProduct"
+    echo "0x0100" > "$GADGET_DIR/bcdDevice"
+    echo "0x0200" > "$GADGET_DIR/bcdUSB"
+
+    device_serial > "$GADGET_DIR/strings/0x409/serialnumber"
+    echo "M5Stack"               > "$GADGET_DIR/strings/0x409/manufacturer"
+    echo "$product"              > "$GADGET_DIR/strings/0x409/product"
+    echo "Config 1: $product"    > "$GADGET_DIR/configs/c.1/strings/0x409/configuration"
+    echo 250                     > "$GADGET_DIR/configs/c.1/MaxPower"
+}
+
+add_ecm_func() {
+    mkdir -p "$GADGET_DIR/functions/ecm.usb0"
+    local serial
+    serial=$(device_serial)
+    local b1 b2
+    b1=$(printf "%s" "$serial" | sha256sum | cut -c1-2)
+    b2=$(printf "%s" "$serial" | sha256sum | cut -c3-4)
+    echo "02:55:00:00:${b1}:${b2}" > "$GADGET_DIR/functions/ecm.usb0/dev_addr"
+    echo "02:55:00:01:${b1}:${b2}" > "$GADGET_DIR/functions/ecm.usb0/host_addr"
+    ln -sf "$GADGET_DIR/functions/ecm.usb0" "$GADGET_DIR/configs/c.1/"
+}
+
+add_hid_kbd_func() {
+    mkdir -p "$GADGET_DIR/functions/hid.usb0"
+    echo 1 > "$GADGET_DIR/functions/hid.usb0/protocol"
+    echo 1 > "$GADGET_DIR/functions/hid.usb0/subclass"
+    echo 8 > "$GADGET_DIR/functions/hid.usb0/report_length"
+    # Standard 104-key boot keyboard HID report descriptor
+    printf '\x05\x01\x09\x06\xa1\x01\x05\x07\x19\xe0\x29\xe7\x15\x00\x25\x01\x75\x01\x95\x08\x81\x02\x95\x01\x75\x08\x81\x03\x95\x05\x75\x01\x05\x08\x19\x01\x29\x05\x91\x02\x95\x01\x75\x03\x91\x03\x95\x06\x75\x08\x15\x00\x25\x65\x05\x07\x19\x00\x29\x65\x81\x00\xc0' \
+        > "$GADGET_DIR/functions/hid.usb0/report_desc"
+    ln -sf "$GADGET_DIR/functions/hid.usb0" "$GADGET_DIR/configs/c.1/"
+}
+
+bind_udc() {
+    local udc
+    udc=$(get_udc)
+    if [[ -z "$udc" ]]; then
+        echo "ERROR: No USB Device Controller (/sys/class/udc) found. Ensure dtoverlay=dwc2 is active." >&2
+        exit 1
+    fi
+    # Switch external USB mux to device/OTG path if available
+    [[ -w "$USB_MUX_LED" ]] && echo 1 > "$USB_MUX_LED" || true
+    echo "$udc" > "$GADGET_DIR/UDC"
+}
+
+bring_up_usb0() {
+    sleep 1
+    if ip link show usb0 >/dev/null 2>&1; then
+        ip link set usb0 up
+        ip addr replace "$USB_IP_CIDR" dev usb0
+        echo "usb0 up at ${USB_IP_CIDR} (SSH to kali@10.55.0.1)"
+    fi
+}
+
+show_status() {
+    echo "UDC controller : $(get_udc || echo none)"
+    if [[ -r "$USB_MUX_LED" ]]; then
+        echo "USB mux GPIO   : $(cat "$USB_MUX_LED") (0=Host, 1=Device/Alt)"
+    fi
+    if [[ -d "$GADGET_DIR" ]]; then
+        echo "Kali gadget    : ACTIVE (UDC=$(cat "$GADGET_DIR/UDC" 2>/dev/null || echo unbound))"
+        ls -1 "$GADGET_DIR/configs/c.1" 2>/dev/null | grep -E '^(ecm|rndis|hid)\.' | sed 's/^/  function: /' || true
+    else
+        echo "Kali gadget    : INACTIVE"
+    fi
+    if ip -4 -br addr show usb0 >/dev/null 2>&1; then
+        ip -4 -br addr show usb0
+    fi
+}
+
+cmd="${1:-status}"
+case "$cmd" in
+    status)
+        show_status
+        ;;
+    net)
+        require_root "$@"
+        teardown_gadget
+        init_base_gadget "CardputerZero Kali USB Net" "0x0104"
+        add_ecm_func
+        bind_udc
+        bring_up_usb0
+        ;;
+    hid)
+        require_root "$@"
+        teardown_gadget
+        init_base_gadget "CardputerZero Kali HID" "0x0105"
+        add_hid_kbd_func
+        bind_udc
+        echo "HID keyboard gadget active at /dev/hidg0"
+        ;;
+    combo)
+        require_root "$@"
+        teardown_gadget
+        init_base_gadget "CardputerZero Kali Net+HID" "0x0106"
+        add_ecm_func
+        add_hid_kbd_func
+        bind_udc
+        bring_up_usb0
+        echo "Composite USB Net + HID gadget active (/dev/hidg0 + usb0)"
+        ;;
+    off)
+        require_root "$@"
+        teardown_gadget
+        [[ -w "$USB_MUX_LED" ]] && echo 0 > "$USB_MUX_LED" || true
+        echo "USB gadget disabled; mux returned to Host mode."
+        ;;
+    *)
+        echo "Usage: $0 {status|net|hid|combo|off}" >&2
+        exit 1
+        ;;
+esac

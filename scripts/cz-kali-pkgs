@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# cz-kali-pkgs — Kali Linux metapackage & toolset installer for CardputerZero.
+# Fits both the 45x10 LCD terminal and 80x24 / SSH / HDMI sessions.
+#
+# Usage:
+#   cz-kali-pkgs                         # Interactive menu
+#   cz-kali-pkgs list                    # List presets and free disk space
+#   sudo cz-kali-pkgs install <preset>   # wireless|top10|sniff|hardware|webpass|headless|default|<pkg...>
+#   sudo cz-kali-pkgs upgrade            # Safe apt full-upgrade (preserves CM0 kernel/fw holds)
+
+set -uo pipefail
+
+HEAVY_BOOT_SERVICES=(
+    apache2.service
+    mariadb.service
+    mysql.service
+    postgresql.service
+    smbd.service
+    nmbd.service
+    snmpd.service
+    atftpd.service
+    openvpn.service
+    dnsmasq.service
+    hostapd.service
+)
+
+free_gb() {
+    df -BG / | awk 'NR==2 {gsub("G","",$4); print $4}'
+}
+
+free_human() {
+    df -h / | awk 'NR==2 {print $4}'
+}
+
+pause_key() {
+    read -r -n 1 -p "[Any key] " _ || true
+    echo ""
+}
+
+ensure_kernel_holds() {
+    local hold_list=()
+    while read -r p; do
+        [[ -n "$p" ]] && hold_list+=("$p")
+    done < <(dpkg-query -W -f='${Package}\n' 'linux-image-*rpt*' 'linux-headers-*rpt*' 'raspi-firmware' 2>/dev/null || true)
+    if [[ ${#hold_list[@]} -gt 0 ]]; then
+        sudo apt-mark hold "${hold_list[@]}" >/dev/null 2>&1 || true
+    fi
+}
+
+disable_heavy_boot_daemons() {
+    local svc
+    for svc in "${HEAVY_BOOT_SERVICES[@]}"; do
+        if systemctl list-unit-files "$svc" >/dev/null 2>&1; then
+            sudo systemctl disable --now "$svc" >/dev/null 2>&1 || true
+        fi
+    done
+}
+
+resolve_preset() {
+    # Outputs: "<min_gb>|<package list>"
+    case "$1" in
+        1|wireless)
+            echo "2|kali-tools-802-11 kali-tools-bluetooth kali-tools-rfid python3-requests python3-scapy"
+            ;;
+        2|top10)
+            echo "3|kali-tools-top10 python3-requests"
+            ;;
+        3|sniff|sniffing)
+            echo "2|kali-tools-sniffing-spoofing python3-requests"
+            ;;
+        4|hardware|iot)
+            echo "2|kali-tools-hardware"
+            ;;
+        5|webpass|web)
+            echo "6|kali-tools-web kali-tools-passwords python3-requests"
+            ;;
+        6|headless)
+            echo "10|kali-linux-headless python3-requests"
+            ;;
+        7|default)
+            echo "15|kali-linux-default python3-requests"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+install_packages() {
+    local min_gb="$1"
+    shift
+    local pkgs=("$@")
+    local avail
+    avail="$(free_gb)"
+
+    if [[ "$avail" =~ ^[0-9]+$ ]] && (( avail < min_gb )); then
+        echo "[!] Low free space: ${avail}G (< ~${min_gb}G)"
+        read -r -p "Continue anyway? [y/N]: " ans || return 1
+        [[ "$ans" =~ ^[Yy]$ ]] || return 1
+    fi
+
+    echo "[*] Preserving CM0 kernel/firmware holds..."
+    ensure_kernel_holds
+
+    echo "[*] Updating APT package lists..."
+    sudo apt-get update
+
+    echo "[*] Installing: ${pkgs[*]}"
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" \
+        "${pkgs[@]}"
+    local rc=$?
+
+    disable_heavy_boot_daemons
+    sudo apt-get clean
+    if (( rc == 0 )); then
+        echo "[+] Done! Free SD space: $(free_human)"
+    else
+        echo "[!] apt exited with code $rc"
+    fi
+    return "$rc"
+}
+
+run_upgrade() {
+    echo "[*] Preserving CM0 kernel/firmware holds..."
+    ensure_kernel_holds
+    sudo apt-get update && \
+    sudo DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" && \
+    sudo apt-get autoremove -y && \
+    sudo apt-get clean
+    disable_heavy_boot_daemons
+    echo "[+] Upgrade complete (Free: $(free_human))"
+}
+
+launch_kali_tweaks() {
+    if ! command -v kali-tweaks >/dev/null 2>&1; then
+        install_packages 1 kali-tweaks || return
+    fi
+    local cols
+    cols="$(tput cols 2>/dev/null || echo 45)"
+    if (( cols < 75 )) && [[ -z "${DISPLAY:-}" && -x /usr/local/bin/cz-term80 && -e /dev/fb_lcd ]]; then
+        /usr/local/bin/cz-term80 kali-tweaks || kali-tweaks
+    else
+        kali-tweaks
+    fi
+}
+
+print_list() {
+    echo "Free space on /: $(free_human)"
+    echo "Presets:"
+    echo "  wireless  (~2G)  kali-tools-802-11, bluetooth, rfid, python3-requests"
+    echo "  top10     (~3G)  kali-tools-top10 (metasploit, sqlmap, hydra, john, wireshark...)"
+    echo "  sniff     (~2G)  kali-tools-sniffing-spoofing"
+    echo "  hardware  (~2G)  kali-tools-hardware"
+    echo "  webpass   (~6G)  kali-tools-web + kali-tools-passwords"
+    echo "  headless  (~10G) kali-linux-headless (full CLI Kali suite)"
+    echo "  default   (~15G) kali-linux-default  (full Kali desktop + CLI suite)"
+}
+
+case "${1:-menu}" in
+    -h|--help|help)
+        sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+        exit 0
+        ;;
+    list)
+        print_list
+        exit 0
+        ;;
+    upgrade)
+        run_upgrade
+        exit 0
+        ;;
+    install)
+        shift
+        [[ $# -gt 0 ]] || { print_list; exit 1; }
+        if spec="$(resolve_preset "$1")"; then
+            min_req="${spec%%|*}"
+            read -r -a preset_pkgs <<< "${spec#*|}"
+            install_packages "$min_req" "${preset_pkgs[@]}"
+        else
+            install_packages 1 "$@"
+        fi
+        exit $?
+        ;;
+    menu|"")
+        ;;
+    *)
+        echo "Unknown subcommand: $1 (try --help)" >&2
+        exit 1
+        ;;
+esac
+
+# Interactive menu formatted for <= 44 cols x <= 8 lines (fits 45x10 LCD)
+while true; do
+    clear || true
+    echo "=== KALI PACKAGES [Free: $(free_human)] ==="
+    echo "1)Wireless   2)Top10      3)Sniff/Spoof"
+    echo "4)Hardware   5)Web+Pass   6)Headless"
+    echo "7)Default    t)kali-tweaks u)AptUpgrade"
+    echo "c)CustomPkg  r)CleanCache q)Quit"
+    read -r -p "Select> " sel || exit 0
+    case "$sel" in
+        1|2|3|4|5|6|7)
+            clear || true
+            spec="$(resolve_preset "$sel")"
+            min_req="${spec%%|*}"
+            read -r -a preset_pkgs <<< "${spec#*|}"
+            echo "Preset #$sel (~${min_req}G): ${preset_pkgs[*]}"
+            read -r -p "Install now? [Y/n]: " ok_go || continue
+            if [[ -z "$ok_go" || "$ok_go" =~ ^[Yy]$ ]]; then
+                install_packages "$min_req" "${preset_pkgs[@]}" || true
+                pause_key
+            fi
+            ;;
+        t|T)
+            launch_kali_tweaks
+            ;;
+        u|U)
+            clear || true
+            run_upgrade || true
+            pause_key
+            ;;
+        c|C)
+            clear || true
+            read -r -p "Pkg(s)> " cpkgs || continue
+            if [[ -n "$cpkgs" ]]; then
+                read -r -a carr <<< "$cpkgs"
+                install_packages 1 "${carr[@]}" || true
+                pause_key
+            fi
+            ;;
+        r|R)
+            clear || true
+            sudo apt-get autoremove -y && sudo apt-get clean || true
+            echo "Free space: $(free_human)"
+            pause_key
+            ;;
+        q|Q)
+            exit 0
+            ;;
+    esac
+done

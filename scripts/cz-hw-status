@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# cz-hw-status — Hardware diagnostic & status check for CardputerZero on Kali Linux
+
+set -u
+
+printf "=== CardputerZero Kali Hardware Status ===\n"
+printf "Host/Kernel : %s (%s)\n" "$(hostname)" "$(uname -r)"
+if [[ -r /sys/class/thermal/thermal_zone0/temp ]]; then
+    t=$(cat /sys/class/thermal/thermal_zone0/temp)
+    printf "SoC Temp    : %d.%d C\n" "$((t/1000))" "$(((t%1000)/100))"
+fi
+printf "Memory      : %s\n" "$(free -m | awk '/^Mem:/{printf "%d/%d MiB used", $3, $2}')"
+printf "ZRAM Swap   : %s\n" "$(free -m | awk '/^Swap:/{printf "%d/%d MiB used", $3, $2}')"
+
+# Battery (BQ27220)
+for bat in /sys/class/power_supply/bq27220* /sys/class/power_supply/BAT*; do
+    [[ -d "$bat" ]] || continue
+    cap=$(cat "$bat/capacity" 2>/dev/null || echo "?")
+    stat=$(cat "$bat/status" 2>/dev/null || echo "?")
+    volt=$(cat "$bat/voltage_now" 2>/dev/null || echo "0")
+    printf "Battery     : %s%% (%s, %d mV)\n" "$cap" "$stat" "$((volt/1000))"
+    break
+done
+
+# Displays (LCD + HDMI)
+printf "SPI LCD     : %s\n" "$( [[ -e /dev/fb_lcd ]] && echo "OK (/dev/fb_lcd)" || echo "MISSING" )"
+printf "DRM Cards   : %s\n" "$(ls /dev/dri/card* 2>/dev/null | tr '\n' ' ' || echo "none")"
+
+# Keypad (TCA8418)
+printf "Keypad      : %s\n" "$( [[ -e /dev/input/cardputer-zero-internal ]] && echo "OK (/dev/input/cardputer-zero-internal)" || echo "MISSING" )"
+
+# Audio (ES8389 + PipeWire)
+printf "ALSA Cards  : %s\n" "$(awk '/\[/{print $2 $3}' /proc/asound/cards 2>/dev/null | tr '\n' ' ' || echo "none")"
+
+# Wireless (Wi-Fi + Bluetooth)
+printf "Network     : %s\n" "$(ip -4 -br addr show 2>/dev/null | awk '$1!="lo"{printf "%s=%s ", $1, ($3?$3:$2)}')"
+printf "Bluetooth   : %s\n" "$(hciconfig 2>/dev/null | awk '/^hci/{gsub(":","",$1); printf "%s ", $1}' || echo "none")"
+
+# Sensors (BMI270 + BMM150 IIO)
+iio_names=""
+for d in /sys/bus/iio/devices/iio:device*/name; do
+    [[ -r "$d" ]] && iio_names="${iio_names}$(cat "$d") "
+done
+printf "IIO Sensors : %s\n" "${iio_names:-none}"
+
+# RTC (RX8130)
+printf "RTC         : %s\n" "$( [[ -e /dev/rtc0 ]] && cat /sys/class/rtc/rtc0/name 2>/dev/null || echo "none" )"
+
+# Camera (IMX219)
+cam_subdevs=$(grep -l "imx219" /sys/class/video4linux/*/name 2>/dev/null | wc -l)
+printf "Camera      : %s\n" "$( (( cam_subdevs > 0 )) && echo "IMX219 detected" || echo "check media-ctl / v4l2" )"
+
+# Infrared (LIRC TX/RX)
+printf "Infrared    : %s\n" "$(ls /dev/lirc* 2>/dev/null | tr '\n' ' ' || echo "none")"
+
+# Expansion / Power Rails (M5IOE1)
+rails=""
+for r in grove_5v_out ext_5v_out grove_fun ext_usb_gpio_fun; do
+    [[ -r "/sys/class/leds/$r/brightness" ]] && rails="${rails}${r}=$(cat "/sys/class/leds/$r/brightness") "
+done
+printf "IOE1 Rails  : %s\n" "${rails:-none}"
+printf "SPI/I2C/TTY : %s\n" "$(ls /dev/spidev* /dev/i2c-* /dev/ttyS0 2>/dev/null | tr '\n' ' ' || echo "none")"
