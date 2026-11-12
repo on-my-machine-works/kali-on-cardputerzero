@@ -1,10 +1,20 @@
-name: Weekly Image Release
+name: Image Release
 
 on:
   schedule:
     - cron: '17 3 * * 1'
   workflow_dispatch:
     inputs:
+      release_tag:
+        description: 'Custom release tag (empty = vYYYY.MM.DD, schedule uses weekly-YYYY.MM.DD)'
+        required: false
+        default: ''
+        type: string
+      release_summary:
+        description: 'Optional release changelog line'
+        required: false
+        default: ''
+        type: string
       runner:
         description: 'Runner image'
         required: false
@@ -102,9 +112,17 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CUSTOM_TAG: ${{ inputs.release_tag || '' }}
+          RELEASE_SUMMARY: ${{ inputs.release_summary || '' }}
         run: |
           date_slug="$(date -u +%Y.%m.%d)"
-          base_tag="weekly-${date_slug}"
+          if [[ -n "${CUSTOM_TAG}" ]]; then
+            base_tag="${CUSTOM_TAG}"
+          elif [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            base_tag="weekly-${date_slug}"
+          else
+            base_tag="v${date_slug}"
+          fi
           tag="$base_tag"
           suffix=2
           while gh release view "$tag" >/dev/null 2>&1; do
@@ -112,36 +130,40 @@ jobs:
             suffix=$((suffix + 1))
           done
 
+          if [[ "$tag" == weekly-* ]]; then
+            rel_title="Kali CardputerZero (${date_slug})"
+          else
+            rel_title="Kali CardputerZero ${tag}"
+          fi
+
           kver="$(python3 -c 'import json; print(json.load(open("upstream.lock.json"))["kernel"]["kver"])')"
           xz_sha="$(awk '{print $1}' output/kali-cardputerzero-arm64.img.xz.sha256)"
           raw_sha="$(awk '/kali-cardputerzero-arm64\.img$/{print $1}' output/kali-cardputerzero-arm64.img.sha256)"
           xz_size="$(du -h output/kali-cardputerzero-arm64.img.xz | awk '{print $1}')"
 
-          cat <<'EOF' | sed \
-            -e "s|__TAG__|${tag}|g" \
-            -e "s|__KVER__|${kver}|g" \
-            -e "s|__XZ_SIZE__|${xz_size}|g" \
-            -e "s|__XZ_SHA__|${xz_sha}|g" \
-            -e "s|__RAW_SHA__|${raw_sha}|g" \
-            > /tmp/release-notes.md
-          ## Kali Linux (`arm64`) for M5Stack CardputerZero — `__TAG__`
-
-          Scheduled Kali Rolling (`arm64`) microSD image for **M5Stack CardputerZero (`v5` / CM0)** with **Linux `__KVER__`**, M5Stack hardware drivers and overlays, `APPLaunch` integration, and native `320x170` LCD utilities.
-
-          ### Checksums (`SHA-256`)
-          | File | Size | SHA-256 |
-          | :--- | :---: | :--- |
-          | `kali-cardputerzero-arm64.img.xz` | `__XZ_SIZE__` | `__XZ_SHA__` |
-          | `kali-cardputerzero-arm64.img` *(uncompressed)* | `7.0G` | `__RAW_SHA__` |
-
-          ### Verify & Flash
-          ```bash
-          sha256sum -c kali-cardputerzero-arm64.img.xz.sha256
-          xzcat kali-cardputerzero-arm64.img.xz | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync
-          ```
-          *(Default login: `kali` / `kali` — see `README.md` for LCD, HDMI Desktop, USB OTG Gadget, and External Wi-Fi usage.)*
-          EOF
-          sed -i 's/^          //' /tmp/release-notes.md
+          {
+            echo "## Kali Linux (\`arm64\`) for M5Stack CardputerZero (\`${tag}\`)"
+            echo ""
+            echo "Kali Rolling (\`arm64\`) microSD image for M5Stack CardputerZero (\`v5\` / CM0) with Linux \`${kver}\`, M5Stack hardware drivers and overlays, \`APPLaunch\` integration, and \`320x170\` LCD utilities."
+            if [[ -n "${RELEASE_SUMMARY}" ]]; then
+              echo ""
+              echo "### Changes"
+              echo "- ${RELEASE_SUMMARY}"
+            fi
+            echo ""
+            echo "### Checksums (\`SHA-256\`)"
+            echo "| File | Size | SHA-256 |"
+            echo "| :--- | :---: | :--- |"
+            echo "| \`kali-cardputerzero-arm64.img.xz\` | \`${xz_size}\` | \`${xz_sha}\` |"
+            echo "| \`kali-cardputerzero-arm64.img\` *(uncompressed)* | \`7.0G\` | \`${raw_sha}\` |"
+            echo ""
+            echo "### Verify & Flash"
+            echo '```bash'
+            echo "sha256sum -c kali-cardputerzero-arm64.img.xz.sha256"
+            echo "xzcat kali-cardputerzero-arm64.img.xz | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync"
+            echo '```'
+            echo "*(Default login: \`kali\` / \`kali\`, see \`README.md\` for LCD, HDMI desktop, USB OTG gadget, and external Wi-Fi usage.)*"
+          } > /tmp/release-notes.md
 
           if [[ -s work/m5-warnings.md ]]; then
             {
@@ -155,7 +177,7 @@ jobs:
             output/kali-cardputerzero-arm64.img.xz \
             output/kali-cardputerzero-arm64.img.xz.sha256 \
             --target "${{ steps.lockfile.outputs.target_sha }}" \
-            --title "Kali CardputerZero (${date_slug})" \
+            --title "${rel_title}" \
             --notes-file /tmp/release-notes.md \
             --latest
 
