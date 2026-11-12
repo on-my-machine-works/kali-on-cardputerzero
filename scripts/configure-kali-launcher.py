@@ -346,6 +346,10 @@ def main() -> int:
 
     apps_dir.mkdir(parents=True, exist_ok=True)
     imgs_dir.mkdir(parents=True, exist_ok=True)
+    kali_names = {a["filename"] for a in KALI_APPS}
+    for stale in apps_dir.glob("kali-*.desktop"):
+        if stale.name not in kali_names:
+            stale.unlink(missing_ok=True)
 
     # 1 & 2. Write icons + .desktop files + deterministic mtimes
     tsv_lines = ["# filename\tName\tIcon\tExec\tTerminal\tSysplause"]
@@ -445,10 +449,16 @@ def main() -> int:
         cfg_file.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     # 5. Patch M5CardputerZero-APPLaunch carousel sort order
+    #    Use atomic temp-file + os.replace so live updates succeed even while
+    #    M5CardputerZero-APPLaunch is actively executing (avoids ETXTBSY).
     applaunch_bin = applaunch_dir / "bin/M5CardputerZero-APPLaunch"
     diverted_orig = root / "usr/lib/cz-kali/M5CardputerZero-APPLaunch.m5"
     if diverted_orig.exists():
-        shutil.copy2(diverted_orig, applaunch_bin)
+        applaunch_bin.parent.mkdir(parents=True, exist_ok=True)
+        tmp_copy = applaunch_bin.with_suffix(".orig.tmp")
+        shutil.copy2(diverted_orig, tmp_copy)
+        os.chmod(tmp_copy, 0o755)
+        tmp_copy.replace(applaunch_bin)
     if applaunch_bin.exists():
         patch_applaunch_elf64(applaunch_bin)
 
