@@ -24,6 +24,11 @@ done
 
 # Displays (LCD + HDMI)
 printf "SPI LCD     : %s\n" "$( [[ -e /dev/fb_lcd ]] && echo "OK (/dev/fb_lcd)" || echo "MISSING" )"
+hdmi_stat="disconnected"
+for hs in /sys/class/drm/card*-HDMI-A-*/status; do
+    [[ -r "$hs" ]] && [[ "$(cat "$hs" 2>/dev/null)" == "connected" ]] && hdmi_stat="connected"
+done
+printf "HDMI Output : %s (lightdm: %s)\n" "$hdmi_stat" "$(systemctl is-active lightdm.service 2>/dev/null || echo inactive)"
 printf "DRM Cards   : %s\n" "$(ls /dev/dri/card* 2>/dev/null | tr '\n' ' ' || echo "none")"
 
 # Keypad (TCA8418)

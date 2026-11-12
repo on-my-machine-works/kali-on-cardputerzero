@@ -992,6 +992,7 @@ Wants=pipewire-pulse.service
 
 [Service]
 Environment=LV_LINUX_FBDEV_DEVICE=/dev/fb_lcd
+UnsetEnvironment=DISPLAY WAYLAND_DISPLAY XAUTHORITY
 ExecStartPre=-/usr/bin/xdg-user-dirs-update
 ExecStartPre=/bin/sh -c "for i in 1 2 3 4 5 6 7 8 9 10; do [ -e /dev/input/by-path/platform-3f804000.i2c-event ] && [ -e /dev/fb_lcd ] && exit 0; sleep 1; done; exit 0"
 EOF
@@ -1031,10 +1032,11 @@ stage_launcher() {
                       "$MNT_ROOT/usr/share/APPLaunch/applications" \
                       "$MNT_ROOT/usr/share/APPLaunch/share/images"
     install -d -m 755 -o 1000 -g 1000 "$MNT_ROOT/home/kali/captures"
-    install -m 755 "$SCRIPT_DIR/scripts/cz-usb-gadget" "$MNT_ROOT/usr/local/bin/cz-usb-gadget"
-    install -m 755 "$SCRIPT_DIR/scripts/cz-hw-status"  "$MNT_ROOT/usr/local/bin/cz-hw-status"
-    install -m 755 "$SCRIPT_DIR/scripts/cz-kali-menu"  "$MNT_ROOT/usr/local/bin/cz-kali-menu"
-    install -m 755 "$SCRIPT_DIR/scripts/cz-kali-pkgs"  "$MNT_ROOT/usr/local/bin/cz-kali-pkgs"
+    install -m 755 "$SCRIPT_DIR/scripts/cz-usb-gadget"   "$MNT_ROOT/usr/local/bin/cz-usb-gadget"
+    install -m 755 "$SCRIPT_DIR/scripts/cz-hw-status"    "$MNT_ROOT/usr/local/bin/cz-hw-status"
+    install -m 755 "$SCRIPT_DIR/scripts/cz-hdmi-hotplug" "$MNT_ROOT/usr/local/bin/cz-hdmi-hotplug"
+    install -m 755 "$SCRIPT_DIR/scripts/cz-kali-menu"    "$MNT_ROOT/usr/local/bin/cz-kali-menu"
+    install -m 755 "$SCRIPT_DIR/scripts/cz-kali-pkgs"    "$MNT_ROOT/usr/local/bin/cz-kali-pkgs"
 
     cp -f "$SCRIPT_DIR/src/Makefile" \
           "$SCRIPT_DIR/src/cz_ui.h" \
@@ -1332,6 +1334,40 @@ EOF
     chmod 755 "$MNT_ROOT/usr/local/sbin/cz-hdmi-console"
     cat > "$MNT_ROOT/etc/udev/rules.d/90-cz-hdmi-console.rules" <<'EOF'
 ACTION=="add", SUBSYSTEM=="graphics", KERNEL=="fb[0-9]*", ATTR{name}=="vc4drmfb", RUN+="/usr/local/sbin/cz-hdmi-console %n"
+EOF
+
+    # On-demand HDMI desktop: skip LightDM/Xorg when booted unplugged, auto-start on
+    # HDMI plug-in, and stop after 5s unplug debounce to reclaim ~75-90 MiB RAM
+    install -d -m 755 "$MNT_ROOT/etc/default" \
+                      "$MNT_ROOT/etc/systemd/system/lightdm.service.d"
+    cat > "$MNT_ROOT/etc/default/cz-hdmi-desktop" <<'EOF'
+# CardputerZero HDMI desktop policy: auto | always | off
+HDMI_DESKTOP_MODE=auto
+HDMI_UNPLUG_DELAY=5
+EOF
+    cat > "$MNT_ROOT/etc/systemd/system/lightdm.service.d/hdmi-on-demand.conf" <<'EOF'
+[Unit]
+After=systemd-user-sessions.service systemd-udev-settle.service
+OnFailure=
+
+[Service]
+ExecCondition=/usr/local/bin/cz-hdmi-hotplug check
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+EOF
+    cat > "$MNT_ROOT/etc/systemd/system/cz-hdmi-hotplug.service" <<'EOF'
+[Unit]
+Description=CardputerZero On-Demand HDMI Desktop Hotplug Handler
+After=systemd-user-sessions.service multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cz-hdmi-hotplug sync
+EOF
+    cat > "$MNT_ROOT/etc/udev/rules.d/91-cz-hdmi-hotplug.rules" <<'EOF'
+ACTION=="add", SUBSYSTEM=="drm", KERNEL=="card[0-9]*-HDMI-A-*", RUN+="/usr/bin/systemctl --no-block start cz-hdmi-hotplug.service"
+ACTION=="change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ENV{ID_PATH}!="platform-3f204000.spi-cs-0", RUN+="/usr/bin/systemctl --no-block start cz-hdmi-hotplug.service"
 EOF
 
     # 4. Glycin Sandbox Bypass & Thumbnailer Diversion + 512MB RAM Diet
@@ -1664,6 +1700,7 @@ CHROOT
              etc/udev/rules.d/99-ignore-i2c-key.rules \
              etc/udev/rules.d/70-cardputerzero-peripherals.rules \
              etc/udev/rules.d/90-cz-hdmi-console.rules \
+             etc/udev/rules.d/91-cz-hdmi-hotplug.rules \
              usr/lib/udev/rules.d/zz-cardputerzero-hdmi-display.rules \
              usr/lib/udev/rules.d/60-cardputerzero-leds.rules \
              usr/lib/udev/rules.d/99-com.rules \
@@ -1688,13 +1725,14 @@ CHROOT
     vcheck "[[ -f '$MNT_ROOT/etc/wireplumber/wireplumber.conf.d/51-cardputerzero-es8389-priority.conf' ]]" "Missing WirePlumber ES8389 priority config"
     vcheck "[[ -f '$MNT_ROOT/etc/X11/xorg.conf.d/40-cardputerzero-no-grab.conf' ]]" "Missing X11 keypad/IR ignore config"
     vcheck "[[ -f '$MNT_ROOT/etc/X11/xorg.conf.d/98-vc4-no-glamor.conf' ]]" "Missing X11 no-glamor config"
+    vcheck "[[ -f '$MNT_ROOT/etc/systemd/system/lightdm.service.d/hdmi-on-demand.conf' && -f '$MNT_ROOT/etc/systemd/system/cz-hdmi-hotplug.service' && -f '$MNT_ROOT/etc/default/cz-hdmi-desktop' ]]" "Missing on-demand HDMI desktop units/config"
     vcheck "[[ -f '$MNT_ROOT/var/lib/systemd/linger/kali' ]]" "Missing systemd linger for kali"
     vcheck "[[ -x '$MNT_ROOT/usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch' && -f '$MNT_ROOT/usr/lib/cz-kali/M5CardputerZero-APPLaunch.m5' ]] && ! cmp -s '$MNT_ROOT/usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch' '$MNT_ROOT/usr/lib/cz-kali/M5CardputerZero-APPLaunch.m5'" "APPLaunch missing or sort patch not applied"
     vcheck "[[ -f '$MNT_ROOT/usr/lib/cz-kali/libcz_fb_lcd.so' ]]" "Missing libcz_fb_lcd.so"
     vcheck "grep -q 'LV_LINUX_FBDEV_DEVICE=/dev/fb_lcd' '$MNT_ROOT/etc/systemd/user/APPLaunch.service.d/wait-for-udev.conf'" "APPLaunch missing LV_LINUX_FBDEV_DEVICE=/dev/fb_lcd"
     vcheck "[[ -x '$MNT_ROOT/usr/bin/camera_app' ]] && grep -q '$RPI_LIBCAMERA_DIR' '$MNT_ROOT/usr/bin/camera_app'" "Camera wrapper invalid"
     vcheck "dpkg_installed python3-requests && dpkg_installed kali-tweaks" "Missing python3-requests or kali-tweaks"
-    for kbin in cz-sysmon cz-term80 cz-wifiscan cz-lanscan cz-pktsniff cz-usbgadget cz-kali-menu cz-kali-pkgs cz-usb-gadget cz-hw-status monstart monstop; do
+    for kbin in cz-sysmon cz-term80 cz-wifiscan cz-lanscan cz-pktsniff cz-usbgadget cz-kali-menu cz-kali-pkgs cz-usb-gadget cz-hw-status cz-hdmi-hotplug monstart monstop; do
         vcheck "[[ -x '$MNT_ROOT/usr/local/bin/$kbin' ]]" "Missing helper binary/script: /usr/local/bin/$kbin"
     done
     for kdt in kali-wifi.desktop kali-term80.desktop kali-zsh.desktop kali-menu.desktop kali-btop.desktop kali-lanscan.desktop kali-pktsniff.desktop kali-usbgadget.desktop kali-pkgs.desktop; do

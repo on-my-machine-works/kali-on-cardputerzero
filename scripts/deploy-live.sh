@@ -30,16 +30,12 @@ cp "$SCRIPT_DIR/src/Makefile" \
    "$SCRIPT_DIR/scripts/cz-kali-pkgs" \
    "$SCRIPT_DIR/scripts/cz-usb-gadget" \
    "$SCRIPT_DIR/scripts/cz-hw-status" \
+   "$SCRIPT_DIR/scripts/cz-hdmi-hotplug" \
    "$SCRIPT_DIR/scripts/gen-kali-splash.py" \
    "$SCRIPT_DIR/scripts/configure-kali-launcher.py" \
    "$TMP_BUNDLE/"
 
-echo "[*] Uploading sources and scripts to $TARGET:/tmp/cz-live-sync ..."
-ssh "$TARGET" "rm -rf /tmp/cz-live-sync && mkdir -p /tmp/cz-live-sync"
-scp -q "$TMP_BUNDLE"/* "$TARGET:/tmp/cz-live-sync/"
-
-echo "[*] Building native 320x170 apps and updating launcher on $TARGET ..."
-ssh "$TARGET" 'sudo bash -s' <<'REMOTE'
+cat > "$TMP_BUNDLE/_deploy_remote.sh" <<'REMOTE'
 set -euo pipefail
 cd /tmp/cz-live-sync
 
@@ -64,7 +60,7 @@ if ! dpkg-divert --list /usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch | gre
     dpkg-divert --local --rename \
         --divert /usr/lib/cz-kali/M5CardputerZero-APPLaunch.m5 \
         --add /usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch
-    cp -a /usr/lib/cz-kali/M5CardputerZero-APPLaunch.m5 /usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch
+    install -m 755 /usr/lib/cz-kali/M5CardputerZero-APPLaunch.m5 /usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch
 fi
 
 # 3. Ensure wireless/Python runtime helpers & kali-tweaks are present
@@ -83,10 +79,11 @@ fi
 
 # 4. Compile native 320x170 RGB565 Kali LCD apps + helper scripts
 make install
-install -m 755 cz-kali-menu  /usr/local/bin/cz-kali-menu
-install -m 755 cz-kali-pkgs  /usr/local/bin/cz-kali-pkgs
-install -m 755 cz-usb-gadget /usr/local/bin/cz-usb-gadget
-install -m 755 cz-hw-status  /usr/local/bin/cz-hw-status
+install -m 755 cz-kali-menu    /usr/local/bin/cz-kali-menu
+install -m 755 cz-kali-pkgs    /usr/local/bin/cz-kali-pkgs
+install -m 755 cz-usb-gadget   /usr/local/bin/cz-usb-gadget
+install -m 755 cz-hw-status    /usr/local/bin/cz-hw-status
+install -m 755 cz-hdmi-hotplug /usr/local/bin/cz-hdmi-hotplug
 install -d -m 755 -o kali -g kali /home/kali/captures
 
 # 4. Configure launcher layout, manifest & config.json
@@ -102,11 +99,46 @@ Wants=pipewire-pulse.service
 
 [Service]
 Environment=LV_LINUX_FBDEV_DEVICE=/dev/fb_lcd
+UnsetEnvironment=DISPLAY WAYLAND_DISPLAY XAUTHORITY
 ExecStartPre=-/usr/bin/xdg-user-dirs-update
 ExecStartPre=/bin/sh -c "for i in 1 2 3 4 5 6 7 8 9 10; do [ -e /dev/input/by-path/platform-3f804000.i2c-event ] && [ -e /dev/fb_lcd ] && exit 0; sleep 1; done; exit 0"
 EOF
 
-# 5. Generate & install Kali boot splash + APPLaunch logo_lcd.png + lockscreen.png
+# 5. On-demand HDMI desktop hotplug + RAM reclaim
+install -d -m 755 /etc/default /etc/systemd/system/lightdm.service.d
+if [ ! -f /etc/default/cz-hdmi-desktop ]; then
+    cat > /etc/default/cz-hdmi-desktop <<'EOF'
+# CardputerZero HDMI desktop policy: auto | always | off
+HDMI_DESKTOP_MODE=auto
+HDMI_UNPLUG_DELAY=5
+EOF
+fi
+cat > /etc/systemd/system/lightdm.service.d/hdmi-on-demand.conf <<'EOF'
+[Unit]
+After=systemd-user-sessions.service systemd-udev-settle.service
+OnFailure=
+
+[Service]
+ExecCondition=/usr/local/bin/cz-hdmi-hotplug check
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+EOF
+cat > /etc/systemd/system/cz-hdmi-hotplug.service <<'EOF'
+[Unit]
+Description=CardputerZero On-Demand HDMI Desktop Hotplug Handler
+After=systemd-user-sessions.service multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cz-hdmi-hotplug sync
+EOF
+cat > /etc/udev/rules.d/91-cz-hdmi-hotplug.rules <<'EOF'
+ACTION=="add", SUBSYSTEM=="drm", KERNEL=="card[0-9]*-HDMI-A-*", RUN+="/usr/bin/systemctl --no-block start cz-hdmi-hotplug.service"
+ACTION=="change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ENV{ID_PATH}!="platform-3f204000.spi-cs-0", RUN+="/usr/bin/systemctl --no-block start cz-hdmi-hotplug.service"
+EOF
+
+# 6. Generate & install Kali boot splash + APPLaunch logo_lcd.png + lockscreen.png
 for img in /usr/share/APPLaunch/share/images/logo_lcd.png \
            /usr/share/APPLaunch/share/images/lockscreen.png; do
     base="$(basename "$img")"
@@ -127,6 +159,9 @@ ExecStart=
 ExecStart=/usr/sbin/fb_load --keep-open /boot/firmware/splash.bmp /dev/dri/cardputer-zero-internal
 EOF
 systemctl daemon-reload
+udevadm control --reload-rules
+/usr/local/bin/cz-hdmi-hotplug sync
+/usr/local/bin/cz-hdmi-hotplug status
 
 sudo -u kali XDG_RUNTIME_DIR=/run/user/1000 systemctl --user daemon-reload
 sudo -u kali XDG_RUNTIME_DIR=/run/user/1000 systemctl --user restart APPLaunch.service
@@ -134,3 +169,7 @@ sudo -u kali XDG_RUNTIME_DIR=/run/user/1000 systemctl --user restart APPLaunch.s
 rm -rf /tmp/cz-live-sync
 echo "[+] Live deployment complete."
 REMOTE
+
+echo "[*] Streaming bundle & deploying over a single SSH session to $TARGET ..."
+tar -C "$TMP_BUNDLE" -czf - . | ssh "$TARGET" \
+    'set -e; rm -rf /tmp/cz-live-sync && mkdir -p /tmp/cz-live-sync && tar -xzf - -C /tmp/cz-live-sync && sudo bash /tmp/cz-live-sync/_deploy_remote.sh'

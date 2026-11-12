@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# cz-hdmi-hotplug — On-demand HDMI desktop manager for M5Stack CardputerZero
+#
+# Modes (/etc/default/cz-hdmi-desktop):
+#   auto   — Start LightDM/LXDE automatically when HDMI is connected; stop after
+#            unplug debounce (default 5s) to free ~75-90 MiB RAM on handheld use
+#   always — Keep LightDM/LXDE enabled regardless of HDMI cable state
+#   off    — Keep LightDM/LXDE stopped even when HDMI is connected (VT consoles only)
+
+set -euo pipefail
+export PATH="${PATH:+$PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+CONF_FILE="${CZ_HDMI_CONF:-/etc/default/cz-hdmi-desktop}"
+LOCK_FILE="${CZ_HDMI_LOCK:-/run/cz-hdmi-hotplug.lock}"
+SYSFS_DRM_GLOB="${CZ_HDMI_DRM_GLOB:-/sys/class/drm/card*-HDMI-A-*/status}"
+
+HDMI_DESKTOP_MODE="auto"
+HDMI_UNPLUG_DELAY="5"
+
+load_conf() {
+    HDMI_DESKTOP_MODE="auto"
+    HDMI_UNPLUG_DELAY="5"
+    if [[ -r "$CONF_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$CONF_FILE"
+    fi
+    case "${HDMI_DESKTOP_MODE:-auto}" in
+        auto|always|off) ;;
+        *) HDMI_DESKTOP_MODE="auto" ;;
+    esac
+    if ! [[ "${HDMI_UNPLUG_DELAY:-5}" =~ ^[0-9]+$ ]]; then
+        HDMI_UNPLUG_DELAY="5"
+    fi
+}
+
+hdmi_connected() {
+    local s
+    # shellcheck disable=SC2086
+    for s in $SYSFS_DRM_GLOB; do
+        [[ -r "$s" ]] || continue
+        if [[ "$(cat "$s" 2>/dev/null || true)" == "connected" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+hdmi_connectors_summary() {
+    local s name st out=""
+    # shellcheck disable=SC2086
+    for s in $SYSFS_DRM_GLOB; do
+        [[ -r "$s" ]] || continue
+        name="$(basename "$(dirname "$s")")"
+        st="$(cat "$s" 2>/dev/null || echo "unknown")"
+        out+="${name}=${st} "
+    done
+    printf "%s" "${out:-none}"
+}
+
+desktop_wanted() {
+    load_conf
+    case "$HDMI_DESKTOP_MODE" in
+        always) return 0 ;;
+        off)    return 1 ;;
+        auto)   hdmi_connected && return 0 || return 1 ;;
+    esac
+}
+
+map_hdmi_consoles() {
+    local n fbnum
+    for n in /sys/class/graphics/fb[0-9]*/name; do
+        [[ -r "$n" ]] || continue
+        if [[ "$(cat "$n" 2>/dev/null || true)" == "vc4drmfb" ]]; then
+            fbnum="$(basename "$(dirname "$n")")"
+            fbnum="${fbnum#fb}"
+            if [[ -x /usr/local/sbin/cz-hdmi-console ]]; then
+                /usr/local/sbin/cz-hdmi-console "$fbnum" || true
+            fi
+            break
+        fi
+    done
+}
+
+clear_user_x11_env() {
+    if [[ -d /run/user/1000 ]]; then
+        runuser -u kali -- env XDG_RUNTIME_DIR=/run/user/1000 \
+            systemctl --user unset-environment \
+            DISPLAY XAUTHORITY DESKTOP_SESSION XDG_CURRENT_DESKTOP XDG_SESSION_TYPE \
+            2>/dev/null || true
+    fi
+}
+
+desktop_rss_mib() {
+    ps -eo rss=,comm= 2>/dev/null | awk '
+        $2 ~ /^(lightdm|Xorg|lxsession|lxpanel|pcmanfm|openbox|lxpolkit)$/ { sum += $1 }
+        END { printf "%.1f", sum / 1024.0 }
+    '
+}
+
+require_root() {
+    if [[ "$(id -u)" -ne 0 ]]; then
+        echo "Run with sudo: sudo cz-hdmi-hotplug $*" >&2
+        exit 1
+    fi
+}
+
+write_mode() {
+    local new_mode="$1"
+    load_conf
+    mkdir -p "$(dirname "$CONF_FILE")"
+    cat > "$CONF_FILE" <<EOF
+# CardputerZero HDMI desktop policy: auto | always | off
+HDMI_DESKTOP_MODE=${new_mode}
+HDMI_UNPLUG_DELAY=${HDMI_UNPLUG_DELAY}
+EOF
+}
+
+do_sync() {
+    require_root sync
+    mkdir -p "$(dirname "$LOCK_FILE")"
+    exec 9>"$LOCK_FILE"
+    flock -w 20 9 || exit 0
+
+    map_hdmi_consoles
+
+    local iter=0 want active
+    while (( iter < 4 )); do
+        iter=$((iter + 1))
+        if desktop_wanted; then want=1; else want=0; fi
+        if systemctl is-active --quiet lightdm.service; then active=1; else active=0; fi
+
+        if (( want == 1 && active == 0 )); then
+            systemctl reset-failed lightdm.service 2>/dev/null || true
+            systemctl start lightdm.service || true
+        elif (( want == 0 && active == 1 )); then
+            if [[ "$HDMI_DESKTOP_MODE" == "auto" ]] && (( HDMI_UNPLUG_DELAY > 0 )); then
+                sleep "$HDMI_UNPLUG_DELAY"
+                if desktop_wanted; then
+                    continue
+                fi
+            fi
+            systemctl stop lightdm.service || true
+            clear_user_x11_env
+        fi
+
+        if desktop_wanted; then want=1; else want=0; fi
+        if systemctl is-active --quiet lightdm.service; then active=1; else active=0; fi
+        if (( want == active )); then
+            break
+        fi
+    done
+}
+
+do_status() {
+    load_conf
+    local conn ldm rss
+    conn="$(hdmi_connectors_summary)"
+    ldm="$(systemctl is-active lightdm.service 2>/dev/null || true)"
+    [[ -n "$ldm" ]] || ldm="inactive"
+    rss="$(desktop_rss_mib)"
+    printf "HDMI Connectors : %s\n" "$conn"
+    printf "Desktop Policy  : %s (unplug debounce: %ss)\n" "$HDMI_DESKTOP_MODE" "$HDMI_UNPLUG_DELAY"
+    printf "LightDM Service : %s (desktop RSS: %s MiB)\n" "$ldm" "$rss"
+}
+
+cmd="${1:-status}"
+case "$cmd" in
+    check)
+        desktop_wanted && exit 0 || exit 1
+        ;;
+    sync)
+        do_sync
+        ;;
+    status)
+        do_status
+        ;;
+    auto|always|off)
+        require_root "$cmd"
+        write_mode "$cmd"
+        do_sync
+        do_status
+        ;;
+    *)
+        echo "Usage: cz-hdmi-hotplug {status|auto|always|off|check|sync}" >&2
+        exit 2
+        ;;
+esac
