@@ -54,7 +54,7 @@ Every onboard component and expansion bus of the CardputerZero is configured and
 | :--- | :--- | :--- | :--- |
 | **SoC & Boot** | Raspberry Pi CM0 Lite (`RP3A0` / `BCM2837`, Quad Cortex-A53 `arm64`, 512 MB LPDDR2) | `bcm2710-rpi-cm0.dtb`, `raspi-firmware`, Linux **`6.18.39+rpt-rpi-v8`** (`apt-mark hold` + APT-pinned), `zstd` ZRAM (75%) | First-boot rootfs auto-expand (`cz-firstboot-resize`) & SSH host keygen |
 | **1.9" IPS LCD + Backlight** | `ST7789v3` **320x170** RGB565 on SPI0 CS0 (`GPIO25` DC) + `M5IOE1` PWM3 Backlight | `panel-mipi-dbi-m.ko`, `st7789v_m5stack.ko`, `pwm_bl_m5stack.ko`, `cardputerzero,st7789v_lcd.bin`, `fb_load.service` | `/dev/fb_lcd` (`320x170` px; `APPLaunch` PTY `45x10` + `Term80x24` `80x24`), Kali Dragon boot splash & lockscreen, `fbcon=map:99` |
-| **Full-Size HDMI Output** | VideoCore IV KMS (`vc4-kms-v3d,cma-64`) | `vc4`, `98-vc4-no-glamor.conf` (saves 64 MB CMA), `zz-cardputerzero-hdmi-display.rules` | Independent **LightDM + LXDE** Kali desktop on HDMI + `fb-mirror.py` LCD mirror + `VT2..VT6` consoles |
+| **Full-Size HDMI Output** | VideoCore IV KMS (`vc4-kms-v3d,cma-64`) | `vc4`, `98-vc4-no-glamor.conf` (saves 64 MB CMA), `zz-cardputerzero-hdmi-display.rules`, `91-cz-hdmi-hotplug.rules` | On-demand **LightDM + LXDE** Kali desktop (`cz-hdmi-hotplug`) + `fb-mirror.py` LCD mirror + `VT2..VT6` consoles |
 | **46-Key Matrix Keyboard + LEDs** | `TCA8418` (`0x34` on I2C1, IRQ `GPIO27`) + Caps/Fn/Tab LEDs on `M5IOE1` | `tca8418_keypad_m5stack.ko` (3-layer keymap in `cardputerzero-v5-overlay.dtbo`) | Isolated on `seat1` (`99-ignore-i2c-key.rules` + Xorg `Ignore`) & `tty1` masked; bottom softkeys aligned to physical `4`–`8` keys |
 | **Audio Codec, Speaker, Mic & 3.5mm Jack** | Everest `ES8389` (`0x10` I2C1 + I2S), 1W Speaker (`GPIO24`), MEMS Mic, 3.5mm TRS Detect (`GPIO17`) | `es8389_m5stack.ko`, `simple-amplifier.ko`, `cardputerzero-audio.ko` (auto speaker mute & mic switch on jack plug) | **PipeWire + WirePlumber + RTKit** (`50-cardputerzero-default-volume.conf` @ 60%, ES8389 prioritized over HDMI) |
 | **2.4 GHz Wi-Fi** | `BCM43439` / `CYW4343A2` SDIO (`wlan0`) | `brcmfmac` + RPi CM0 `cyfmac43439-sdio.txt` (`boardflags3=0x04000000`; `nexmon` excluded) | `NetworkManager` (`nmcli` / `nmtui` / `WiFiScan` / `APPLaunch -> Settings -> Wi-Fi`) |
@@ -89,6 +89,7 @@ Every onboard component and expansion bus of the CardputerZero is configured and
 - [`scripts/cz-kali-menu`](scripts/cz-kali-menu) — Quick-launch TUI menu formatted for `APPLaunch`'s `45x10` character grid (`KaliMenu`).
 - [`scripts/cz-kali-pkgs`](scripts/cz-kali-pkgs) — Interactive `45x10`-compatible Kali metapackage & toolset installer (`KaliPkgs` / `kali-tweaks` launcher, free-space guard, and CM0 kernel/RAM service safeguards).
 - [`scripts/cz-usb-gadget`](scripts/cz-usb-gadget) — Runtime USB-C OTG Host <-> Gadget switcher (`net`, `hid`, `combo`, `off`, `status`).
+- [`scripts/cz-hdmi-hotplug`](scripts/cz-hdmi-hotplug) — On-demand HDMI desktop manager (`status`, `auto`, `always`, `off`) that starts LightDM/LXDE on HDMI plug-in and reclaims ~75–90 MiB RAM on unplug.
 - [`scripts/cz-hw-status`](scripts/cz-hw-status) — Live CardputerZero hardware & bus status inspector.
 - [`scripts/deploy-live.sh`](scripts/deploy-live.sh) — Live over-SSH deployment script to update the native `320x170` Kali apps, launcher configuration, and branding on a running CardputerZero without reflashing.
 - `output/` — Generated raw and compressed disk images:
@@ -163,11 +164,17 @@ Every preinstalled Kali and M5 main menu item is registered in `/usr/share/APPLa
 ### B. Full-Size HDMI Desktop
 The CardputerZero drives **both** displays simultaneously without conflict: the 1.9" SPI LCD stays on `APPLaunch`, while the full-size HDMI port runs an independent **Kali LXDE** desktop session (auto-logged in as `kali`).
 
-- **Booting with HDMI connected**: Plug in HDMI before powering on and the Kali LXDE desktop starts automatically.
-- **Hot-plugging HDMI after boot**: Because Xorg probes connected monitors when `lightdm` starts at boot, if HDMI is connected to an already-running unit, restart `lightdm` in `KaliZsh` (or over SSH) to start the desktop without rebooting:
-  ```bash
-  sudo systemctl restart lightdm
-  ```
+- **On-Demand Hotplug & RAM Reclaim (`auto`, default)**:
+  - **Handheld (unplugged)**: `lightdm` and `Xorg` stay completely stopped so all 512 MB LPDDR2 RAM remains available to handheld tools.
+  - **Plug in HDMI (before or after boot)**: `udev` detects HDMI Hot-Plug and launches the Kali LXDE desktop automatically.
+  - **Unplug HDMI**: After a 5-second debounce (ignoring brief monitor sleep/mode switches), `lightdm` stops automatically to free ~75–90 MiB RAM.
+  - **Policy Override**: Check live status or pin the desktop state anytime via `cz-hdmi-hotplug`:
+    ```bash
+    cz-hdmi-hotplug status        # Shows connector state, policy, and desktop RSS in MiB
+    sudo cz-hdmi-hotplug always   # Keep LXDE running even when HDMI is unplugged (e.g. for VNC)
+    sudo cz-hdmi-hotplug off      # Never start LXDE (TTY consoles only on HDMI)
+    sudo cz-hdmi-hotplug auto     # Restore automatic plug-and-play + unplug RAM reclaim
+    ```
 - **Controlling the HDMI Desktop**:
   - The built-in 46-key keypad is isolated to the 1.9" LCD (`seat1` / Xorg `Ignore`) so handheld use never sends keystrokes into HDMI windows.
   - Connect a **USB keyboard/mouse** (or 2.4 GHz wireless receiver / USB hub) to the **USB-A port**—or pair a Bluetooth keyboard/mouse—to control the HDMI desktop.
