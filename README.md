@@ -91,7 +91,7 @@ make -C src && make -C src check
 6. `[5]` `LanScan` (`cz-lanscan`): keys `4:DISCOVER`, `5:PORTS`, `6:UP`, `7:DOWN`, `8:EXIT`
 7. `[6]` `PktSniff` (`cz-pktsniff`): keys `4:START/PAUSE`, `5:IFACE`, `6:FILTER`, `7:PCAP`, `8:EXIT`
 8. `[7]` `USBGadget` (`cz-usbgadget`): keys `4:NET`, `5:HID`, `6:COMBO`, `7:HOST/OFF`, `8:EXIT`
-9. `[8]` `KaliPkgs` (`cz-kali-pkgs`): Kali metapackage installer (`wireless`, `top10`, `sniff`, `hardware`, `webpass`, `headless`, `default`, plus `kali-tweaks`)
+9. `[8]` `KaliPkgs` (`cz-kali-pkgs`): Kali metapackage & companion installer (`wireless`, `top10`, `sniff`, `hardware`, `webpass`, `headless`, `default`, `zero2zero`, plus `kali-tweaks`)
 10. M5 apps: `Settings`, `Store`, `CLI`, `SSH`, `IP Panel`, `Camera`, `IR Remote`, `IR Chat`, `Compass`, `Rec`, `Files`, `LoRa`, `GPS`, `NFC`, `SubG Chat`. Sample entries (`Python`, `Snake`, `Tank`, `Calculator`) default to off.
 
 All entries are registered in `/usr/share/APPLaunch/preinstalled-desktop-apps.tsv` and `~/.config/cardputerzero/config.json`, and can be toggled on or off under `Settings -> Launcher`.
@@ -143,17 +143,20 @@ sudo cz-usb-gadget status
   sudo monstop
   ```
 
-### Kali Metapackages (`cz-kali-pkgs`)
+### Kali Metapackages & Companion Add-ons (`cz-kali-pkgs`)
 
-`KaliPkgs` (`cz-kali-pkgs`) installs Kali toolsets after checking free SD space, keeping the CM0 kernel packages on hold, and leaving heavy background daemons (`apache2`, `mariadb`, `smbd`, etc.) disabled at boot:
+`KaliPkgs` (`cz-kali-pkgs`) installs Kali toolsets and optional companion packages after checking free SD space, keeping the CM0 kernel packages on hold, and leaving heavy background daemons (`apache2`, `mariadb`, `smbd`, etc.) disabled at boot:
 
 ```bash
 sudo cz-kali-pkgs install wireless   # kali-tools-802-11 + bluetooth + rfid (~2 GB)
 sudo cz-kali-pkgs install top10      # kali-tools-top10 (~3 GB)
 sudo cz-kali-pkgs install headless   # kali-linux-headless (~10 GB, 32 GB+ SD)
 sudo cz-kali-pkgs install default    # kali-linux-default (~15 GB, 32 GB+ SD)
-cz-kali-pkgs                         # Interactive 45x10 menu (includes kali-tweaks)
+sudo cz-kali-pkgs install zero2zero  # Flipper Zero BLE companion (~140 KB, SHA-256 verified)
+cz-kali-pkgs                         # Interactive 45x10 menu (includes zero2zero & kali-tweaks)
 ```
+
+See [`zero2zero`](https://github.com/on-my-machine-works/zero2zero) for Flipper Zero BLE pairing, Sub-GHz `rtl_433` decoding, IR remote deck, camera-to-NFC/RFID scanning, and screen mirroring.
 
 ### Hardware & Rail Status
 
