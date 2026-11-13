@@ -15,8 +15,9 @@ configure-kali-launcher.py — Configure CardputerZero APPLaunch for Kali Linux:
        - Custom preinstalled entries sort ahead of built-in M5 entries.
        - Disable Cp0SystemSoundPlayer's always-open 50 Hz miniaudio silence stream
          and startup float32 SFX cache decode (keeps ES8389 DAC/I2S and PipeWire idle).
-       - Eliminate infinite 30 FPS LVGL animations (carousel title scrolling, charging
-         highlight shimmer bar, and unbounded overflowing label/guide scroll loops).
+       - Eliminate infinite 30 FPS LVGL animations (charging highlight shimmer bar,
+         and bound circular title marquee / guide scroll loops to 3 passes so long app
+         titles scroll cleanly when navigating and park at x=0 with 0% idle CPU).
        - Relax LVGL background timers and worker poll intervals (Wi-Fi nmcli, BQ27220
          battery cache, BlueZ retry, directory watcher, watchdog, keypad/pipe poll).
 """
@@ -275,14 +276,16 @@ def patch_applaunch_elf64(elf_path: Path, *, source_path: Path | None = None) ->
          disable miniaudio's continuous 48 kHz 50 Hz silence stream and skip decoding
          19 WAV/MP3 SFX files into float32 heap buffers.
       3. UI animations that would otherwise spin LVGL + lv_draw_sw at 30 FPS forever:
-         - create_carousel_title() & snap_label_to_slot(): LV_LABEL_LONG_SCROLL_CIRCULAR (#3)
-           -> LV_LABEL_LONG_DOT (#1) so carousel titles truncate statically with "...".
+         - create_carousel_title() & snap_label_to_slot(): keep stock
+           LV_LABEL_LONG_SCROLL_CIRCULAR (#3) so long app titles marquee smoothly
+           instead of truncating with "...".
          - AppTopBarBatteryComponent::set_charging(bool): keep the #fff2a8 gold text color
            indicator when charging, but skip the infinite 30 FPS 8px highlight bar animation
            (which kept rendering 30 FPS on two threads even when locked / screen off).
          - lv_label_refr_text() & LvSettingAdbGuidePage3::start_animation(): bound
-           LV_ANIM_REPEAT_INFINITE (-1) scroll/guide animations to finite repeat counts so
-           locking the device on a settings page never leaves a 30 FPS render loop running.
+           LV_ANIM_REPEAT_INFINITE (-1) scroll/guide animations to 3 passes (rested at
+           dsc.ofs.x = 0, re-triggered automatically on every carousel step) so idle or
+           locked screens drop to 0% render CPU.
       4. Background timers & polling threads:
          relax lv_indev_create read timer (33ms -> 50ms), WifiSystem nmcli x3 poll (3s -> 60s),
          cp0_sudo coordinator timer (20ms -> 250ms), EscUiWatchdog (50ms -> 250ms),
@@ -447,7 +450,8 @@ def patch_applaunch_elf64(elf_path: Path, *, source_path: Path | None = None) ->
     else:
         raise RuntimeError(f"{elf_path}: unexpected decode_cache prologue: {dec_entry:#010x}")
 
-    # 4. Home carousel title labels: LV_LABEL_LONG_SCROLL_CIRCULAR (#3) -> LV_LABEL_LONG_DOT (#1)
+    # 4. Home carousel title labels: ensure LV_LABEL_LONG_SCROLL_CIRCULAR (#3) is active
+    #    (restores stock circular marquee if upgrading an earlier LV_LABEL_LONG_DOT binary)
     _, _, long_mode_vma = find_symbol(b"lv_label_set_long_mode", exact=True)
     for sym_prefix, label_desc in (
         (b"_ZN12_GLOBAL__N_121create_carousel_titleE", "create_carousel_title long_mode"),
@@ -457,8 +461,8 @@ def patch_applaunch_elf64(elf_path: Path, *, source_path: Path | None = None) ->
         patch_guarded_u32(
             fn_off,
             fn_sz,
-            (0x52800061,),  # mov w1, #3 (LV_LABEL_LONG_SCROLL_CIRCULAR)
-            0x52800021,     # mov w1, #1 (LV_LABEL_LONG_DOT)
+            (0x52800021,),  # mov w1, #1 (LV_LABEL_LONG_DOT)
+            0x52800061,     # mov w1, #3 (LV_LABEL_LONG_SCROLL_CIRCULAR)
             lambda rel, o=fn_off, s=fn_sz, v=fn_vma: (
                 rel + 12 <= s
                 and (u32(o + rel + 4) & 0xFFC003FF) == 0xF94003E0  # ldr x0, [sp, #uimm]
@@ -485,19 +489,20 @@ def patch_applaunch_elf64(elf_path: Path, *, source_path: Path | None = None) ->
         "AppTopBarBatteryComponent::set_charging shimmer anim",
     )
 
-    # 4c. Cap remaining infinite LVGL UI animations (LV_ANIM_REPEAT_INFINITE = -1) so leaving
-    #     or locking on a settings page with long labels / ADB guide stops cleanly at 0% CPU
+    # 4c. Cap infinite LVGL label/guide animations (LV_ANIM_REPEAT_INFINITE = -1 -> 3 passes):
+    #     carousel titles marquee 3 full cycles whenever navigated, then park cleanly at x = 0
+    #     (no "..." truncation) and let LVGL auto-pause rendering at 0% idle/locked CPU
     _, _, anim_repeat_vma = find_symbol(b"lv_anim_set_repeat_count", exact=True)
-    for sym_key, new_rep_word, exp_cnt, rep_desc in (
-        (b"lv_label_refr_text", 0x52800041, 2, "lv_label_refr_text scroll repeat_count"),
-        (b"_ZN22LvSettingAdbGuidePage315start_animationEv", 0x52800061, 1, "LvSettingAdbGuidePage3 repeat_count"),
+    for sym_key, orig_rep_words, new_rep_word, exp_cnt, rep_desc in (
+        (b"lv_label_refr_text", (0x12800001, 0x52800041), 0x52800061, 2, "lv_label_refr_text scroll repeat_count"),
+        (b"_ZN22LvSettingAdbGuidePage315start_animationEv", (0x12800001,), 0x52800061, 1, "LvSettingAdbGuidePage3 repeat_count"),
     ):
         fn_off, fn_sz, fn_vma = find_symbol(sym_key, exact=True)
         patch_guarded_u32(
             fn_off,
             fn_sz,
-            (0x12800001,),  # mov w1, #-1 (LV_ANIM_REPEAT_INFINITE)
-            new_rep_word,   # mov w1, #2 or #3
+            orig_rep_words,
+            new_rep_word,   # mov w1, #3
             lambda rel, o=fn_off, s=fn_sz, v=fn_vma: (
                 rel + 8 <= s and is_bl_to(v + rel + 4, u32(o + rel + 4), anim_repeat_vma)
             ),
