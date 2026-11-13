@@ -804,7 +804,10 @@ for grp in sudo users adm dialout cdrom audio video plugdev games input gpio spi
     getent group "$grp" >/dev/null && usermod -aG "$grp" kali
 done
 echo 'kali:kali' | chpasswd
-echo 'kali ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/kali-nopasswd
+cat > /etc/sudoers.d/kali-nopasswd <<'SUDOEOF'
+Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+kali ALL=(ALL) NOPASSWD:ALL
+SUDOEOF
 chmod 440 /etc/sudoers.d/kali-nopasswd
 install -d -m 700 -o 1000 -g 1000 /home/kali/.ssh
 if [ -f /etc/skel/.zshrc ]; then

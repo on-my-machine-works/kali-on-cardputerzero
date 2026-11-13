@@ -84,6 +84,11 @@ install -m 755 cz-kali-pkgs    /usr/local/bin/cz-kali-pkgs
 install -m 755 cz-usb-gadget   /usr/local/bin/cz-usb-gadget
 install -m 755 cz-hw-status    /usr/local/bin/cz-hw-status
 install -m 755 cz-hdmi-hotplug /usr/local/bin/cz-hdmi-hotplug
+cat > /etc/sudoers.d/kali-nopasswd <<'EOF'
+Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+kali ALL=(ALL) NOPASSWD:ALL
+EOF
+chmod 440 /etc/sudoers.d/kali-nopasswd
 install -d -m 755 -o kali -g kali /home/kali/captures
 
 # 5. Configure launcher layout, manifest, config.json & APPLaunch ELF64 patches
