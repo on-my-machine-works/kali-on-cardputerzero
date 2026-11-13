@@ -542,11 +542,12 @@ EOF
 ACTION!="remove", SUBSYSTEM=="drm", KERNEL=="card*", ENV{ID_PATH}=="platform-3f204000.spi-cs-0", TAG-="master-of-seat"
 EOF
     cat > "$MNT_ROOT/etc/udev/rules.d/70-cardputerzero-peripherals.rules" <<'EOF'
-# Allow kali user (video/i2c/plugdev) to use IR TX/RX, hardware RTC, and USB HID gadgets
+# Allow kali user (video/i2c/plugdev/netdev) to use IR TX/RX, hardware RTC, USB HID gadgets, and rfkill
 SUBSYSTEM=="lirc", GROUP="video", MODE="0660"
 SUBSYSTEM=="rtc", GROUP="i2c", MODE="0664"
 ACTION=="add", SUBSYSTEM=="rtc", KERNEL=="rtc0", RUN+="/sbin/hwclock --hctosys --utc --noadjfile"
 KERNEL=="hidg[0-9]*", GROUP="plugdev", MODE="0660"
+KERNEL=="rfkill", SUBSYSTEM=="misc", GROUP="netdev", MODE="0664"
 EOF
 
     # Ensure critical modules autoload reliably at boot
@@ -983,7 +984,8 @@ CHROOT
     chown -h 1000:1000 "$MNT_ROOT/home/kali/.config/systemd/user/default.target.wants/APPLaunch.service"
 
     # Prevent race between APPLaunch startup and udev creating keypad/LCD nodes,
-    # and export LV_LINUX_FBDEV_DEVICE=/dev/fb_lcd to all child LVGL apps
+    # export LV_LINUX_FBDEV_DEVICE=/dev/fb_lcd to all child LVGL apps, and stop
+    # fb_load (--keep-open) once APPLaunch takes over the LCD
     install -d "$MNT_ROOT/etc/systemd/user/APPLaunch.service.d"
     cat > "$MNT_ROOT/etc/systemd/user/APPLaunch.service.d/wait-for-udev.conf" <<'EOF'
 [Unit]
@@ -995,6 +997,7 @@ Environment=LV_LINUX_FBDEV_DEVICE=/dev/fb_lcd
 UnsetEnvironment=DISPLAY WAYLAND_DISPLAY XAUTHORITY
 ExecStartPre=-/usr/bin/xdg-user-dirs-update
 ExecStartPre=/bin/sh -c "for i in 1 2 3 4 5 6 7 8 9 10; do [ -e /dev/input/by-path/platform-3f804000.i2c-event ] && [ -e /dev/fb_lcd ] && exit 0; sleep 1; done; exit 0"
+ExecStartPost=-/usr/bin/sudo -n /usr/bin/systemctl --no-block stop fb_load.service
 EOF
 
     cat > "$MNT_ROOT/usr/bin/camera_app" <<EOF
@@ -1202,21 +1205,30 @@ stage_configs() {
     log "Applying PipeWire/WirePlumber, Xorg/HDMI, console, low-RAM & peripheral configs"
 
     # 1. PipeWire + WirePlumber RTKit & Default Volume & ES8389 Priority
-    for dir in pipewire.conf.d pipewire-pulse.conf.d filter-chain.conf.d client.conf.d; do
+    for dir in pipewire.conf.d pipewire-pulse.conf.d client.conf.d; do
         install -d "$MNT_ROOT/etc/pipewire/$dir"
         install -m 644 "$CACHE_DIR/pigen/20-rtkit-direct.conf" \
             "$MNT_ROOT/etc/pipewire/$dir/20-rtkit-direct.conf"
     done
+    rm -rf "$MNT_ROOT/etc/pipewire/filter-chain.conf.d" \
+           "$MNT_ROOT/home/kali/.config/systemd/user/filter-chain.service.d"
     install -d "$MNT_ROOT/etc/systemd/system/user@1000.service.d"
     install -m 644 "$CACHE_DIR/pigen/20-rtkit-order.conf" \
         "$MNT_ROOT/etc/systemd/system/user@1000.service.d/20-rtkit-order.conf"
 
-    for svc in pipewire pipewire-pulse filter-chain; do
+    for svc in pipewire pipewire-pulse; do
         local dropin="$MNT_ROOT/home/kali/.config/systemd/user/${svc}.service.d"
         install -d -m 755 -o 1000 -g 1000 "$dropin"
         install -m 644 -o 1000 -g 1000 "$CACHE_DIR/pigen/20-audio-rlimits.conf" \
             "$dropin/20-audio-rlimits.conf"
     done
+
+    # Mask unused PipeWire DSP filter-chain & Bluetooth MPRIS proxy user daemons (~8-12 MiB RAM)
+    install -d "$MNT_ROOT/etc/systemd/user"
+    rm -f "$MNT_ROOT/etc/systemd/user/default.target.wants/filter-chain.service" \
+          "$MNT_ROOT/etc/systemd/user/default.target.wants/mpris-proxy.service"
+    ln -sfn /dev/null "$MNT_ROOT/etc/systemd/user/filter-chain.service"
+    ln -sfn /dev/null "$MNT_ROOT/etc/systemd/user/mpris-proxy.service"
 
     install -d "$MNT_ROOT/etc/wireplumber/wireplumber.conf.d"
     install -m 644 "$CACHE_DIR/pigen/50-cardputerzero-default-volume.conf" \
@@ -1433,18 +1445,31 @@ blacklist rtw88_88xxa
 blacklist rtw88_8812au
 blacklist rtw88_8814au
 EOF
-    echo "88XXau" > "$MNT_ROOT/etc/modules-load.d/rtw88xxau.conf"
+    # Load 88XXau.ko (~3 MiB) on USB hotplug/modalias rather than at every boot
+    rm -f "$MNT_ROOT/etc/modules-load.d/rtw88xxau.conf"
     cat > "$MNT_ROOT/etc/udev/rules.d/99-rtw88xxau.rules" <<'EOF'
 ACTION=="add", SUBSYSTEM=="usb", DEVTYPE=="usb_device", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="0811", RUN+="/usr/sbin/modprobe 88XXau"
 ACTION=="add", SUBSYSTEM=="usb", DEVTYPE=="usb_device", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="8822", RUN+="/usr/sbin/modprobe 88XXau"
 ACTION=="add", SUBSYSTEM=="usb", DEVTYPE=="usb_device", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="a811", RUN+="/usr/sbin/modprobe 88XXau"
 EOF
 
-    # Pre-seed systemd-rfkill state so onboard Bluetooth & Wi-Fi boot unblocked
+    # Pre-seed systemd-rfkill unblocked so BlueZ/NetworkManager control radios cleanly,
+    # and set BlueZ AutoEnable=false so Bluetooth stays powered down at boot to save battery
+    # until enabled in APPLaunch -> Settings -> Bluetooth or `bluetoothctl power on`
     install -d "$MNT_ROOT/var/lib/systemd/rfkill"
     for addr in 107d50c000.serial 3f215040.serial 3f201000.serial 20215040.serial fe215040.serial soc; do
         echo 0 > "$MNT_ROOT/var/lib/systemd/rfkill/platform-${addr}:bluetooth"
     done
+    if [[ -f "$MNT_ROOT/etc/bluetooth/main.conf" ]]; then
+        if grep -qE '^#?[[:space:]]*AutoEnable[[:space:]]*=' "$MNT_ROOT/etc/bluetooth/main.conf"; then
+            sed -i -E 's/^#?[[:space:]]*AutoEnable[[:space:]]*=.*/AutoEnable=false/' "$MNT_ROOT/etc/bluetooth/main.conf"
+        else
+            printf '\n[Policy]\nAutoEnable=false\n' >> "$MNT_ROOT/etc/bluetooth/main.conf"
+        fi
+    else
+        install -d "$MNT_ROOT/etc/bluetooth"
+        printf '[Policy]\nAutoEnable=false\n' > "$MNT_ROOT/etc/bluetooth/main.conf"
+    fi
 
     # 7. Polkit rule so kali (in netdev/sudo) can join Wi-Fi via APPLaunch / nmcli without prompt
     install -d "$MNT_ROOT/etc/polkit-1/rules.d"
@@ -1720,16 +1745,20 @@ CHROOT
         vcheck "grep -q '^$g:' '$MNT_ROOT/etc/group'" "udev rule references non-existent group: $g"
     done
 
-    # Audio, Display, Consoles & Launcher Integration
+    # Audio, Display, Consoles, Power/RAM & Launcher Integration
     vcheck "[[ -f '$MNT_ROOT/etc/wireplumber/wireplumber.conf.d/50-cardputerzero-default-volume.conf' ]]" "Missing WirePlumber default volume config"
     vcheck "[[ -f '$MNT_ROOT/etc/wireplumber/wireplumber.conf.d/51-cardputerzero-es8389-priority.conf' ]]" "Missing WirePlumber ES8389 priority config"
+    vcheck "[[ \"\$(readlink '$MNT_ROOT/etc/systemd/user/filter-chain.service')\" == '/dev/null' && \"\$(readlink '$MNT_ROOT/etc/systemd/user/mpris-proxy.service')\" == '/dev/null' ]]" "filter-chain / mpris-proxy user units not masked"
+    vcheck "[[ ! -e '$MNT_ROOT/etc/modules-load.d/rtw88xxau.conf' && -f '$MNT_ROOT/etc/udev/rules.d/99-rtw88xxau.rules' ]]" "88XXau must be hotplug-only (no boot modules-load)"
+    vcheck "grep -qx 'AutoEnable=false' '$MNT_ROOT/etc/bluetooth/main.conf'" "Bluetooth AutoEnable=false not set in /etc/bluetooth/main.conf"
+    vcheck "grep -q 'KERNEL==\"rfkill\"' '$MNT_ROOT/etc/udev/rules.d/70-cardputerzero-peripherals.rules'" "Missing rfkill netdev permission rule"
     vcheck "[[ -f '$MNT_ROOT/etc/X11/xorg.conf.d/40-cardputerzero-no-grab.conf' ]]" "Missing X11 keypad/IR ignore config"
     vcheck "[[ -f '$MNT_ROOT/etc/X11/xorg.conf.d/98-vc4-no-glamor.conf' ]]" "Missing X11 no-glamor config"
     vcheck "[[ -f '$MNT_ROOT/etc/systemd/system/lightdm.service.d/hdmi-on-demand.conf' && -f '$MNT_ROOT/etc/systemd/system/cz-hdmi-hotplug.service' && -f '$MNT_ROOT/etc/default/cz-hdmi-desktop' ]]" "Missing on-demand HDMI desktop units/config"
     vcheck "[[ -f '$MNT_ROOT/var/lib/systemd/linger/kali' ]]" "Missing systemd linger for kali"
-    vcheck "[[ -x '$MNT_ROOT/usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch' && -f '$MNT_ROOT/usr/lib/cz-kali/M5CardputerZero-APPLaunch.m5' ]] && ! cmp -s '$MNT_ROOT/usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch' '$MNT_ROOT/usr/lib/cz-kali/M5CardputerZero-APPLaunch.m5'" "APPLaunch missing or sort patch not applied"
+    vcheck "[[ -x '$MNT_ROOT/usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch' && -f '$MNT_ROOT/usr/lib/cz-kali/M5CardputerZero-APPLaunch.m5' ]] && ! cmp -s '$MNT_ROOT/usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch' '$MNT_ROOT/usr/lib/cz-kali/M5CardputerZero-APPLaunch.m5'" "APPLaunch missing or sort/power patch not applied"
     vcheck "[[ -f '$MNT_ROOT/usr/lib/cz-kali/libcz_fb_lcd.so' ]]" "Missing libcz_fb_lcd.so"
-    vcheck "grep -q 'LV_LINUX_FBDEV_DEVICE=/dev/fb_lcd' '$MNT_ROOT/etc/systemd/user/APPLaunch.service.d/wait-for-udev.conf'" "APPLaunch missing LV_LINUX_FBDEV_DEVICE=/dev/fb_lcd"
+    vcheck "grep -q 'LV_LINUX_FBDEV_DEVICE=/dev/fb_lcd' '$MNT_ROOT/etc/systemd/user/APPLaunch.service.d/wait-for-udev.conf' && grep -q 'stop fb_load.service' '$MNT_ROOT/etc/systemd/user/APPLaunch.service.d/wait-for-udev.conf'" "APPLaunch drop-in missing LV_LINUX_FBDEV_DEVICE or fb_load stop"
     vcheck "[[ -x '$MNT_ROOT/usr/bin/camera_app' ]] && grep -q '$RPI_LIBCAMERA_DIR' '$MNT_ROOT/usr/bin/camera_app'" "Camera wrapper invalid"
     vcheck "dpkg_installed python3-requests && dpkg_installed kali-tweaks" "Missing python3-requests or kali-tweaks"
     for kbin in cz-sysmon cz-term80 cz-wifiscan cz-lanscan cz-pktsniff cz-usbgadget cz-kali-menu cz-kali-pkgs cz-usb-gadget cz-hw-status cz-hdmi-hotplug monstart monstop; do

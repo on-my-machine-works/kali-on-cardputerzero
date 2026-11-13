@@ -10,13 +10,19 @@ configure-kali-launcher.py — Configure CardputerZero APPLaunch for Kali Linux:
      identity parity so every item appears in Settings -> Launcher toggles.
   4. Seed /home/kali/.config/cardputerzero/config.json (and /etc/skel) with all
      configurable app_* and app_desktop_* keys.
-  5. Patch M5CardputerZero-APPLaunch's launcher_sort_app_display_order comparator
-     so custom preinstalled entries sort ahead of built-in M5 entries.
+  5. Patch M5CardputerZero-APPLaunch's ELF64 binary for carousel sort order and
+     handheld battery/CPU/RAM efficiency:
+       - Custom preinstalled entries sort ahead of built-in M5 entries.
+       - Disable Cp0SystemSoundPlayer's always-open 50 Hz miniaudio silence stream
+         and startup float32 SFX cache decode (keeps ES8389 DAC/I2S and PipeWire idle).
+       - Eliminate infinite 30 FPS LVGL animations (carousel title scrolling, charging
+         highlight shimmer bar, and unbounded overflowing label/guide scroll loops).
+       - Relax LVGL background timers and worker poll intervals (Wi-Fi nmcli, BQ27220
+         battery cache, BlueZ retry, directory watcher, watchdog, keypad/pipe poll).
 """
 
 import json
 import os
-import shutil
 import stat
 import struct
 import sys
@@ -260,13 +266,35 @@ def parse_desktop_identity(path: Path):
     )
 
 
-def patch_applaunch_elf64(elf_path: Path) -> None:
+def patch_applaunch_elf64(elf_path: Path, *, source_path: Path | None = None) -> None:
     """
-    Pure-Python ELF64 symbol-verified patcher for M5CardputerZero-APPLaunch:
-    Changes `mov w0, #0x7fffffff` (0x12b00000) -> `mov w0, #-1` (0x12800000)
-    at +0x48 and +0x64 inside launcher_sort_app_display_order's comparator lambda.
+    Pure-Python ELF64 symbol-bounded patcher for M5CardputerZero-APPLaunch:
+      1. launcher_sort_app_display_order comparator lambda:
+         `mov w0, #0x7fffffff` -> `mov w0, #-1` so custom preinstalled apps sort first.
+      2. Cp0SystemSoundPlayer::Impl::Impl() & decode_cache():
+         disable miniaudio's continuous 48 kHz 50 Hz silence stream and skip decoding
+         19 WAV/MP3 SFX files into float32 heap buffers.
+      3. UI animations that would otherwise spin LVGL + lv_draw_sw at 30 FPS forever:
+         - create_carousel_title() & snap_label_to_slot(): LV_LABEL_LONG_SCROLL_CIRCULAR (#3)
+           -> LV_LABEL_LONG_DOT (#1) so carousel titles truncate statically with "...".
+         - AppTopBarBatteryComponent::set_charging(bool): keep the #fff2a8 gold text color
+           indicator when charging, but skip the infinite 30 FPS 8px highlight bar animation
+           (which kept rendering 30 FPS on two threads even when locked / screen off).
+         - lv_label_refr_text() & LvSettingAdbGuidePage3::start_animation(): bound
+           LV_ANIM_REPEAT_INFINITE (-1) scroll/guide animations to finite repeat counts so
+           locking the device on a settings page never leaves a 30 FPS render loop running.
+      4. Background timers & polling threads:
+         relax lv_indev_create read timer (33ms -> 50ms), WifiSystem nmcli x3 poll (3s -> 60s),
+         cp0_sudo coordinator timer (20ms -> 250ms), EscUiWatchdog (50ms -> 250ms),
+         keyboard_read_thread poll timeout (100ms -> 500ms), cp0_runner pipe poll timeout
+         (20ms -> 100ms), cp0_external_app_runner wait sleep (10ms -> 50ms), battery warning
+         timer (250ms -> 2000ms), screensaver idle timer (500ms -> 1000ms), top-bar HH:MM clock
+         timer (1s -> 5s), top-bar fallback status timer (5s -> 15s), BluezWorker retry
+         (2s -> 30s), AppDirectoryWatcher RPC scan (3s -> 30s), and BQ27220 battery sampling
+         (3s -> 15s, within the 60s SnapshotCache::kStaleAfter window).
     """
-    data = bytearray(elf_path.read_bytes())
+    src = source_path if source_path is not None else elf_path
+    data = bytearray(src.read_bytes())
     if data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
         raise RuntimeError(f"{elf_path}: not a 64-bit little-endian ELF")
 
@@ -276,7 +304,7 @@ def patch_applaunch_elf64(elf_path: Path) -> None:
     sections = []
     for i in range(e_shnum):
         off = e_shoff + i * e_shentsize
-        sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size, sh_link, sh_info, sh_align, sh_entsize = (
+        sh_name, sh_type, _sh_flags, sh_addr, sh_offset, sh_size, sh_link, _sh_info, _sh_align, sh_entsize = (
             struct.unpack_from("<IIQQQQIIQQ", data, off)
         )
         sections.append((sh_name, sh_type, sh_addr, sh_offset, sh_size, sh_link, sh_entsize))
@@ -287,54 +315,331 @@ def patch_applaunch_elf64(elf_path: Path) -> None:
         end = data.index(0, shstr_off + name_off)
         return data[shstr_off + name_off : end].decode("ascii", errors="replace")
 
-    text_vma = text_off = None
+    rodata_sec = None
     symtab_sec = None
+    has_text = False
     for s in sections:
         nm = sec_name(s[0])
         if nm == ".text":
-            text_vma, text_off = s[2], s[3]
+            has_text = True
+        elif nm == ".rodata":
+            rodata_sec = s
         elif s[1] == 2:  # SHT_SYMTAB
             symtab_sec = s
 
-    if text_vma is None or symtab_sec is None:
-        raise RuntimeError(f"{elf_path}: missing .text or .symtab section (stripped?)")
+    if not has_text or rodata_sec is None or symtab_sec is None:
+        raise RuntimeError(f"{elf_path}: missing .text, .rodata, or .symtab section (stripped?)")
 
     _, _, _, sym_off, sym_size, str_idx, sym_entsize = symtab_sec
     str_off = sections[str_idx][3]
 
-    target_vma = None
-    prefix = b"_ZZ31launcher_sort_app_display_order"
-    for pos in range(sym_off, sym_off + sym_size, sym_entsize):
-        st_name, st_info, st_other, st_shndx, st_value, st_sz = struct.unpack_from("<IBBHQQ", data, pos)
-        if st_name == 0:
-            continue
-        end = data.index(0, str_off + st_name)
-        sname = bytes(data[str_off + st_name : end])
-        if sname.startswith(prefix):
-            target_vma = st_value
-            break
+    def u32(pos: int) -> int:
+        return struct.unpack_from("<I", data, pos)[0]
 
-    if target_vma is None:
-        raise RuntimeError(f"{elf_path}: comparator symbol {prefix.decode()} not found")
+    def w32(pos: int, val: int) -> None:
+        struct.pack_into("<I", data, pos, val)
 
-    fn_file_off = target_vma - text_vma + text_off
-    old_insn = bytes.fromhex("0000b012")  # mov w0, #0x7fffffff
-    new_insn = bytes.fromhex("00008012")  # mov w0, #-1
+    def find_symbol(name_or_prefix: bytes, *, exact: bool = False) -> tuple[int, int, int]:
+        hits = []
+        for pos in range(sym_off, sym_off + sym_size, sym_entsize):
+            st_name, _st_info, _st_other, st_shndx, st_value, st_sz = struct.unpack_from(
+                "<IBBHQQ", data, pos
+            )
+            if st_name == 0 or st_value == 0 or st_sz == 0 or st_shndx >= len(sections):
+                continue
+            end = data.index(0, str_off + st_name)
+            sname = bytes(data[str_off + st_name : end])
+            matched = (sname == name_or_prefix) if exact else sname.startswith(name_or_prefix)
+            if matched:
+                sec_vma, sec_off = sections[st_shndx][2], sections[st_shndx][3]
+                hits.append((st_value - sec_vma + sec_off, st_sz, st_value))
+        if len(hits) != 1:
+            raise RuntimeError(
+                f"{elf_path}: expected 1 symbol for {name_or_prefix.decode()}, found {len(hits)}"
+            )
+        return hits[0]
 
-    for rel in (0x48, 0x64):
-        p = fn_file_off + rel
-        cur = bytes(data[p : p + 4])
-        if cur == old_insn:
-            data[p : p + 4] = new_insn
-        elif cur == new_insn:
+    def is_bl_to(call_vma: int, insn: int, target_vma: int) -> bool:
+        if (insn & 0xFC000000) != 0x94000000:
+            return False
+        imm26 = insn & 0x03FFFFFF
+        if imm26 & (1 << 25):
+            imm26 -= 1 << 26
+        return (call_vma + imm26 * 4) == target_vma
+
+    def patch_guarded_u32(
+        fn_off: int,
+        fn_sz: int,
+        orig_words: tuple[int, ...],
+        new_word: int,
+        guard_fn,
+        desc: str,
+        *,
+        expected_count: int = 1,
+    ) -> None:
+        orig_hits = []
+        new_hits = []
+        for rel in range(0, fn_sz - 4 + 1, 4):
+            if not guard_fn(rel):
+                continue
+            p = fn_off + rel
+            cur = u32(p)
+            if cur in orig_words:
+                orig_hits.append(p)
+            elif cur == new_word:
+                new_hits.append(p)
+        if len(orig_hits) == expected_count and len(new_hits) == 0:
+            for p in orig_hits:
+                w32(p, new_word)
+        elif len(orig_hits) == 0 and len(new_hits) == expected_count:
             pass
         else:
-            raise RuntimeError(f"{elf_path}: unexpected instruction at +{hex(rel)}: {cur.hex()}")
+            raise RuntimeError(
+                f"{elf_path}: unexpected match count for {desc} "
+                f"(orig={len(orig_hits)}, new={len(new_hits)}, expected={expected_count})"
+            )
+
+    def patch_int64_const(
+        const_off: int, const_sz: int, orig_vals: tuple[int, ...], new_val: int, desc: str
+    ) -> None:
+        if const_sz != 8:
+            raise RuntimeError(f"{elf_path}: unexpected size {const_sz} for {desc}")
+        cur = struct.unpack_from("<q", data, const_off)[0]
+        if cur in orig_vals:
+            struct.pack_into("<q", data, const_off, new_val)
+        elif cur == new_val:
+            pass
+        else:
+            raise RuntimeError(f"{elf_path}: unexpected value {cur} for {desc}")
+
+    # 1. Carousel sort order: custom preinstalled apps before built-in M5 apps
+    sort_off, sort_sz, _ = find_symbol(b"_ZZ31launcher_sort_app_display_order")
+    for rel in (0x48, 0x64):
+        if rel + 4 > sort_sz:
+            raise RuntimeError(f"{elf_path}: comparator symbol smaller than expected ({hex(sort_sz)})")
+        p = sort_off + rel
+        cur = u32(p)
+        if cur == 0x12B00000:  # mov w0, #0x7fffffff
+            w32(p, 0x12800000)  # mov w0, #-1
+        elif cur == 0x12800000:
+            pass
+        else:
+            raise RuntimeError(f"{elf_path}: unexpected sort instruction at +{hex(rel)}: {cur:#010x}")
+
+    # 2. Cp0SystemSoundPlayer::Impl::Impl(): enabled_ = false (no idle 50 Hz silence stream)
+    snd_off, snd_sz, _ = find_symbol(b"_ZN20Cp0SystemSoundPlayer4ImplC1Ev", exact=True)
+    patch_guarded_u32(
+        snd_off,
+        snd_sz,
+        (0x52800021,),  # mov w1, #1
+        0x52800001,     # mov w1, #0
+        lambda rel: rel >= 4 and u32(snd_off + rel - 4) == 0x91032000,  # add x0, x0, #0xc8
+        "Cp0SystemSoundPlayer::Impl::enabled_ default",
+    )
+
+    # 3. Cp0SystemSoundPlayer::Impl::decode_cache(): early `ret` (skip SFX PCM cache in RAM)
+    dec_off, _, _ = find_symbol(b"_ZN20Cp0SystemSoundPlayer4Impl12decode_cache")
+    dec_entry = u32(dec_off)
+    if (dec_entry & 0xFFC003FF) == 0xD10003FF:  # sub sp, sp, #imm12
+        w32(dec_off, 0xD65F03C0)  # ret
+    elif dec_entry == 0xD65F03C0:
+        pass
+    else:
+        raise RuntimeError(f"{elf_path}: unexpected decode_cache prologue: {dec_entry:#010x}")
+
+    # 4. Home carousel title labels: LV_LABEL_LONG_SCROLL_CIRCULAR (#3) -> LV_LABEL_LONG_DOT (#1)
+    _, _, long_mode_vma = find_symbol(b"lv_label_set_long_mode", exact=True)
+    for sym_prefix, label_desc in (
+        (b"_ZN12_GLOBAL__N_121create_carousel_titleE", "create_carousel_title long_mode"),
+        (b"_ZN12_GLOBAL__N_1L18snap_label_to_slotE", "snap_label_to_slot long_mode"),
+    ):
+        fn_off, fn_sz, fn_vma = find_symbol(sym_prefix)
+        patch_guarded_u32(
+            fn_off,
+            fn_sz,
+            (0x52800061,),  # mov w1, #3 (LV_LABEL_LONG_SCROLL_CIRCULAR)
+            0x52800021,     # mov w1, #1 (LV_LABEL_LONG_DOT)
+            lambda rel, o=fn_off, s=fn_sz, v=fn_vma: (
+                rel + 12 <= s
+                and (u32(o + rel + 4) & 0xFFC003FF) == 0xF94003E0  # ldr x0, [sp, #uimm]
+                and is_bl_to(v + rel + 8, u32(o + rel + 8), long_mode_vma)
+            ),
+            label_desc,
+        )
+
+    # 4b. AppTopBarBatteryComponent::set_charging(bool): keep #fff2a8 gold text color when
+    #     charging, skip the infinite 30 FPS 8px highlight bar animation (`lv_anim_start`)
+    _, _, anim_delete_vma = find_symbol(b"lv_anim_delete", exact=True)
+    chg_off, chg_sz, chg_vma = find_symbol(b"_ZN25AppTopBarBatteryComponent12set_chargingEb", exact=True)
+    patch_guarded_u32(
+        chg_off,
+        chg_sz,
+        (0x540001C0,),  # b.eq +0x38 (branch to unhide shimmer bar & start infinite lv_anim)
+        0xD503201F,     # nop (keep shimmer bar hidden; text color is already updated above)
+        lambda rel: (
+            rel >= 4
+            and rel + 20 <= chg_sz
+            and u32(chg_off + rel - 4) == 0x7100001F  # cmp w0, #0
+            and is_bl_to(chg_vma + rel + 16, u32(chg_off + rel + 16), anim_delete_vma)
+        ),
+        "AppTopBarBatteryComponent::set_charging shimmer anim",
+    )
+
+    # 4c. Cap remaining infinite LVGL UI animations (LV_ANIM_REPEAT_INFINITE = -1) so leaving
+    #     or locking on a settings page with long labels / ADB guide stops cleanly at 0% CPU
+    _, _, anim_repeat_vma = find_symbol(b"lv_anim_set_repeat_count", exact=True)
+    for sym_key, new_rep_word, exp_cnt, rep_desc in (
+        (b"lv_label_refr_text", 0x52800041, 2, "lv_label_refr_text scroll repeat_count"),
+        (b"_ZN22LvSettingAdbGuidePage315start_animationEv", 0x52800061, 1, "LvSettingAdbGuidePage3 repeat_count"),
+    ):
+        fn_off, fn_sz, fn_vma = find_symbol(sym_key, exact=True)
+        patch_guarded_u32(
+            fn_off,
+            fn_sz,
+            (0x12800001,),  # mov w1, #-1 (LV_ANIM_REPEAT_INFINITE)
+            new_rep_word,   # mov w1, #2 or #3
+            lambda rel, o=fn_off, s=fn_sz, v=fn_vma: (
+                rel + 8 <= s and is_bl_to(v + rel + 4, u32(o + rel + 4), anim_repeat_vma)
+            ),
+            rep_desc,
+            expected_count=exp_cnt,
+        )
+
+    # 5. WifiSystem::poll_loop(): 3s (or 15s) -> 60s background nmcli x3 poll interval
+    wifi_off, wifi_sz, _ = find_symbol(b"_ZN10WifiSystem9poll_loopEv", exact=True)
+    patch_guarded_u32(
+        wifi_off,
+        wifi_sz,
+        (0x52800060, 0x528001E0),  # mov w0, #3 or mov w0, #15
+        0x52800780,                # mov w0, #60
+        lambda rel: rel + 8 <= wifi_sz and (u32(wifi_off + rel + 4) & 0xFFC003FF) == 0xB90003E0,
+        "WifiSystem::poll_loop interval",
+    )
+
+    # 6. Relax LVGL background periodic timers (`mov w1, #ms ; adrp ; add ; bl lv_timer_create`)
+    _, _, timer_create_vma = find_symbol(b"lv_timer_create", exact=True)
+    for sym_key, is_exact, orig_ms_word, new_ms_word, timer_desc in (
+        # LVGL input device read timer: 33ms (30 Hz) -> 50ms (20 Hz)
+        (b"lv_indev_create", True, 0x52800421, 0x52800641, "lv_indev_create read timer"),
+        # cp0_sudo coordinator timer: 20ms (50 Hz) -> 250ms (4 Hz)
+        (b"_ZN12_GLOBAL__N_115execute_actionsESt6vectorIN8cp0_sudo6ActionE", False, 0x52800281, 0x52801F41, "cp0_sudo coordinator timer"),
+        # Low-battery warning check: 250ms (4 Hz) -> 2000ms (0.5 Hz)
+        (b"_ZN19launcher_battery_ui12init_warningEv", True, 0x52801F41, 0x5280FA01, "battery warning timer"),
+        # Screensaver idle poll: 500ms (2 Hz) -> 1000ms (1 Hz)
+        (b"ui_screensaver_init", True, 0x52803E81, 0x52807D01, "ui_screensaver_init timer"),
+        # Top-bar HH:MM clock refresh (no seconds shown): 1000ms -> 5000ms
+        (b"_ZZN15AppTopBarRegion6enableEvENKUlvE0_clEv", True, 0x52807D01, 0x52827101, "AppTopBarRegion clock timer"),
+        # Top-bar fallback status refresh (signals push immediately): 5000ms -> 15000ms
+        (b"_ZZN15AppTopBarRegion6enableEvENKUlvE1_clEv", True, 0x52827101, 0x52875301, "AppTopBarRegion status timer"),
+        # AppDirectoryWatcher .desktop RPC scan: 3000ms -> 30000ms
+        (b"_ZN19AppDirectoryWatcher5startE", False, 0x52817701, 0x528EA601, "AppDirectoryWatcher timer"),
+        # Battery UI model poll: 3000ms -> 15000ms
+        (b"_ZZ12init_batteryENKUlvE0_clEv", True, 0x52817701, 0x52875301, "init_battery timer"),
+    ):
+        fn_off, fn_sz, fn_vma = find_symbol(sym_key, exact=is_exact)
+        patch_guarded_u32(
+            fn_off,
+            fn_sz,
+            (orig_ms_word,),
+            new_ms_word,
+            lambda rel, o=fn_off, s=fn_sz, v=fn_vma: (
+                rel + 16 <= s and is_bl_to(v + rel + 12, u32(o + rel + 12), timer_create_vma)
+            ),
+            timer_desc,
+        )
+
+    # Keep screensaver update_timer_period() idle period matched at 1000ms (hold_pending stays 100ms)
+    _, _, timer_set_period_vma = find_symbol(b"lv_timer_set_period", exact=True)
+    utp_off, utp_sz, utp_vma = find_symbol(b"_ZN12_GLOBAL__N_119update_timer_periodEv", exact=True)
+    patch_guarded_u32(
+        utp_off,
+        utp_sz,
+        (0x52803E80,),  # mov w0, #500
+        0x52807D00,     # mov w0, #1000
+        lambda rel: rel + 16 <= utp_sz and is_bl_to(utp_vma + rel + 12, u32(utp_off + rel + 12), timer_set_period_vma),
+        "screensaver update_timer_period idle period",
+    )
+
+    # 7. EscUiWatchdog::run() condition_variable::wait_for duration: 50ms -> 250ms
+    wd_off, wd_sz, wd_vma = find_symbol(b"_ZN13EscUiWatchdog3runEv", exact=True)
+    wd_ro_vma = None
+    for rel in range(0, wd_sz - 12 + 1, 4):
+        i0, i1, i2 = u32(wd_off + rel), u32(wd_off + rel + 4), u32(wd_off + rel + 8)
+        if (i0 & 0x9F00001F) == 0x90000000 and (i1 & 0xFFC003FF) == 0x91000002 and i2 == 0xAA0303E0:
+            imm = (((i0 >> 5) & 0x7FFFF) << 2) | ((i0 >> 29) & 0x3)
+            if imm & (1 << 20):
+                imm -= 1 << 21
+            wd_ro_vma = ((wd_vma + rel) & ~0xFFF) + (imm << 12) + ((i1 >> 10) & 0xFFF)
+            break
+    if wd_ro_vma is None or not (rodata_sec[2] <= wd_ro_vma <= rodata_sec[2] + rodata_sec[4] - 8):
+        raise RuntimeError(f"{elf_path}: could not resolve EscUiWatchdog::kPollInterval in .rodata")
+    patch_int64_const(
+        wd_ro_vma - rodata_sec[2] + rodata_sec[3],
+        8,
+        (50,),
+        250,
+        "EscUiWatchdog::kPollInterval",
+    )
+
+    # 8. Bq27220System::kSamplePeriod (.rodata int64 seconds): 3s -> 15s (kStaleAfter is 60s)
+    bq_off, bq_sz, _ = find_symbol(b"_ZN12_GLOBAL__N_113Bq27220System13kSamplePeriodE", exact=True)
+    patch_int64_const(bq_off, bq_sz, (3,), 15, "Bq27220System::kSamplePeriod")
+
+    # 9. poll() shutdown-check timeouts (events still wake immediately on fd activity):
+    #    - keyboard_read_thread: 100ms -> 500ms
+    #    - cp0_runner::run (PTY/pipe reader): 20ms -> 100ms
+    for sym_key, is_exact, orig_poll_word, new_poll_word, poll_desc in (
+        (b"keyboard_read_thread", True, 0x52800C82, 0x52803E82, "keyboard_read_thread poll timeout"),
+        (b"_ZN10cp0_runner3runE", False, 0x52800282, 0x52800C82, "cp0_runner::run poll timeout"),
+    ):
+        fn_off, fn_sz, _ = find_symbol(sym_key, exact=is_exact)
+        patch_guarded_u32(
+            fn_off,
+            fn_sz,
+            (orig_poll_word,),
+            new_poll_word,
+            lambda rel, o=fn_off, s=fn_sz: (
+                rel + 12 <= s
+                and u32(o + rel + 4) == 0xD2800041  # mov x1, #2
+                and (u32(o + rel + 8) & 0xFC000000) == 0x94000000  # bl poll@plt
+            ),
+            poll_desc,
+        )
+
+    # 10. BluezWorker::schedule_manager_retry(): 2s -> 30s when Bluetooth adapter is off/absent
+    bz_off, bz_sz, _ = find_symbol(b"_ZN12_GLOBAL__N_111BluezWorker22schedule_manager_retryEv", exact=True)
+    patch_guarded_u32(
+        bz_off,
+        bz_sz,
+        (0x52800040,),  # mov w0, #2
+        0x528003C0,     # mov w0, #30
+        lambda rel: (
+            rel + 12 <= bz_sz
+            and (u32(bz_off + rel + 4) & 0xFC000000) == 0x94000000  # bl g_timeout_source_new_seconds@plt
+            and (u32(bz_off + rel + 8) & 0xFFC003FF) == 0xF90003E0  # str x0, [sp, #uimm]
+        ),
+        "BluezWorker::schedule_manager_retry interval",
+    )
+
+    # 11. cp0_external_app_runner::run(): 10ms -> 50ms child-app wait loop sleep
+    run_off, run_sz, _ = find_symbol(b"_ZN23cp0_external_app_runner3runEPKcb", exact=True)
+    patch_guarded_u32(
+        run_off,
+        run_sz,
+        (0x52800140,),  # mov w0, #10
+        0x52800640,     # mov w0, #50
+        lambda rel: rel + 8 <= run_sz and (u32(run_off + rel + 4) & 0xFFC003FF) == 0xB90003E0,
+        "cp0_external_app_runner::run sleep",
+    )
 
     tmp = elf_path.with_suffix(".patching")
-    tmp.write_bytes(data)
-    os.chmod(tmp, 0o755)
-    tmp.replace(elf_path)
+    try:
+        tmp.write_bytes(data)
+        os.chmod(tmp, 0o755)
+        tmp.replace(elf_path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def main() -> int:
@@ -389,7 +694,6 @@ def main() -> int:
 
     # Ensure M5 .desktop files have later mtimes than Kali .desktop files
     # and register them in preinstalled-desktop-apps.tsv so they are toggleable too
-    kali_names = {a["filename"] for a in KALI_APPS}
     m5_ts = 1780272000  # 2026-06-01T00:00:00Z
     for idx, dfile in enumerate(sorted(apps_dir.glob("*.desktop"))):
         if dfile.name not in kali_names:
@@ -448,21 +752,21 @@ def main() -> int:
                 merged[k] = v
         cfg_file.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
-    # 5. Patch M5CardputerZero-APPLaunch carousel sort order
-    #    Use atomic temp-file + os.replace so live updates succeed even while
-    #    M5CardputerZero-APPLaunch is actively executing (avoids ETXTBSY).
+    # 5. Patch M5CardputerZero-APPLaunch sort order & idle-power behavior.
+    #    Read directly from the diverted pristine .m5 binary when available and
+    #    atomically replace the destination once (avoids ETXTBSY while running).
     applaunch_bin = applaunch_dir / "bin/M5CardputerZero-APPLaunch"
     diverted_orig = root / "usr/lib/cz-kali/M5CardputerZero-APPLaunch.m5"
     if diverted_orig.exists():
         applaunch_bin.parent.mkdir(parents=True, exist_ok=True)
-        tmp_copy = applaunch_bin.with_suffix(".orig.tmp")
-        shutil.copy2(diverted_orig, tmp_copy)
-        os.chmod(tmp_copy, 0o755)
-        tmp_copy.replace(applaunch_bin)
-    if applaunch_bin.exists():
+        patch_applaunch_elf64(applaunch_bin, source_path=diverted_orig)
+    elif applaunch_bin.exists():
         patch_applaunch_elf64(applaunch_bin)
 
-    print(f"[OK] Configured {len(KALI_APPS)} Kali launcher apps + manifest + config.json + carousel sort order")
+    print(
+        f"[OK] Configured {len(KALI_APPS)} Kali launcher apps + manifest + config.json "
+        "+ APPLaunch sort & idle-power patches"
+    )
     return 0
 
 
