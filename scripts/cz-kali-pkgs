@@ -5,10 +5,13 @@
 # Usage:
 #   cz-kali-pkgs                         # Interactive menu
 #   cz-kali-pkgs list                    # List presets and free disk space
-#   sudo cz-kali-pkgs install <preset>   # wireless|top10|sniff|hardware|webpass|headless|default|<pkg...>
+#   sudo cz-kali-pkgs install <preset>   # wireless|top10|sniff|hardware|webpass|headless|default|zero2zero|<pkg...>
 #   sudo cz-kali-pkgs upgrade            # Safe apt full-upgrade (preserves CM0 kernel/fw holds)
 
 set -uo pipefail
+
+Z2Z_RELEASE_BASE="${Z2Z_RELEASE_BASE:-https://github.com/on-my-machine-works/zero2zero/releases/latest/download}"
+Z2Z_RELEASE_API="${Z2Z_RELEASE_API:-https://api.github.com/repos/on-my-machine-works/zero2zero/releases/latest}"
 
 HEAVY_BOOT_SERVICES=(
     apache2.service
@@ -122,6 +125,63 @@ install_packages() {
     return "$rc"
 }
 
+install_zero2zero() {
+    local tmp_dir
+    tmp_dir="$(mktemp -d)" || return 1
+    chmod 0755 "$tmp_dir"
+
+    echo "[*] Downloading zero2zero release and SHA256SUMS..."
+    if ! curl -fsSL --retry 2 --connect-timeout 10 "$Z2Z_RELEASE_BASE/SHA256SUMS" -o "$tmp_dir/SHA256SUMS" || \
+       ! curl -fL --retry 2 --connect-timeout 10 "$Z2Z_RELEASE_BASE/zero2zero_arm64.deb" -o "$tmp_dir/zero2zero_arm64.deb"; then
+        echo "[!] Failed to download zero2zero release from GitHub." >&2
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    echo "[*] Verifying SHA-256 checksum..."
+    local sum_line
+    sum_line="$(grep '  zero2zero_arm64\.deb$' "$tmp_dir/SHA256SUMS" || true)"
+    if [[ -z "$sum_line" ]] || ! ( cd "$tmp_dir" && printf '%s\n' "$sum_line" | sha256sum -c - ); then
+        echo "[!] SHA-256 verification failed for zero2zero_arm64.deb!" >&2
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    echo "[*] Installing zero2zero_arm64.deb..."
+    sudo DEBIAN_FRONTEND=noninteractive dpkg -i "$tmp_dir/zero2zero_arm64.deb"
+    local rc=$?
+    if (( rc != 0 )); then
+        ensure_kernel_holds
+        sudo apt-get update && \
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -f -y \
+            -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confold"
+        rc=$?
+    fi
+    rm -rf "$tmp_dir"
+
+    if (( rc == 0 )); then
+        local zver
+        zver="$(dpkg-query -W -f='${Version}' zero2zero 2>/dev/null || echo 'installed')"
+        echo "[+] zero2zero ($zver) installed (Zero2Zero available in APPLaunch)"
+    fi
+    return "$rc"
+}
+
+upgrade_zero2zero_if_installed() {
+    dpkg -s zero2zero >/dev/null 2>&1 || return 0
+    local cur_ver latest_tag latest_ver
+    cur_ver="$(dpkg-query -W -f='${Version}' zero2zero 2>/dev/null || true)"
+    [[ -n "$cur_ver" ]] || return 0
+
+    latest_tag="$(curl -fsSL --connect-timeout 5 "$Z2Z_RELEASE_API" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tag_name",""))' 2>/dev/null || true)"
+    latest_ver="${latest_tag#v}"
+    if [[ -n "$latest_ver" ]] && dpkg --compare-versions "$latest_ver" gt "$cur_ver"; then
+        echo "[*] Updating zero2zero ($cur_ver -> $latest_ver)..."
+        install_zero2zero || true
+    fi
+}
+
 run_upgrade() {
     echo "[*] Preserving CM0 kernel/firmware holds..."
     ensure_kernel_holds
@@ -132,6 +192,7 @@ run_upgrade() {
     sudo apt-get autoremove -y && \
     sudo apt-get clean
     disable_heavy_boot_daemons
+    upgrade_zero2zero_if_installed
     echo "[+] Upgrade complete (Free: $(free_human))"
 }
 
@@ -158,6 +219,7 @@ print_list() {
     echo "  webpass   (~6G)  kali-tools-web + kali-tools-passwords"
     echo "  headless  (~10G) kali-linux-headless (full CLI Kali suite)"
     echo "  default   (~15G) kali-linux-default  (full Kali desktop + CLI suite)"
+    echo "  zero2zero (~1M)  Flipper Zero BLE companion (z2z-ui, z2z, zero2zero.fap)"
 }
 
 case "${1:-menu}" in
@@ -176,7 +238,9 @@ case "${1:-menu}" in
     install)
         shift
         [[ $# -gt 0 ]] || { print_list; exit 1; }
-        if spec="$(resolve_preset "$1")"; then
+        if [[ $# -eq 1 && ( "$1" == "zero2zero" || "$1" == "z2z" ) ]]; then
+            install_zero2zero
+        elif spec="$(resolve_preset "$1")"; then
             min_req="${spec%%|*}"
             read -r -a preset_pkgs <<< "${spec#*|}"
             install_packages "$min_req" "${preset_pkgs[@]}"
@@ -199,8 +263,8 @@ while true; do
     echo "=== KALI PACKAGES [Free: $(free_human)] ==="
     echo "1)Wireless   2)Top10      3)Sniff/Spoof"
     echo "4)Hardware   5)Web+Pass   6)Headless"
-    echo "7)Default    t)kali-tweaks u)AptUpgrade"
-    echo "c)CustomPkg  r)CleanCache q)Quit"
+    echo "7)Default    z)Zero2Zero  t)kali-tweaks"
+    echo "u)AptUpgrade c)CustomPkg  r)Clean q)Quit"
     read -r -p "Select> " sel || exit 0
     case "$sel" in
         1|2|3|4|5|6|7)
@@ -212,6 +276,16 @@ while true; do
             read -r -p "Install now? [Y/n]: " ok_go || continue
             if [[ -z "$ok_go" || "$ok_go" =~ ^[Yy]$ ]]; then
                 install_packages "$min_req" "${preset_pkgs[@]}" || true
+                pause_key
+            fi
+            ;;
+        z|Z)
+            clear || true
+            zcur="$(dpkg-query -W -f='${Version}' zero2zero 2>/dev/null || echo 'not installed')"
+            echo "zero2zero: Flipper BLE companion ($zcur)"
+            read -r -p "Install/Update now? [Y/n]: " ok_z2z || continue
+            if [[ -z "$ok_z2z" || "$ok_z2z" =~ ^[Yy]$ ]]; then
+                install_zero2zero || true
                 pause_key
             fi
             ;;
