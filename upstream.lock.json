@@ -3,7 +3,7 @@
   "pigen": {
     "repo": "CardputerZero/pi-gen",
     "branch": "cardputerzero_v1.0",
-    "commit": "e3b4e323782a59a426b92356248f5bc09a098be1",
+    "commit": "6ea0430e6c4f848126640496ef51d10a2450e569",
     "assets": {
       "stage0/02-firmware/files/kernel.pref": "a5de6a4e9b8fe512ea479ae1c7bc64a584cad394b79d7719b718c7ff2bfac084",
       "stage2/05-cardputerzero/files/splash.bmp": "21466ad04871484b878dc18b409a61ba97e5e08880a0e48f35f3f7420a270091",
@@ -120,10 +120,10 @@
       ],
       "asset_regex": "^m5cardputerzero-compass_[^/]+_m5stack1_arm64\\.deb$",
       "locked": {
-        "tag": "v1.0.0",
-        "filename": "m5cardputerzero-compass_0.2.4_m5stack1_arm64.deb",
-        "url": "https://github.com/CardputerZero/Compass/releases/download/v1.0.0/m5cardputerzero-compass_0.2.4_m5stack1_arm64.deb",
-        "sha256": "11ab1e4a0a1089dd48ae5c5c73248ea9d289b321c457bff225ae41c9529270bc"
+        "tag": "v1.0.1",
+        "filename": "m5cardputerzero-compass_1.0.1_m5stack1_arm64.deb",
+        "url": "https://github.com/CardputerZero/Compass/releases/download/v1.0.1/m5cardputerzero-compass_1.0.1_m5stack1_arm64.deb",
+        "sha256": "6ce492bb00b23fff4c61839eb8cd18d968e127966f241a290ad48036d6963b7e"
       }
     },
     {
