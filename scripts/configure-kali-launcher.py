@@ -16,10 +16,13 @@ configure-kali-launcher.py — Configure CardputerZero APPLaunch for Kali Linux:
        - Disable Cp0SystemSoundPlayer's always-open 50 Hz miniaudio silence stream
          and startup float32 SFX cache decode (keeps ES8389 DAC/I2S and PipeWire idle).
        - Eliminate infinite 30 FPS LVGL animations (charging highlight shimmer bar,
-         and bound circular title marquee / guide scroll loops to 3 passes so long app
-         titles scroll cleanly when navigating and park at x=0 with 0% idle CPU).
-       - Relax LVGL background timers and worker poll intervals (Wi-Fi nmcli, BQ27220
-         battery cache, BlueZ retry, directory watcher, watchdog, keypad/pipe poll).
+         low-battery top-bar opacity pulse, critical <5% full-screen alpha-blend flash,
+         leaked hidden ui_loading spinner animations after app/page launch, and bound
+         circular title marquee / guide scroll loops to 3 passes so long app titles
+         scroll cleanly when navigating and park at x=0 with 0% idle CPU).
+       - Relax LVGL background, Settings async-drain, and built-in PTY poll timers plus
+         worker poll intervals (Wi-Fi nmcli, BQ27220 battery cache, BlueZ retry,
+         directory watcher, watchdog, keypad/pipe poll).
 """
 
 import json
@@ -282,19 +285,29 @@ def patch_applaunch_elf64(elf_path: Path, *, source_path: Path | None = None) ->
          - AppTopBarBatteryComponent::set_charging(bool): keep the #fff2a8 gold text color
            indicator when charging, but skip the infinite 30 FPS 8px highlight bar animation
            (which kept rendering 30 FPS on two threads even when locked / screen off).
+         - AppTopBarBatteryComponent::set_low_battery_blink(bool): keep static #ff6b6b red
+           battery percentage text at full opacity, skipping the infinite 30 FPS opacity
+           fade (which also stayed active while charging at <=2% or locked).
+         - launcher_battery_ui::timer_cb(): keep the critical <5% modal, shutdown countdown,
+           and static red screen tint, skipping the full-screen 320x240 bg_opa alpha flash.
+         - ui_loading::hide(): delegate to ui_loading::shutdown() so the loading overlay's
+           lv_spinner and its two LV_ANIM_REPEAT_INFINITE 30 Hz animations are deleted after
+           every app/page launch instead of running hidden forever.
          - lv_label_refr_text() & LvSettingAdbGuidePage3::start_animation(): bound
            LV_ANIM_REPEAT_INFINITE (-1) scroll/guide animations to 3 passes (rested at
            dsc.ofs.x = 0, re-triggered automatically on every carousel step) so idle or
            locked screens drop to 0% render CPU.
-      4. Background timers & polling threads:
-         relax lv_indev_create read timer (33ms -> 50ms), WifiSystem nmcli x3 poll (3s -> 60s),
-         cp0_sudo coordinator timer (20ms -> 250ms), EscUiWatchdog (50ms -> 250ms),
-         keyboard_read_thread poll timeout (100ms -> 500ms), cp0_runner pipe poll timeout
-         (20ms -> 100ms), cp0_external_app_runner wait sleep (10ms -> 50ms), battery warning
-         timer (250ms -> 2000ms), screensaver idle timer (500ms -> 1000ms), top-bar HH:MM clock
-         timer (1s -> 5s), top-bar fallback status timer (5s -> 15s), BluezWorker retry
-         (2s -> 30s), AppDirectoryWatcher RPC scan (3s -> 30s), and BQ27220 battery sampling
-         (3s -> 15s, within the 60s SnapshotCache::kStaleAfter window).
+      4. Background, Settings, & terminal timers + polling threads:
+         relax lv_indev_create read timer (33ms -> 50ms), UISTPage PTY poll timer
+         (30ms -> 50ms, coalesced with lv_indev while draining all ready PTY bytes per tick),
+         Settings async-result drain timers (20ms/30ms/50ms -> 100ms), WifiSystem nmcli x3
+         poll (3s -> 60s), cp0_sudo coordinator timer (20ms -> 250ms), EscUiWatchdog
+         (50ms -> 250ms), keyboard_read_thread poll timeout (100ms -> 500ms), cp0_runner
+         pipe poll timeout (20ms -> 100ms), cp0_external_app_runner wait sleep (10ms -> 50ms),
+         battery warning timer (250ms -> 2000ms), screensaver idle timer (500ms -> 1000ms),
+         top-bar HH:MM clock timer (1s -> 5s), top-bar fallback status timer (5s -> 15s),
+         BluezWorker retry (2s -> 30s), AppDirectoryWatcher RPC scan (3s -> 30s), and BQ27220
+         battery sampling (3s -> 15s, within the 60s SnapshotCache::kStaleAfter window).
     """
     src = source_path if source_path is not None else elf_path
     data = bytearray(src.read_bytes())
@@ -471,8 +484,9 @@ def patch_applaunch_elf64(elf_path: Path, *, source_path: Path | None = None) ->
             label_desc,
         )
 
-    # 4b. AppTopBarBatteryComponent::set_charging(bool): keep #fff2a8 gold text color when
-    #     charging, skip the infinite 30 FPS 8px highlight bar animation (`lv_anim_start`)
+    # 4b. AppTopBarBatteryComponent::set_charging(bool) & set_low_battery_blink(bool):
+    #     keep #fff2a8 gold charging text and #ff6b6b red low-battery text at full opacity,
+    #     skip both infinite 30 FPS top-bar animations (`lv_anim_start`)
     _, _, anim_delete_vma = find_symbol(b"lv_anim_delete", exact=True)
     chg_off, chg_sz, chg_vma = find_symbol(b"_ZN25AppTopBarBatteryComponent12set_chargingEb", exact=True)
     patch_guarded_u32(
@@ -489,7 +503,61 @@ def patch_applaunch_elf64(elf_path: Path, *, source_path: Path | None = None) ->
         "AppTopBarBatteryComponent::set_charging shimmer anim",
     )
 
-    # 4c. Cap infinite LVGL label/guide animations (LV_ANIM_REPEAT_INFINITE = -1 -> 3 passes):
+    blink_off, blink_sz, blink_vma = find_symbol(
+        b"_ZN25AppTopBarBatteryComponent21set_low_battery_blinkEb", exact=True
+    )
+    patch_guarded_u32(
+        blink_off,
+        blink_sz,
+        (0x540000E0,),  # b.eq +0x1c (branch to start infinite 450ms+450ms opacity fade)
+        0xD503201F,     # nop (delete any anim, keep opa = 255 static #ff6b6b red text, return)
+        lambda rel: (
+            rel >= 24
+            and rel + 4 <= blink_sz
+            and u32(blink_off + rel - 4) == 0x7100001F  # cmp w0, #0
+            and is_bl_to(blink_vma + rel - 24, u32(blink_off + rel - 24), anim_delete_vma)
+        ),
+        "AppTopBarBatteryComponent::set_low_battery_blink pulse anim",
+    )
+
+    # 4c. launcher_battery_ui::timer_cb(): keep critical <5% modal, countdown, and static
+    #     red tint (bg_opa = 51), skipping the full-screen 320x240 bg_opa 51 <-> 127 flash
+    _, _, tick_elaps_vma = find_symbol(b"lv_tick_elaps", exact=True)
+    btm_off, btm_sz, btm_vma = find_symbol(
+        b"_ZN19launcher_battery_ui12_GLOBAL__N_18timer_cbEP11_lv_timer_t", exact=True
+    )
+    patch_guarded_u32(
+        btm_off,
+        btm_sz,
+        (0x52800020,),  # mov w0, #1 (should_flash = true when lv_tick_elaps > 499)
+        0x52800000,     # mov w0, #0 (should_flash = false; render() above still updates countdown)
+        lambda rel: (
+            rel >= 12
+            and rel + 4 <= btm_sz
+            and is_bl_to(btm_vma + rel - 12, u32(btm_off + rel - 12), tick_elaps_vma)
+            and u32(btm_off + rel - 8) == 0x7107CC1F  # cmp w0, #0x1f3
+        ),
+        "launcher_battery_ui::timer_cb full-screen alpha flash",
+    )
+
+    # 4d. ui_loading::hide(): tail-call ui_loading::shutdown() so the loading popup's
+    #     lv_spinner and both LV_ANIM_REPEAT_INFINITE 30 Hz arc animations are deleted
+    #     whenever loading finishes (recreated on demand via GlobalOverlayModel on next show)
+    hide_off, hide_sz, hide_vma = find_symbol(b"_ZN10ui_loading4hideEv", exact=True)
+    _, _, shutdown_vma = find_symbol(b"_ZN10ui_loading8shutdownEv", exact=True)
+    delta_insns = (shutdown_vma - hide_vma) // 4
+    if hide_sz < 4 or (shutdown_vma - hide_vma) % 4 != 0 or not (-(1 << 25) <= delta_insns < (1 << 25)):
+        raise RuntimeError(f"{elf_path}: invalid branch range from ui_loading::hide to shutdown")
+    b_shutdown_word = 0x14000000 | (delta_insns & 0x03FFFFFF)
+    hide_entry = u32(hide_off)
+    if hide_entry == 0xA9BF7BFD:  # stp x29, x30, [sp, #-16]!
+        w32(hide_off, b_shutdown_word)
+    elif hide_entry == b_shutdown_word:
+        pass
+    else:
+        raise RuntimeError(f"{elf_path}: unexpected ui_loading::hide prologue: {hide_entry:#010x}")
+
+    # 4e. Cap infinite LVGL label/guide animations (LV_ANIM_REPEAT_INFINITE = -1 -> 3 passes):
     #     carousel titles marquee 3 full cycles whenever navigated, then park cleanly at x = 0
     #     (no "..." truncation) and let LVGL auto-pause rendering at 0% idle/locked CPU
     _, _, anim_repeat_vma = find_symbol(b"lv_anim_set_repeat_count", exact=True)
@@ -521,11 +589,20 @@ def patch_applaunch_elf64(elf_path: Path, *, source_path: Path | None = None) ->
         "WifiSystem::poll_loop interval",
     )
 
-    # 6. Relax LVGL background periodic timers (`mov w1, #ms ; adrp ; add ; bl lv_timer_create`)
+    # 6. Relax LVGL background, Settings async-drain, and built-in PTY timers
+    #    (`mov w1, #ms ; adrp ; add ; bl lv_timer_create`)
     _, _, timer_create_vma = find_symbol(b"lv_timer_create", exact=True)
     for sym_key, is_exact, orig_ms_word, new_ms_word, timer_desc in (
         # LVGL input device read timer: 33ms (30 Hz) -> 50ms (20 Hz)
         (b"lv_indev_create", True, 0x52800421, 0x52800641, "lv_indev_create read timer"),
+        # Built-in terminal (UISTPage) PTY read poll: 30ms -> 50ms (coalesced with lv_indev)
+        (b"_ZZN8UISTPage12start_timersEvENKUlvE_clEv", True, 0x528003C1, 0x52800641, "UISTPage PTY poll timer"),
+        # Settings async-result queue drainers: 20ms/30ms/50ms -> 100ms (10 Hz)
+        (b"_ZN10DComponens17LvglComponensBase21ensure_async_dispatchEv", True, 0x52800281, 0x52800C81, "DComponens async dispatch timer"),
+        (b"_ZN22LvSettingAdbGuidePage39create_uiEP9_lv_obj_t", True, 0x528003C1, 0x52800C81, "LvSettingAdbGuidePage3 api timer"),
+        (b"_ZN22LvSettingWifiScanPage39create_uiEP9_lv_obj_t", True, 0x528003C1, 0x52800C81, "LvSettingWifiScanPage3 ui dispatch timer"),
+        (b"_ZN23LvSettingBluetoothPage39create_uiEP9_lv_obj_t", True, 0x52800641, 0x52800C81, "LvSettingBluetoothPage3 api timer"),
+        (b"_ZN28LvSettingBluetoothAliasPage39create_uiEP9_lv_obj_t", True, 0x52800641, 0x52800C81, "LvSettingBluetoothAliasPage3 api timer"),
         # cp0_sudo coordinator timer: 20ms (50 Hz) -> 250ms (4 Hz)
         (b"_ZN12_GLOBAL__N_115execute_actionsESt6vectorIN8cp0_sudo6ActionE", False, 0x52800281, 0x52801F41, "cp0_sudo coordinator timer"),
         # Low-battery warning check: 250ms (4 Hz) -> 2000ms (0.5 Hz)
