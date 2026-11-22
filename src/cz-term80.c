@@ -669,63 +669,8 @@ static void render_term(const struct term_state *t)
     }
 }
 
-/* Evdev keycode -> ASCII (unshifted, shifted) */
-static int keycode_to_ascii(int code, int shift)
-{
-    switch (code) {
-        case KEY_A: return shift ? 'A' : 'a';
-        case KEY_B: return shift ? 'B' : 'b';
-        case KEY_C: return shift ? 'C' : 'c';
-        case KEY_D: return shift ? 'D' : 'd';
-        case KEY_E: return shift ? 'E' : 'e';
-        case KEY_F: return shift ? 'F' : 'f';
-        case KEY_G: return shift ? 'G' : 'g';
-        case KEY_H: return shift ? 'H' : 'h';
-        case KEY_I: return shift ? 'I' : 'i';
-        case KEY_J: return shift ? 'J' : 'j';
-        case KEY_K: return shift ? 'K' : 'k';
-        case KEY_L: return shift ? 'L' : 'l';
-        case KEY_M: return shift ? 'M' : 'm';
-        case KEY_N: return shift ? 'N' : 'n';
-        case KEY_O: return shift ? 'O' : 'o';
-        case KEY_P: return shift ? 'P' : 'p';
-        case KEY_Q: return shift ? 'Q' : 'q';
-        case KEY_R: return shift ? 'R' : 'r';
-        case KEY_S: return shift ? 'S' : 's';
-        case KEY_T: return shift ? 'T' : 't';
-        case KEY_U: return shift ? 'U' : 'u';
-        case KEY_V: return shift ? 'V' : 'v';
-        case KEY_W: return shift ? 'W' : 'w';
-        case KEY_X: return shift ? 'X' : 'x';
-        case KEY_Y: return shift ? 'Y' : 'y';
-        case KEY_Z: return shift ? 'Z' : 'z';
-        case KEY_1: return shift ? '!' : '1';
-        case KEY_2: return shift ? '@' : '2';
-        case KEY_3: return shift ? '#' : '3';
-        case KEY_4: return shift ? '$' : '4';
-        case KEY_5: return shift ? '%' : '5';
-        case KEY_6: return shift ? '^' : '6';
-        case KEY_7: return shift ? '&' : '7';
-        case KEY_8: return shift ? '*' : '8';
-        case KEY_9: return shift ? '(' : '9';
-        case KEY_0: return shift ? ')' : '0';
-        case KEY_MINUS: return shift ? '_' : '-';
-        case KEY_EQUAL: return shift ? '+' : '=';
-        case KEY_LEFTBRACE: return shift ? '{' : '[';
-        case KEY_RIGHTBRACE: return shift ? '}' : ']';
-        case KEY_BACKSLASH: return shift ? '|' : '\\';
-        case KEY_SEMICOLON: return shift ? ':' : ';';
-        case KEY_APOSTROPHE: return shift ? '"' : '\'';
-        case KEY_GRAVE: return shift ? '~' : '`';
-        case KEY_COMMA: return shift ? '<' : ',';
-        case KEY_DOT: return shift ? '>' : '.';
-        case KEY_SLASH: return shift ? '?' : '/';
-        case KEY_SPACE: return ' ';
-        default: return 0;
-    }
-}
-
 static void send_key_to_pty(int pty_fd, const struct term_state *t,
+                            const char sym_map[CZ_TCA8418_SYM_MAX], int is_tca8418,
                             int code, int shift, int ctrl, int alt)
 {
     char seq[16];
@@ -747,11 +692,24 @@ static void send_key_to_pty(int pty_fd, const struct term_state *t,
         case KEY_LEFT:  slen = snprintf(seq, sizeof(seq), "\x1b%cD", pfx); break;
         case KEY_HOME:  memcpy(seq, "\x1b[H", 3); slen = 3; break;
         case KEY_END:   memcpy(seq, "\x1b[F", 3); slen = 3; break;
+        case KEY_INSERT:   memcpy(seq, "\x1b[2~", 4); slen = 4; break;
+        case KEY_DELETE:   memcpy(seq, "\x1b[3~", 4); slen = 4; break;
         case KEY_PAGEUP:   memcpy(seq, "\x1b[5~", 4); slen = 4; break;
         case KEY_PAGEDOWN: memcpy(seq, "\x1b[6~", 4); slen = 4; break;
-        case KEY_DELETE:   memcpy(seq, "\x1b[3~", 4); slen = 4; break;
+        case KEY_F1:  memcpy(seq, "\x1bOP", 3); slen = 3; break;
+        case KEY_F2:  memcpy(seq, "\x1bOQ", 3); slen = 3; break;
+        case KEY_F3:  memcpy(seq, "\x1bOR", 3); slen = 3; break;
+        case KEY_F4:  memcpy(seq, "\x1bOS", 3); slen = 3; break;
+        case KEY_F5:  memcpy(seq, "\x1b[15~", 5); slen = 5; break;
+        case KEY_F6:  memcpy(seq, "\x1b[17~", 5); slen = 5; break;
+        case KEY_F7:  memcpy(seq, "\x1b[18~", 5); slen = 5; break;
+        case KEY_F8:  memcpy(seq, "\x1b[19~", 5); slen = 5; break;
+        case KEY_F9:  memcpy(seq, "\x1b[20~", 5); slen = 5; break;
+        case KEY_F10: memcpy(seq, "\x1b[21~", 5); slen = 5; break;
+        case KEY_F11: memcpy(seq, "\x1b[23~", 5); slen = 5; break;
+        case KEY_F12: memcpy(seq, "\x1b[24~", 5); slen = 5; break;
         default: {
-            int ch = keycode_to_ascii(code, shift);
+            int ch = cz_evdev_to_ascii(sym_map, is_tca8418, code, shift);
             if (ch > 0) {
                 if (ctrl) {
                     if (ch >= 'a' && ch <= 'z') ch = ch - 'a' + 1;
@@ -760,6 +718,9 @@ static void send_key_to_pty(int pty_fd, const struct term_state *t,
                     else if (ch == '[') ch = 27;
                     else if (ch == '\\') ch = 28;
                     else if (ch == ']') ch = 29;
+                    else if (ch == '^' || ch == '~') ch = 30;
+                    else if (ch == '_' || ch == '/') ch = 31;
+                    else if (ch == '?') ch = 127;
                 }
                 if (alt) {
                     seq[0] = 0x1B;
@@ -846,9 +807,17 @@ int main(int argc, char **argv)
     if (flags >= 0) fcntl(master_fd, F_SETFL, flags | O_NONBLOCK);
 
     int in_fds[CZ_MAX_INPUT_FDS];
+    int in_tca8418[CZ_MAX_INPUT_FDS];
     int n_in = cz_inputs_open(in_fds, CZ_MAX_INPUT_FDS);
 
+    char tca_sym_map[CZ_TCA8418_SYM_MAX];
+    cz_tca8418_keymap_load(CZ_TCA8418_KEYMAP_PATH, tca_sym_map);
+
+    for (int i = 0; i < n_in; i++)
+        in_tca8418[i] = cz_is_tca8418_fd(in_fds[i]);
+
     int shift = 0, ctrl = 0, alt = 0;
+    cz_inputs_sync_modifiers(in_fds, n_in, &shift, &ctrl, &alt);
     double esc_down_at = 0.0;
     int dirty = 1;
 
@@ -914,7 +883,8 @@ int main(int argc, char **argv)
                     g_running = 0;
                     break;
                 }
-                send_key_to_pty(master_fd, ts, ev.code, shift, ctrl, alt);
+                send_key_to_pty(master_fd, ts, tca_sym_map, in_tca8418[i],
+                                ev.code, shift, ctrl, alt);
             }
         }
     }
