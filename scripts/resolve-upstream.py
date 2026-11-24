@@ -28,8 +28,8 @@ import tempfile
 from pathlib import Path
 
 KALI_MIRROR = os.environ.get("KALI_MIRROR", "https://kali.download/kali").rstrip("/")
-RPI_MIRROR = "https://archive.raspberrypi.com/debian"
-DEBIAN_MIRROR = "https://deb.debian.org/debian"
+RPI_MIRROR = os.environ.get("RPI_MIRROR", "https://archive.raspberrypi.com/debian").rstrip("/")
+DEBIAN_MIRROR = os.environ.get("DEBIAN_MIRROR", "https://deb.debian.org/debian").rstrip("/")
 M5_APT_MIRROR = "https://cardputer-zero-repo.oss-cn-shenzhen.aliyuncs.com/packages"
 
 RPI_BSP_PKGS = [
@@ -51,6 +51,13 @@ CAMERA_TRANSITIVE_PREFIXES = (
     "libboost-",
     "libabsl",
 )
+
+# Known SHA-256 digests for Raspberry Pi pool packages pruned from Packages.xz when
+# RPi bumps libcamera SONAME (e.g. 0.7 -> 0.8) while M5 CameraApp links libcamera.so.0.7.
+KNOWN_RPI_LIBCAMERA_POOL_SHA256 = {
+    ("libcamera0.7", "0.7.2+rpt20261009-1"): "371424b861f0a6611babab81561c66e7c8cb8160798fe31a2f011826673ff549",
+    ("libcamera-ipa", "0.7.2+rpt20261009-1"): "0ee197e03669f755dc437d5a1784b10eb12369fad299f5ef87dbc1bbc43a386f",
+}
 
 
 def log(msg: str) -> None:
@@ -129,12 +136,13 @@ def download_file(url: str, dest: Path, expected_sha256: str | None = None, head
 
     cmd = [
         "curl", "-fsSL",
-        "--retry", "4",
+        "-C", "-",
+        "--retry", "6",
         "--retry-all-errors",
         "--connect-timeout", "20",
-        "--max-time", "300",
-        "--speed-limit", "4096",
-        "--speed-time", "20",
+        "--max-time", "1800",
+        "--speed-limit", "2048",
+        "--speed-time", "30",
         "-o", str(part),
     ]
     if headers:
@@ -339,7 +347,7 @@ def gh_api_json(url: str, token: str):
     return json.loads(http_get(url, headers=headers, retries=3, timeout=30).decode("utf-8"))
 
 
-def validate_deb_file(deb_path: Path) -> tuple[bool, str]:
+def validate_deb_file(deb_path: Path, kali_pkgs: dict[str, dict] | None = None) -> tuple[bool, str]:
     if not deb_path.exists():
         return False, "missing file"
     p = subprocess.run(["dpkg-deb", "-f", str(deb_path), "Package", "Version", "Architecture"],
@@ -349,6 +357,14 @@ def validate_deb_file(deb_path: Path) -> tuple[bool, str]:
     arch = subprocess.check_output(["dpkg-deb", "-f", str(deb_path), "Architecture"], text=True).strip()
     if arch not in ("arm64", "all"):
         return False, f"unexpected Architecture '{arch}'"
+    if kali_pkgs is not None:
+        deps_raw = subprocess.check_output(["dpkg-deb", "-f", str(deb_path), "Depends"], text=True).strip()
+        for group in deps_raw.split(","):
+            alts = [re.split(r"[\s(:]", a.strip())[0].strip() for a in group.split("|") if a.strip()]
+            # Reject M5 candidate .debs that hard-depend on a newer libcamera0.x SONAME than Kali Rolling ships
+            if alts and all(re.fullmatch(r"libcamera\d+\.\d+", a) for a in alts):
+                if not any(a in kali_pkgs for a in alts):
+                    return False, f"Depends on {' | '.join(alts)} not yet in Kali Rolling APT"
     return True, "ok"
 
 
@@ -388,7 +404,7 @@ def detect_camera_libcamera_pkg(camera_deb: Path, rpi_pkgs: dict[str, dict]) -> 
                 m = re.search(r"libcamera\.so\.(\d+\.\d+)", out)
                 if m:
                     candidate = f"libcamera{m.group(1)}"
-                    if candidate in rpi_pkgs:
+                    if candidate in rpi_pkgs or candidate == "libcamera0.7":
                         return candidate
     except Exception:
         pass
@@ -398,15 +414,68 @@ def detect_camera_libcamera_pkg(camera_deb: Path, rpi_pkgs: dict[str, dict]) -> 
     return "libcamera0.7"
 
 
+def _abi_series_of_libcamera_pkg(pkg_name: str) -> str | None:
+    m = re.fullmatch(r"libcamera(\d+\.\d+)", pkg_name)
+    return m.group(1) if m else None
+
+
+def _ver_matches_abi(version: str, abi: str) -> bool:
+    ver_no_epoch = version.split(":", 1)[-1]
+    return ver_no_epoch == abi or ver_no_epoch.startswith(f"{abi}.")
+
+
 def resolve_camera_runtime_debs(root_pkg: str, rpi_pkgs: dict[str, dict], deb_pkgs: dict[str, dict]) -> list[dict]:
-    """Transitively resolve isolated RPi libcamera + libpisp + tflite + boost + absl .debs."""
+    """Transitively resolve isolated RPi libcamera + libpisp + tflite + boost + absl .debs
+    without ever mixing ABI series (e.g. libcamera0.7 with libcamera-ipa 0.8.0)."""
+    root_abi = _abi_series_of_libcamera_pkg(root_pkg)
+    root_stanza = rpi_pkgs.get(root_pkg) or deb_pkgs.get(root_pkg)
+    if not root_stanza and root_pkg == "libcamera0.7":
+        fallback_ver = "0.7.2+rpt20261009-1"
+        root_stanza = {
+            "Package": "libcamera0.7",
+            "Version": fallback_ver,
+            "BaseURL": RPI_MIRROR,
+            "Filename": f"pool/main/libc/libcamera/libcamera0.7_{fallback_ver}_arm64.deb",
+            "SHA256": KNOWN_RPI_LIBCAMERA_POOL_SHA256[("libcamera0.7", fallback_ver)],
+            "Depends": "libpisp1",
+        }
+
+    root_ver = root_stanza["Version"] if root_stanza else ""
+    root_ver_no_epoch = root_ver.split(":", 1)[-1]
+
     selected: dict[str, dict] = {}
     queue = [root_pkg, "libcamera-ipa"]
     while queue:
         pkg = queue.pop(0)
         if pkg in selected:
             continue
-        stanza = rpi_pkgs.get(pkg) or deb_pkgs.get(pkg)
+        if re.fullmatch(r"libcamera\d+\.\d+", pkg) and pkg != root_pkg:
+            # Never mix two libcamera0.x SONAMEs in /opt/rpi-libcamera.
+            continue
+
+        if pkg == root_pkg and root_stanza:
+            stanza = root_stanza
+        elif pkg == "libcamera-ipa" and root_abi and root_ver_no_epoch:
+            cand_ipa = rpi_pkgs.get("libcamera-ipa") or deb_pkgs.get("libcamera-ipa")
+            if cand_ipa and _ver_matches_abi(cand_ipa.get("Version", ""), root_abi):
+                stanza = cand_ipa
+            else:
+                cand_ver = cand_ipa.get("Version", "missing") if cand_ipa else "missing"
+                log(
+                    f"APT index libcamera-ipa ({cand_ver}) skews from {root_pkg} ({root_ver}); "
+                    f"pinning matching pool package libcamera-ipa_{root_ver_no_epoch}_arm64.deb"
+                )
+                stanza = {
+                    "Package": "libcamera-ipa",
+                    "Version": root_ver,
+                    "BaseURL": RPI_MIRROR,
+                    "Filename": f"pool/main/libc/libcamera/libcamera-ipa_{root_ver_no_epoch}_arm64.deb",
+                    "SHA256": KNOWN_RPI_LIBCAMERA_POOL_SHA256.get(("libcamera-ipa", root_ver_no_epoch), ""),
+                    "Depends": root_stanza.get("Depends", "") if root_stanza else "",
+                }
+        else:
+            stanza = rpi_pkgs.get(pkg) or deb_pkgs.get(pkg)
+
         if not stanza:
             continue
         selected[pkg] = stanza
@@ -414,8 +483,11 @@ def resolve_camera_runtime_debs(root_pkg: str, rpi_pkgs: dict[str, dict], deb_pk
         for group in deps_raw.split(","):
             first_alt = group.strip().split("|")[0].strip()
             dep_name = re.split(r"[\s(:]", first_alt)[0].strip()
-            if dep_name and dep_name.startswith(CAMERA_TRANSITIVE_PREFIXES) and dep_name not in selected:
-                queue.append(dep_name)
+            if not dep_name or not dep_name.startswith(CAMERA_TRANSITIVE_PREFIXES) or dep_name in selected:
+                continue
+            if re.fullmatch(r"libcamera\d+\.\d+", dep_name) and dep_name != root_pkg:
+                continue
+            queue.append(dep_name)
     return list(selected.values())
 
 
@@ -641,7 +713,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                     try:
                         tmp_cand = cache_dir / "apps" / f".cand_{c_name}"
                         c_sha = download_file(c_url, tmp_cand)
-                        ok_deb, reason = validate_deb_file(tmp_cand)
+                        ok_deb, reason = validate_deb_file(tmp_cand, kali_pkgs)
                         if not ok_deb:
                             raise RuntimeError(reason)
                         if slug == "launcher":
@@ -664,6 +736,8 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                             warnings_file,
                         )
 
+        if not chosen_deb.exists():
+            raise RuntimeError(f"Package {slug} could not be downloaded ({chosen_deb.name})")
         active_dest = cache_dir / "apps/active" / chosen_meta["filename"]
         if chosen_deb != active_dest:
             shutil.copy2(chosen_deb, active_dest)
@@ -686,7 +760,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     for st in cam_stanzas:
         fn = Path(st["Filename"]).name
         active_cam_files.add(fn)
-        download_file(f"{st['BaseURL']}/{st['Filename']}", cache_dir / "camera" / fn, st["SHA256"])
+        download_file(f"{st['BaseURL']}/{st['Filename']}", cache_dir / "camera" / fn, st.get("SHA256") or None)
     for f in (cache_dir / "camera").glob("*.deb"):
         if f.name not in active_cam_files:
             f.unlink()
