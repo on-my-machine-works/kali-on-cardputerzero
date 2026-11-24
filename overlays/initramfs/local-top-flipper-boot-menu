@@ -1,0 +1,104 @@
+#!/bin/sh
+# initramfs-tools local-top script: fast-path early-boot LCD OS Profile Picker.
+#
+# Boots straight through with near-zero delay UNLESS:
+#   (a) a key is held/pressed on the CardputerZero TCA8418 keypad (`Esc`, `4..8`, `Space`, etc.),
+#   (b) `bootmenu=1` (or `flipper.bootmenu=1`) is on `/proc/cmdline`, OR
+#   (c) a Btrfs BLS entry has exhausted its boot counter (`+*0-*.conf`).
+#
+# When triggered, brings up the 320x170 ST7789v3 LCD + backlight, runs `cz-boot-menu`,
+# and writes the chosen `subvol=@...` into `/conf/param.conf` for `mountroot`.
+
+PREREQ="udev"
+prereqs() {
+    echo "$PREREQ"
+}
+case "${1:-}" in
+    prereqs)
+        prereqs
+        exit 0
+        ;;
+esac
+
+BOOT_MENU_BIN=""
+if [ -x /usr/bin/cz-boot-menu ]; then
+    BOOT_MENU_BIN="/usr/bin/cz-boot-menu"
+elif [ -x /usr/bin/flipper-boot-menu ]; then
+    BOOT_MENU_BIN="/usr/bin/flipper-boot-menu"
+fi
+[ -n "$BOOT_MENU_BIN" ] || exit 0
+grep -q 'rootfstype=btrfs' /proc/cmdline 2>/dev/null || exit 0
+
+# Bring up I2C + TCA8418 keypad so `--check-hotkey` can inspect live key state
+for mod in btrfs i2c_bcm2835 i2c_mux i2c_mux_pinctrl regmap_i2c m5ioe1 matrix_keymap tca8418_keypad_m5stack; do
+    modprobe -q "$mod" 2>/dev/null || true
+done
+command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=2 2>/dev/null || true
+
+SHOW_MENU=0
+if "$BOOT_MENU_BIN" --check-hotkey >/dev/null 2>&1; then
+    SHOW_MENU=1
+fi
+
+# Also check if the root Btrfs `boot` subvolume contains a failed (`+0-`) BLS entry
+if [ "$SHOW_MENU" = 0 ]; then
+    ROOT_SPEC="$(sed -n 's/.*root=\([^ ]*\).*/\1/p' /proc/cmdline)"
+    ROOT_DEV=""
+    case "$ROOT_SPEC" in
+        PARTUUID=*|UUID=*|LABEL=*) ROOT_DEV="$(blkid -t "$ROOT_SPEC" -o device 2>/dev/null | head -n1)" ;;
+        /dev/*) ROOT_DEV="$ROOT_SPEC" ;;
+    esac
+    if [ -n "$ROOT_DEV" ] && [ -b "$ROOT_DEV" ]; then
+        mkdir -p /run/cz-bootchk
+        if mount -t btrfs -o ro,subvol=boot "$ROOT_DEV" /run/cz-bootchk 2>/dev/null; then
+            for f in /run/cz-bootchk/loader/entries/*+0-*.conf; do
+                if [ -f "$f" ]; then
+                    SHOW_MENU=1
+                    break
+                fi
+            done
+            umount /run/cz-bootchk 2>/dev/null || true
+        fi
+        rmdir /run/cz-bootchk 2>/dev/null || true
+    fi
+fi
+
+[ "$SHOW_MENU" = 1 ] || exit 0
+
+# Load SPI + ST7789v3 DRM panel + PWM backlight for the 320x170 UI
+for mod in spi_bcm2835 gpio_forwarder pwm_bl_m5stack drm_mipi_dbi panel_mipi_dbi panel_mipi_dbi_m; do
+    modprobe -q "$mod" 2>/dev/null || true
+done
+command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=3 2>/dev/null || true
+
+# Ensure LCD backlight is visible
+for bl in /sys/class/backlight/*; do
+    [ -w "$bl/brightness" ] || continue
+    max="$(cat "$bl/max_brightness" 2>/dev/null || echo 100)"
+    echo "$max" > "$bl/brightness" 2>/dev/null || true
+done
+
+CHOICE_FILE="/run/flipper-initramfs-choice"
+rm -f "$CHOICE_FILE"
+FLIPPER_INITRAMFS_OUT="$CHOICE_FILE" PATH="/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    "$BOOT_MENU_BIN" --no-tui || true
+
+if [ -f "$CHOICE_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$CHOICE_FILE"
+    rm -f "$CHOICE_FILE"
+    if [ -n "${FLIPPER_SUBVOL:-}" ]; then
+        mkdir -p /conf
+        touch /conf/param.conf
+        grep -v '^ROOTFLAGS=' /conf/param.conf > /conf/param.conf.tmp 2>/dev/null || true
+        printf 'ROOTFLAGS="subvol=%s"\n' "$FLIPPER_SUBVOL" >> /conf/param.conf.tmp
+        if [ -n "${FLIPPER_DEV:-}" ]; then
+            grep -v '^ROOT=' /conf/param.conf.tmp > /conf/param.conf.tmp2 2>/dev/null || true
+            mv -f /conf/param.conf.tmp2 /conf/param.conf.tmp
+            printf 'ROOT="%s"\n' "$FLIPPER_DEV" >> /conf/param.conf.tmp
+        fi
+        mv -f /conf/param.conf.tmp /conf/param.conf
+    fi
+fi
+
+exit 0

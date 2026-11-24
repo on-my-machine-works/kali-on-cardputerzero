@@ -1,0 +1,99 @@
+#!/bin/sh
+# SPDX-License-Identifier: LGPL-2.1-or-later
+#
+# Flipper One BLS boot-entry generator: a kernel-install plugin for layout=bls.
+#
+# The kernel/initrd staging and devicetree(dir) handling are derived from systemd's
+# 90-loaderentry.install (LGPL-2.1-or-later).
+#
+# Writes the standard BLS keys plus 'devicetreedir', U-Boot's alias of 'fdtdir'. The
+# entry-writing helpers are in /usr/lib/flipper-bls.sh, shared with the profile tools.
+
+set -e
+. /usr/lib/flipper-bls.sh
+
+COMMAND="${1:?}"
+KERNEL_VERSION="${2:?}"
+ENTRY_DIR_ABS="${3:?}"
+
+[ "$KERNEL_INSTALL_LAYOUT" = "bls" ] || exit 0
+
+BOOT_ROOT="${KERNEL_INSTALL_BOOT_ROOT:?}"
+ENTRY_TOKEN="${KERNEL_INSTALL_ENTRY_TOKEN:?}"
+MACHINE_ID="${KERNEL_INSTALL_MACHINE_ID:-}"
+CONF_ROOT="${KERNEL_INSTALL_CONF_ROOT:-/etc/kernel}"
+ENTRIES="$BOOT_ROOT/loader/entries"
+PROFILES="${FLIPPER_PROFILES:-/etc/kernel/flipper-profiles}"
+resolve_kconfig
+set_dtb_dirs
+[ -n "${BOOT_MNT:-}" ] || BOOT_MNT="/"
+
+# remove: every entry for this version that boots the current root, whatever its token.
+# kernel-install removes the staged dir itself.
+if [ "$COMMAND" = "remove" ]; then
+    remove_entries "$(booted_subvol)" "$KERNEL_VERSION"
+    # The per-token parent, if this was its last version. rmdir never takes a full one.
+    rmdir "$BOOT_ROOT/$ENTRY_TOKEN" 2>/dev/null || :
+    # Or a power cut brings back entries for a kernel whose modules are gone.
+    sync
+    exit 0
+fi
+[ "$COMMAND" = "add" ] || exit 0
+
+ENTRY_DIR="$(boot_rel "$ENTRY_DIR_ABS")"
+mkdir -p "$ENTRIES" || die "could not create '$ENTRIES'"
+
+# Base cmdline shared by every entry; profiles append their rootflags=subvol=.
+compute_base_opts
+
+# The os-release half of the sort-key; the rest is composed once the root is known.
+SORT_KEY_OS="$(os_sort_key)"
+
+# A single devicetree, optional, copied into the entry dir.
+DEVICETREE=""; DEVICETREE_ENTRY=""
+[ -f "$CONF_ROOT/devicetree" ] && read -r DEVICETREE <"$CONF_ROOT/devicetree" || :
+if [ -n "$DEVICETREE" ]; then
+    mkdir -p "$ENTRY_DIR_ABS"
+    for p in "$CONF_ROOT" $DTB_DIRS; do
+        [ -f "$p/$DEVICETREE" ] || continue
+        stage_file "$p/$DEVICETREE" "$ENTRY_DIR_ABS/${DEVICETREE##*/}"
+        DEVICETREE_ENTRY="$ENTRY_DIR/${DEVICETREE##*/}"
+        break
+    done
+    [ -n "$DEVICETREE_ENTRY" ] || die "device tree blob '$DEVICETREE' not found"
+fi
+
+discover_devicetreedir
+
+# apt only ever touches the booted root, so only its entry is written: a listed profile by
+# its line, anything else as a clone.
+CUR_SUBVOL="$(booted_subvol)"
+[ -n "$CUR_SUBVOL" ] || die "cannot determine current root subvol (findmnt)"
+
+# This profile's autoboot digit and band as its entries have them. Installing a kernel never
+# changes what boots: it has to be chosen in Config first.
+SORT_KEY="$(entry_sort_key "$CUR_SUBVOL" "$(token_band "$ENTRY_TOKEN")")"
+
+resolve_kernel_paths "$CUR_SUBVOL"
+
+matched=0
+if [ -f "$PROFILES" ]; then
+    while IFS='|' read -r tok suf extra gate dtbos legend; do
+        tok="$(echo "$tok" | tr -d '[:space:]')"
+        case "$tok" in ''|\#*) continue ;; esac
+        extra="$(trim "$extra")"
+        if [ "$(subvol_of "$extra")" = "$CUR_SUBVOL" ]; then
+            emit_entry "$(trim "$suf")" "$extra" "$(trim "$gate")" "$(trim "$dtbos")"
+            matched=1; break
+        fi
+    done <"$PROFILES"
+fi
+if [ "$matched" != 1 ]; then
+    # A clone inherits the overlays of its own existing entry, else its base profile's.
+    ovl="$(clone_overlay_line "$BASE_OPTS rootflags=subvol=$CUR_SUBVOL" "$CUR_SUBVOL" "/")"
+    emit_entry "$(printf '%s' "$CUR_SUBVOL" | tr -d '@')" "rootflags=subvol=$CUR_SUBVOL" "" "" "$ovl"
+fi
+
+# An entry lost to a power cut leaves a kernel installed that nothing boots.
+sync
+exit 0

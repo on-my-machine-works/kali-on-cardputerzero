@@ -1,0 +1,12 @@
+[connection]
+id=Router WAN Ethernet
+type=ethernet
+interface-name=eth0
+autoconnect=true
+autoconnect-priority=100
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto

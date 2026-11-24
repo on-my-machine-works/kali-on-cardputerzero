@@ -1,0 +1,85 @@
+#!/bin/sh
+# create-snapshot [-p @profile] [tag...] - read-only snapshot of a profile, kept as a restore
+# point inside @snapshots. To turn a snapshot into a writable, bootable root, use
+# create-profile <@source> <@dest>.
+# naming: @<root>_YYYY-MM-DD_HH-MM-SS[_tag]  e.g. @Minimal_2026-06-29_19-52-31
+#         (<root> = the profile snapshotted, e.g. @Desktop/@Minimal; tag slugified)
+# Works via a subvolid=5 (top-level) mount, so /.snapshots need not be mounted.
+#
+# Without -p/--profile the source is the running root (/). With it, any profile on the
+# filesystem, running or not, which is also how a snapshot is captured from a recovery boot
+# (where / is not btrfs at all) together with -d/--device.
+#
+# Examples:
+#   create-snapshot pre-upgrade               # RO snapshot of the booted @SourceProfile
+#   create-snapshot -p @Minimal pre-upgrade   # ... of @Minimal, whether or not it is running
+set -eu
+[ -r /usr/lib/flipper-btrfs.sh ] || { echo "Error: /usr/lib/flipper-btrfs.sh not found" >&2; exit 1; }
+. /usr/lib/flipper-btrfs.sh
+
+usage() {
+    cat <<EOF
+Usage: create-snapshot [-p|--profile @X] [-y|--yes] [-d|--device DEV] [tag...]
+  -p,--profile snapshot @X instead of the booted root (@X need not be running)
+$HELP_YES
+$HELP_DEVICE
+  Read-only snapshot into @snapshots, named @<root>_YYYY-MM-DD_HH-MM-SS[_tag].
+  Snapshots are always read-only; for a writable/bootable root use
+  create-profile <@source> <@dest>.
+EOF
+}
+
+prof=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -p|--profile)  shift; [ $# -ge 1 ] || { echo "Error: --profile needs an argument" >&2; usage >&2; exit 1; }; prof=$1 ;;
+        --profile=*)   prof=${1#*=} ;;
+        -d|--device)   shift; need_device_arg "$#"; ROOTDEV=$1 ;;
+        --device=*)    ROOTDEV=${1#*=} ;;
+        -y|--yes)  ASSUME_YES=1 ;;
+        -h|--help) usage; exit 0 ;;
+        --)        shift; break ;;
+        -?*)       echo "Error: unknown option: $1" >&2; usage >&2; exit 1 ;;
+        *)         break ;;
+    esac
+    shift
+done
+
+need_root
+need_btrfs
+if [ -n "$prof" ]; then
+    validate_profile_name "$prof"
+    # the generated name is parsed as @<profile>_<stamp> by the list tools, so a snapshot of
+    # something that is not a profile would show up there as a restore point of one
+    is_reserved_subvol "$prof" && die "Refusing to snapshot reserved subvolume: $prof"
+else
+    # -d names a filesystem we did not boot from, so there is no running root on it to default to
+    [ -z "${ROOTDEV:-}" ] || die "-d/--device needs -p/--profile to say which profile to snapshot"
+    root_is_btrfs || die "create-snapshot captures the running root unless -p/--profile names a profile; not available when / is not btrfs (e.g. RAM recovery)"
+fi
+
+tag=$*
+if [ -n "$tag" ]; then
+    tag=$(printf '%s' "$tag" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-\{1,\}/-/g; s/^-//; s/-$//')
+fi
+# name after the profile snapshotted, e.g. @Minimal_2026-06-29_19-52-31 (leaf only: booting a
+# snapshot must not nest the new name under @snapshots/@snapshots/)
+src=${prof:-$(booted_subvol)}; src=${src##*/}
+[ -n "$src" ] || die "Cannot determine the source subvolume of /"
+name="${src}_$(stamp)${tag:+_$tag}"
+
+set_lock
+mount_top
+[ -d "$TOP/@snapshots" ] || die "@snapshots not found at top level"
+# the booted root is reached as / so its own mount options apply; any other profile through $TOP
+from=/
+if [ -n "$prof" ]; then
+    [ -d "$TOP/$prof" ] || die "No such profile: $prof (see list-profiles)"
+    [ -n "$(subvol_id "$TOP/$prof")" ] || die "Not a subvolume: $prof"
+    from="$TOP/$prof"
+fi
+dest="$TOP/@snapshots/$name"; rel="@snapshots/$name"
+[ -e "$dest" ] && die "Already exists: $rel"
+
+btrfs subvolume snapshot -r "$from" "$dest" >/dev/null
+echo "Created $(btrfs subvolume show "$dest" | head -n1)"

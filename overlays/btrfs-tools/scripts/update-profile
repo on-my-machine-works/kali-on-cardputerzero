@@ -1,0 +1,706 @@
+#!/bin/sh
+# update-profile <build> [<@profile>] - move a profile onto the _stock of a newer build, keeping
+# what the user changed. A profile check-profile calls pristine, booted or customized is updated;
+# one whose packages or system files changed only with --force, which drops those changes: the new
+# build's packages and /usr are what it gets, and what an update carries goes over as always.
+# --force also takes a build that is not newer than the profile's, to go back to an older one or
+# reinstall its own.
+#
+# The build is looked up among the rootfs builds on the artifact server, its Minimal _stock
+# fetched in full and the profile's own as an increment over it, each received as it arrives and
+# checked against the build's sha256 on the way: one that breaks off or does not match is deleted
+# before anything is built from it. The profile is then renamed <@profile>-obsolete-<its build>, with a
+# boot entry of its own, and a snapshot of the new _stock made in its place (create-profile), onto
+# which the user's changes and the device identity are carried (migrate-profile --keep-identity).
+# Should that leave a conflict, or the result not check out, the new one is dropped and the old one
+# gets its name back, so nothing changes. The new profile boots at the next reboot. Stocks of
+# builds nothing is built from any more are deleted once an update has succeeded.
+#
+# Only a profile forced past its package or system changes is kept, since only there does the
+# update lose something: it stays bootable from the menu until deleted there or with
+# delete-profile. Its name sorts right after the profile's own, and the boot menu shows it as the
+# profile's name followed by "obsolete <build>". Any other old version is deleted, or when it is
+# the one running, set aside as <@profile>_old_<ts>, which the next boot of <@profile> removes.
+#
+# --rollback puts the newest kept build back in place of <@profile>. The one it replaces is
+# set aside as <@profile>_old_<ts> too.
+#
+# --every updates every profile on the drive to <build>, each through a run of this tool of its
+# own, so a stock two of them share is fetched once. A profile is left as it is when its packages
+# or system files changed (unless --force), when it is at <build> or later (unless --force), or
+# when <build> has no _stock of its kind; leftovers, kept builds and profiles with no origin build
+# are not profiles to update. One that fails is put back and the rest go on. It ends with a line
+# per profile: "result <@profile> updated <from> <to>", "result <@profile> blocked <state>",
+# "result <@profile> current <build>", "result <@profile> unavailable" or "result <@profile>
+# failed", and with --progress names each profile as it starts, "@profile <@profile>".
+#
+# --list says what an update could do, one fact per line, for a program to read: "profile <name>
+# <kind> <build>", "kept <build>" when there is one to roll back to, then "build <number> <branch>
+# <bytes to fetch>" per newer build that has this kind of profile, newest first, or with --all
+# per build that has one, older ones too. Whether the profile may be updated is check-profile's
+# to say, asked separately so the two can run at once.
+# --list --every says it for every profile: "profile <name> <kind> <build> <state>" each, with
+# check-profile's word as the state, "booted <@profile>" and "kept <build>" for the booted one
+# when there is one, then "build <number>
+# <branch> <bytes to fetch> <kinds>" per newer build some profile would move to, the kinds
+# comma-separated. With --all, as --force would: any state, any build.
+# --progress adds "@progress <percent> <step>" lines to an update's output.
+#
+# Exit status: 0 updated (or already current), 2 not updated because its packages or system
+# files changed (without --force) or it has unresolved migration conflicts, 3 rolled back
+# because the migration left conflicts, 1 error. With --every, 1 when any profile failed.
+#
+# Examples:
+#   update-profile 1201             # the booted profile
+#   update-profile -n 1201 @Router  # say what would happen
+#   update-profile --rollback       # back to the version before the last update
+#   update-profile --list           # the builds the booted profile could move to
+#   update-profile --every 1235     # every profile
+set -eu
+[ -r /usr/lib/flipper-btrfs.sh ] || { echo "Error: /usr/lib/flipper-btrfs.sh not found" >&2; exit 1; }
+. /usr/lib/flipper-btrfs.sh
+
+URL="${FLIPPER_UPDATE_URL:-https://dl-linux-images.flipp.dev/rootfs/}"
+
+usage() {
+    cat <<EOF
+Usage: update-profile [-n|--dry-run] [-f|--force] [-d|--device DEV] <build> [<@profile>]
+       update-profile --rollback [-d|--device DEV] [<@profile>]
+       update-profile --list [--all] [-d|--device DEV] [<@profile>]
+       update-profile --every [-n] [-f] [-d DEV] <build>
+       update-profile --list --every [--all] [-d|--device DEV]
+$HELP_DEVICE
+  -n,--dry-run say what would be fetched and done, change nothing
+  -f,--force   update a profile whose packages or system files changed too, dropping
+               those changes, or to a build that is not newer
+  --progress   also print "@progress <percent> <step>" lines
+  --rollback   put the version kept by the last update back
+  --list       the profile, the kept version and the builds it could move to
+  --all        with --list, the builds that are not newer too
+  --every      every profile on the drive rather than one
+  Update <@profile> (default: the booted one) to the _stock of rootfs build <build>,
+  carrying its config changes. Builds come from \$FLIPPER_UPDATE_URL ($URL).
+EOF
+}
+
+DRY=0
+FORCE=0
+ROLLBACK=0
+LIST=0
+ALL=0
+EVERY=0
+PROGRESS=0
+DEV=""
+BUILD=""
+PROFILE=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -n|--dry-run) DRY=1 ;;
+        -f|--force)   FORCE=1 ;;
+        --rollback)   ROLLBACK=1 ;;
+        --list)       LIST=1 ;;
+        --all)        ALL=1 ;;
+        --progress)   PROGRESS=1 ;;
+        --every)      EVERY=1 ;;
+        -d|--device)  shift; need_device_arg "$#"; DEV=$1 ;;
+        --device=*)   DEV=${1#*=} ;;
+        -h|--help)    usage; exit 0 ;;
+        -?*)          echo "Error: unknown option: $1" >&2; usage >&2; exit 1 ;;
+        *)            if [ -z "$BUILD" ] && [ "$ROLLBACK" = 0 ] && [ "$LIST" = 0 ]; then BUILD=$1
+                      elif [ -z "$PROFILE" ]; then PROFILE=$1
+                      else echo "Error: unexpected argument: $1" >&2; usage >&2; exit 1; fi ;;
+    esac
+    shift
+done
+if [ "$ROLLBACK" = 0 ] && [ "$LIST" = 0 ]; then
+    [ -n "$BUILD" ] || { usage >&2; exit 1; }
+    case "$BUILD" in *[!0-9]*) die "Build must be a number: $BUILD" ;; esac
+fi
+[ "$EVERY" = 0 ] || [ -z "$PROFILE" ] || die "--every takes no profile: $PROFILE"
+[ "$EVERY" = 0 ] || [ "$ROLLBACK" = 0 ] || die "--rollback is for one profile"
+
+need_root
+need_btrfs
+if [ "$ROLLBACK" = 0 ]; then
+    need_cmd curl
+    need_cmd jq
+    need_cmd sha256sum
+fi
+
+# The other tools take the writers' lock themselves, so this one only reads between them and
+# never holds it: a child waiting on our lock would wait forever.
+# $1 = tool, rest = its arguments
+tool() {
+    _t=$1; shift
+    if [ -n "$DEV" ]; then "$_t" -d "$DEV" "$@"; else "$_t" "$@"; fi
+}
+
+manifest=$(mktemp)
+migrc=$(mktemp)
+_mi=0
+TOP_TMPFILES="$manifest $manifest.list $migrc"
+ROOTDEV=$DEV
+mount_top
+
+# --every names the booted one only to say what it keeps, so there need not be one.
+if [ -z "$PROFILE" ]; then
+    PROFILE=$(target_running_subvol)
+    [ -n "$PROFILE" ] || [ "$EVERY" = 1 ] || die "Not booted from $ROOTDEV: name the profile"
+fi
+[ -z "$PROFILE" ] || validate_profile_name "$PROFILE"
+
+# Renames at the top level, under the writers' lock like any other tool's, released before
+# another tool is run. $1 = from, $2 = to
+rename_root() {
+    set_lock
+    mv -T "$TOP/$1" "$TOP/$2" || { release_lock; return 1; }
+    release_lock
+}
+
+# $1 back to $PROFILE, whatever stood there set aside as $2 first; their entries follow them.
+# Under -d the entries are those of $ROOTDEV, which flipper-bls reads through $TOP.
+swap_in() {
+    if [ -e "$TOP/$PROFILE" ]; then
+        rename_root "$PROFILE" "$2" || die "Could not move $PROFILE aside; nothing changed"
+    fi
+    rename_root "$1" "$PROFILE" || die "Could not rename $1 to $PROFILE; it is still $1, the other one is $2"
+    with_bls "boot entry not rewritten for $PROFILE" flipper_write_entry "$PROFILE" "$TOP/$PROFILE"
+    with_bls "boot entry not removed for $1" remove_root_entries "$1"
+}
+
+# What a kept build of $PROFILE is called: "$kept_head<build>", e.g. @Desktop-obsolete-1230.
+kept_head="$PROFILE-obsolete-"
+
+# Sets kept to the newest kept build, the one the last update kept, and _kb to its number; empty
+# and 0 when there is none.
+find_kept() {
+    kept=""; _kb=0
+    for _n in "$TOP/$kept_head"*; do
+        _b=${_n##*/"$kept_head"}
+        case "$_b" in ""|*[!0-9]*) continue ;; esac
+        [ "$_b" -gt "$_kb" ] && { kept=${_n##*/}; _kb=$_b; }
+    done
+    return 0
+}
+
+if [ "$ROLLBACK" = 1 ]; then
+    find_kept
+    [ -n "$kept" ] || die "No earlier version of $PROFILE is kept (looked for $kept_head<build>)"
+    aside="${PROFILE}_old_$(stamp)"
+    swap_in "$kept" "$aside"
+    if [ ! -e "$TOP/$aside" ]; then
+        echo "$PROFILE is back at build $_kb."
+    elif is_running_id "$(subvol_id "$TOP/$aside")" "$(target_running_id)"; then
+        echo "$PROFILE is back at build $_kb. The newer one, which you are running, is $aside;"
+        echo "the next boot of $PROFILE removes it. Reboot into $PROFILE to use it."
+    else
+        tool delete-profile -y "$aside" >/dev/null || echo "Warning: could not delete $aside" >&2
+        echo "$PROFILE is back at build $_kb; the newer one is deleted."
+    fi
+    exit 0
+fi
+# Sets kind and build (cur) from the origin _stock of profile $1, @Desktop_1193_stock -> Desktop
+# and 1193, and origin to its name; false when it has none with a build number.
+origin_of() {
+    origin=$(sed -n 's/^origin_stock_name=//p' "$TOP/$1/etc/profile_origin" 2>/dev/null | head -n1)
+    case "$origin" in @?*_[0-9]*_stock) ;; *) return 1 ;; esac
+    _o=${origin#@}; _o=${_o%_stock}
+    cur=${_o##*_}; kind=${_o%_*}
+    case "$cur" in *[!0-9]*|"") return 1 ;; esac
+}
+
+if [ "$EVERY" = 0 ]; then
+    btrfs subvolume show "$TOP/$PROFILE" >/dev/null 2>&1 || die "No such profile: $PROFILE"
+    origin_of "$PROFILE" \
+        || die "$PROFILE has no origin _stock with a build number (/etc/profile_origin: '${origin:-none}')"
+fi
+
+# The rootfs builds are listed by directory with no number, newest first.
+build_dirs() {
+    _bd=$(curl -fsSL "${URL}manifest.json" | jq -r '.directories | sort_by(.mtime) | reverse | .[].name') \
+        || die "Cannot list the builds at $URL"
+    [ -n "$_bd" ] || die "Cannot list the builds at $URL"
+    printf '%s\n' "$_bd"
+}
+# The manifests of the builds named on stdin, fetched at once rather than one by one, each a
+# round trip of its own: "<file> <dir>" a line into $manifest.list, in the order given. One that
+# did not arrive is an empty or missing file.
+fetch_manifests() {
+    set --
+    : > "$manifest.list"
+    while read -r _d; do
+        [ -n "$_d" ] || continue
+        _mi=$((_mi + 1))
+        TOP_TMPFILES="$TOP_TMPFILES $manifest.b$_mi $manifest.b$_mi.files"
+        set -- "$@" -o "$manifest.b$_mi" "$URL${_d}manifest.json"
+        echo "$manifest.b$_mi $_d" >> "$manifest.list"
+    done
+    [ $# = 0 ] || curl -fsSL -Z --parallel-max 30 "$@" 2>/dev/null || true
+}
+# $manifest's build number into _n and the branch of build-scripts it was made from, which is
+# what a channel is, into _branch; its files into $manifest.files, "<path> <size> <sha256>" a
+# line after those two. All with one jq, which takes a while to start.
+read_manifest() {
+    jq -r '.build.number,
+        ([.sourcestamps[]? | select(.codebase == "buildscripts") | .branch][0] // "-"),
+        (.files[] | "\(.path) \(.size) \(.sha256)")' "$manifest" > "$manifest.files" 2>/dev/null \
+        || : > "$manifest.files"
+    { read -r _n; read -r _branch; } < "$manifest.files" || true
+}
+# $1 = file name -> its size and sha256 from read_manifest's list, empty if the build has no
+# such file. The shell's own read, as this is asked often.
+file_info() {
+    while read -r _fp _fs _fh; do
+        [ "$_fp" != "$1" ] || { echo "$_fs $_fh"; return 0; }
+    done < "$manifest.files"
+}
+
+# The files build $1 needs fetched for the kinds of profile after it (default: this profile's),
+# into need. A kind's _stock arrives as an increment over the Minimal one, so Minimal is needed
+# only while one of theirs is not here yet, and then only if it is not here either. False when
+# the build has no such file.
+need_for() {
+    _nb=$1; shift
+    [ $# -gt 0 ] || set -- "$kind"
+    need=""; _min=""
+    for _k in "$@"; do
+        case " $need " in *" ${_k}_${_nb}_stock_inc_pack.zst "*) continue ;; esac
+        [ -e "$TOP/@stock-snapshots/@${_k}_${_nb}_stock" ] && continue
+        [ -e "$TOP/@stock-snapshots/@Minimal_${_nb}_stock" ] || _min="Minimal_${_nb}_stock_pack.zst"
+        [ "$_k" = Minimal ] || need="$need ${_k}_${_nb}_stock_inc_pack.zst"
+    done
+    need="$_min$need"
+    bytes=0
+    for _f in $need; do
+        _i=$(file_info "$_f")
+        [ -n "$_i" ] || return 1
+        bytes=$((bytes + ${_i%% *}))
+    done
+}
+
+# $1 = percent, $2 = the step under way
+progress() { [ "$PROGRESS" = 0 ] || printf '@progress %s %s\n' "$1" "$2"; }
+
+# The directory of build $BUILD into bdir, its manifest into $manifest, looked for thirty
+# builds at a time.
+find_build() {
+    bdir=""
+    _left=$(build_dirs)
+    while [ -n "$_left" ] && [ -z "$bdir" ]; do
+        fetch_manifests <<EOF
+$(printf '%s\n' "$_left" | head -n 30)
+EOF
+        _left=$(printf '%s\n' "$_left" | tail -n +31)
+        while read -r _m _d; do
+            [ -s "$_m" ] || continue
+            manifest=$_m; read_manifest
+            [ "$_n" = "$BUILD" ] && { bdir=$_d; break; }
+        done < "$manifest.list"
+    done
+    [ -n "$bdir" ] || die "No rootfs build $BUILD at $URL"
+}
+
+# The profiles --every takes: every root at the top level but the reserved ones, the leftovers of
+# create-profile and of this tool, and the builds it kept.
+every_profiles() {
+    for _d in "$TOP"/@*; do
+        [ -e "$_d" ] || continue
+        _n=${_d##*/}
+        is_reserved_subvol "$_n" && continue
+        case "$_n" in
+            *_old_[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_*|*.old_*) continue ;;
+            *_failed_[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_*) continue ;;
+            *-obsolete-[0-9]*) continue ;;
+        esac
+        btrfs subvolume show "$_d" >/dev/null 2>&1 || continue
+        printf '%s\n' "$_n"
+    done
+}
+
+# Whether a profile of kind $2 at build $3 that check-profile calls $4 moves to build $1: a state
+# an update carries, a newer build, and a _stock of its kind in that build, whose manifest is in
+# $manifest. --force takes any state and any build.
+goes_to() {
+    case "$4" in
+        pristine|booted|customized) ;;
+        packages|system) [ "$FORCE" = 1 ] || return 1 ;;
+        *) return 1 ;;
+    esac
+    [ "$FORCE" = 1 ] || [ "$1" -gt "$3" ] || return 1
+    need_for "$1" "$2"
+}
+
+if [ "$EVERY" = 1 ]; then
+    # "<@profile> <kind> <build> <state>" a line, each profile checked against its stock at once:
+    # it is disk work, and none of them waits on another.
+    table=""
+    _i=0
+    for _p in $(every_profiles); do
+        origin_of "$_p" || continue
+        _i=$((_i + 1))
+        TOP_TMPFILES="$TOP_TMPFILES $manifest.$_i"
+        tool check-profile "$_p" > "$manifest.$_i" 2>/dev/null &
+        table="$table$_p $kind $cur $_i
+"
+    done
+    wait
+    _t=$table; table=""
+    while read -r _p _k _c _i; do
+        [ -n "$_p" ] || continue
+        _s=$(cat "$manifest.$_i" 2>/dev/null)
+        table="$table$_p $_k $_c ${_s:-error}
+"
+    done <<EOF
+$_t
+EOF
+    [ -n "$table" ] || die "No profile on $ROOTDEV has an origin build to update from"
+
+    if [ "$LIST" = 1 ]; then
+        [ "$ALL" = 0 ] || FORCE=1
+        while read -r _p _k _c _s; do
+            [ -z "$_p" ] || echo "profile $_p $_k $_c $_s"
+        done <<EOF
+$table
+EOF
+        if [ -n "$PROFILE" ]; then
+            echo "booted $PROFILE"
+            find_kept
+            [ -z "$kept" ] || echo "kept $_kb"
+        fi
+        fetch_manifests <<EOF
+$(build_dirs | head -n 30)
+EOF
+        while read -r manifest _d; do
+            [ -s "$manifest" ] || continue
+            read_manifest
+            case "$_n" in ""|*[!0-9]*) continue ;; esac
+            _kinds=""
+            while read -r _p _k _c _s; do
+                [ -n "$_p" ] || continue
+                case " $_kinds " in *" $_k "*) continue ;; esac
+                goes_to "$_n" "$_k" "$_c" "$_s" && _kinds="$_kinds $_k"
+            done <<EOF
+$table
+EOF
+            [ -n "$_kinds" ] || continue
+            # shellcheck disable=SC2086 # one kind a word
+            need_for "$_n" $_kinds || continue
+            echo "build $_n $_branch $bytes $(printf '%s' "${_kinds# }" | tr ' ' ,)"
+        done < "$manifest.list"
+        exit 0
+    fi
+
+    find_build
+    # Who goes, and what share of the bar each has: what it fetches beyond what the ones before
+    # it did, and as much again as a stock's increment for the receiving and carrying.
+    share=100000000
+    plan=""; results=""; went=""; before=0; total=0
+    while read -r _p _k _c _s; do
+        [ -n "$_p" ] || continue
+        if goes_to "$BUILD" "$_k" "$_c" "$_s"; then
+            # shellcheck disable=SC2086 # one kind a word
+            need_for "$BUILD" $went "$_k"
+            _w=$((bytes - before + share))
+            before=$bytes; went="$went $_k"; total=$((total + _w))
+            plan="$plan$_p $_w
+"
+        elif [ "$_s" = packages ] || [ "$_s" = system ] || [ "$_s" = error ]; then
+            results="${results}result $_p blocked $_s
+"
+        elif [ "$_c" -ge "$BUILD" ]; then
+            results="${results}result $_p current $_c
+"
+        else
+            results="${results}result $_p unavailable
+"
+        fi
+    done <<EOF
+$table
+EOF
+
+    failed=0; start=0
+    while read -r _p _w; do
+        [ -n "$_p" ] || continue
+        [ "$PROGRESS" = 0 ] || echo "@profile $_p"
+        _from=$(printf '%s' "$table" | awk -v p="$_p" '$1 == p { print $3 }')
+        set -- --progress
+        [ "$FORCE" = 0 ] || set -- "$@" --force
+        [ "$DRY" = 0 ] || set -- "$@" --dry-run
+        # Each run's bar is its share of this one. Its stdin is not ours, which is the plan.
+        { tool "$0" "$@" "$BUILD" "$_p" </dev/null; echo $? > "$migrc"; } | while IFS= read -r _l; do
+            case "$_l" in
+                "@progress "*) _q=${_l#@progress }
+                               progress $(((start + _w * ${_q%% *} / 100) * 100 / total)) "${_q#* }" ;;
+                *) printf '%s\n' "$_l" ;;
+            esac
+        done
+        case "$(cat "$migrc")" in
+            0) results="${results}result $_p updated $_from $BUILD
+" ;;
+            *) results="${results}result $_p failed
+"; failed=1 ;;
+        esac
+        start=$((start + _w))
+    done <<EOF
+$plan
+EOF
+    progress 100 Done
+    echo
+    printf '%s' "$results"
+    exit "$failed"
+fi
+
+if [ "$LIST" = 1 ]; then
+    echo "profile $PROFILE $kind $cur"
+    find_kept
+    [ -z "$kept" ] || echo "kept $_kb"
+    # The newest builds only, and only those after this one that carry its kind of profile.
+    fetch_manifests <<EOF
+$(build_dirs | head -n 30)
+EOF
+    while read -r manifest _d; do
+        [ -s "$manifest" ] || continue
+        read_manifest
+        case "$_n" in ""|*[!0-9]*) continue ;; esac
+        [ "$ALL" = 1 ] || [ "$_n" -gt "$cur" ] || continue
+        need_for "$_n" || continue
+        echo "build $_n $_branch $bytes"
+    done < "$manifest.list"
+    exit 0
+fi
+
+echo "$PROFILE: $kind build $cur"
+if [ "$BUILD" -le "$cur" ] && [ "$FORCE" = 0 ]; then
+    echo "Already at build $cur; nothing to do for $BUILD (--force takes it anyway)"
+    exit 0
+fi
+# The name the current version keeps once the new one takes $PROFILE.
+keep="$kept_head$cur"
+[ -e "$TOP/$keep" ] && die "$keep already exists; delete or rename it first"
+
+status=$(tool check-profile "$PROFILE") || die "check-profile failed on $PROFILE"
+echo "status: $status"
+case "$status" in
+    pristine|booted|customized) ;;
+    packages|system)
+        [ "$FORCE" = 1 ] || { echo "$PROFILE has its $status changed; --force updates it anyway, dropping those changes" >&2; exit 2; }
+        echo "forced: its $status changes are dropped" ;;
+    *) die "check-profile says '$status' for $PROFILE" ;;
+esac
+# A sidecar is a change the last migration could not place; another migration would drop it.
+left=$(find "$TOP/$PROFILE" -xdev \( -name '*.migrate-conflict' -o -name '*.migrate-theirs' \) -print 2>/dev/null | head -n1)
+if [ -n "$left" ]; then
+    echo "$PROFILE has unresolved migration conflicts (${left#"$TOP/$PROFILE"}); resolve them first:" >&2
+    echo "  migrate-profile --resolve $PROFILE" >&2
+    exit 2
+fi
+
+find_build
+need_for "$BUILD" || die "Build $BUILD has no $kind _stock"
+echo "build $BUILD: $URL$bdir"
+echo "to fetch:${need:- nothing}${need:+ ($(human "$bytes"))}"
+
+# A received stream unpacks to a few times its size; ask for four.
+free=$(btrfs filesystem usage -b "$TOP" 2>/dev/null | awk '/Free \(estimated\)/ { print $3; exit }')
+[ -z "$free" ] || [ "$free" -ge $((bytes * 4)) ] \
+    || die "Not enough free space: $(human "$free") free, about $(human $((bytes * 4))) needed"
+
+if [ "$DRY" = 1 ]; then
+    echo "dry run: would replace $PROFILE with @${kind}_${BUILD}_stock and carry its changes"
+    exit 0
+fi
+
+# Streams were once fetched whole into this cache first; what an older run left there goes.
+rm -f /var/cache/flipper-update/*_pack.zst /var/cache/flipper-update/*_pack.zst.part
+rmdir /var/cache/flipper-update 2>/dev/null || true
+
+curlrc=$(mktemp)
+copied=$(mktemp)
+state=$(mktemp)
+sums=$(mktemp)
+fetchrc=$(mktemp)
+recvrc=$(mktemp)
+TOP_TMPFILES="$TOP_TMPFILES $curlrc $copied $state $sums $fetchrc $recvrc"
+
+# $1 = url, $2 = size: the file on stdout, a dropped connection picked up where it stopped, up to
+# five attempts in a row that bring nothing. What got through is dd's count rather than curl's,
+# which a curl that is killed never reports. "<bytes before this request> <dd pid>" goes in
+# $state for the bar. 1 when the download gives up, 2 when the receive stopped reading.
+fetch_stream() {
+    _at=0; _miss=0
+    while :; do
+        { curl -fsSL -r "$_at-" "$1"; echo "$?" > "$curlrc"; } | LC_ALL=C dd bs=64K 2> "$copied" &
+        echo "$_at $!" > "$state"
+        wait
+        _rc=$(cat "$curlrc")
+        _n=$(awk '/ bytes / { print $1 }' "$copied")
+        _at=$((_at + ${_n:-0}))
+        echo "$_at" > "$state"
+        [ "$_at" -lt "$2" ] || return 0
+        [ "$_rc" != 23 ] || return 2
+        if [ "${_n:-0}" -gt 0 ]; then _miss=0; else _miss=$((_miss + 1)); fi
+        [ "$_miss" -lt 5 ] || return 1
+        echo "connection lost at $(human "$_at"), resuming..." >&2
+        sleep 3
+    done
+}
+
+# Each stream is received as it downloads, tee handing a copy to sha256sum on fd 4 and the
+# receive writing to our stdout on fd 3. The download is most of the wait, so it has most of the
+# bar: 0 to 80 by bytes, 85 to 95 migrate-profile's own steps, and the steps after it the rest.
+# A stream that breaks off is removed by receive-snapshot, one whose sha256 is wrong here, and
+# the profile is untouched either way: nothing replaces it until every stream is in.
+_done=0
+for _f in $need; do
+    _i=$(file_info "$_f")
+    _size=${_i%% *}
+    _name=@${_f%_pack.zst}; _name=${_name%_inc}
+    echo "fetching $_f ($(human "$_size"))..."
+    echo "0" > "$state"
+    (
+        {
+            { fetch_stream "$URL$bdir$_f" "$_size" && _r=0 || _r=$?; echo "$_r" > "$fetchrc"; } \
+                | tee /dev/fd/4 \
+                | { tool receive-snapshot - 4>&- >&3 && _r=0 || _r=$?; echo "$_r" > "$recvrc"; }
+        } 4>&1 | sha256sum > "$sums"
+    ) 3>&1 &
+    _pp=$!
+    _at=0; _cp=""
+    while kill -0 "$_pp" 2>/dev/null; do
+        read -r _a _c < "$state" 2>/dev/null && { _at=$_a; _cp=${_c:-}; }
+        _w=$(awk '$1 == "wchar:" { print $2 }' "/proc/${_cp:-0}/io" 2>/dev/null) || _w=0
+        progress $(((_done + _at + ${_w:-0}) * 80 / bytes)) "Downloading images"
+        sleep 1
+    done
+    wait "$_pp" || true
+    case "$(cat "$fetchrc")" in
+        0|2) ;;
+        *) die "Download failed: $_f" ;;
+    esac
+    [ "$(cat "$recvrc")" = 0 ] || die "Receive failed: $_f"
+    if [ "$(cut -d' ' -f1 "$sums")" != "${_i#* }" ]; then
+        tool delete-snapshot -y "$_name" >/dev/null || echo "Warning: could not delete $_name" >&2
+        die "Checksum mismatch on $_f; $_name deleted, run again to fetch it anew"
+    fi
+    _done=$((_done + _size))
+done
+
+# Stocks of the builds no profile or restore point is built from any more: nothing is reset to
+# them or migrated against them, so they only take space. A build still in use keeps every
+# stock it has, other kinds of profile among them, so one can be made from it again.
+prune_stocks() {
+    _used=" "
+    for _p in "$TOP"/@* "$TOP"/@snapshots/*; do
+        _o=$(sed -n 's/^origin_stock_name=//p' "$_p/etc/profile_origin" 2>/dev/null | head -n1)
+        _b=${_o%_stock}; _b=${_b##*_}
+        case "$_b" in ""|*[!0-9]*) continue ;; esac
+        _used="$_used$_b "
+    done
+    for _s in "$TOP"/@stock-snapshots/@*_stock; do
+        [ -e "$_s" ] || continue
+        _n=${_s##*/}; _b=${_n%_stock}; _b=${_b##*_}
+        case "$_b" in ""|*[!0-9]*) continue ;; esac
+        case "$_used" in *" $_b "*) continue ;; esac
+        if tool delete-snapshot -y "$_n" >/dev/null; then
+            echo "deleted $_n: nothing is built from build $_b any more"
+        else
+            echo "Warning: could not delete $_n" >&2
+        fi
+    done
+}
+
+# migrate-profile's own snapshot of the new profile, told apart from older ones by being new.
+snaps() { for _n in "$TOP/@snapshots/${PROFILE}"_*_before_migrate; do [ -e "$_n" ] && printf '%s\n' "${_n#"$TOP/"}"; done; return 0; }
+snaps_before=$(snaps)
+drop_migrate_snapshots() {
+    for _s in $(snaps | grep -vxF -e "$snaps_before" -e ''); do
+        tool delete-snapshot -y "$_s" >/dev/null || echo "Warning: could not delete $_s" >&2
+    done
+}
+
+# The new one is dropped and the old one takes its name back.
+restore_old() {
+    echo "rolling back: $keep returns to $PROFILE" >&2
+    _failed="${PROFILE}_failed_$(stamp)"
+    swap_in "$keep" "$_failed"
+    if [ -e "$TOP/$_failed" ]; then
+        tool delete-profile -y "$_failed" >/dev/null || echo "Warning: could not delete $_failed" >&2
+    fi
+    drop_migrate_snapshots
+}
+
+# The current version moves out of the way first, under its own name and with its own entry, so
+# it is never a leftover anything cleans up, and it keeps its identity.
+progress 80 "Switching profiles"
+rename_root "$PROFILE" "$keep" || die "Could not rename $PROFILE to $keep; nothing changed"
+with_bls "boot entry not written for $keep" flipper_write_entry "$keep" "$TOP/$keep" "$PROFILE"
+# The kept copy takes the profile's autoboot digit, so its entries sort right after the profile's
+# own and are what boots should the new one spend its tries.
+keep_auto() {
+    _d=$(profile_auto_digit "$PROFILE")
+    for _c in "$ENTRIES"/*.conf; do
+        [ -f "$_c" ] && [ "$(entry_subvol_of "$_c")" = "$keep" ] || continue
+        restamp_entry "$_c" "$_d" - - "$TOP/$keep"
+    done
+}
+with_bls "autoboot digit not set for $keep" keep_auto
+
+tool create-profile -y "@${kind}_${BUILD}_stock" "$PROFILE" || { restore_old; die "create-profile failed; $PROFILE is as it was"; }
+
+set +e
+# Forced, the packages stay the new build's: nothing is replayed, and nothing needs the network.
+set -- -a -y --keep-identity --progress
+[ "$FORCE" = 0 ] || set -- "$@" --no-packages
+# Its steps take 85 to 95 of the bar. The pipe would lose its exit status, so it is kept aside.
+{ tool migrate-profile "$@" "$keep" "$PROFILE"; echo $? > "$migrc"; } | while IFS= read -r _l; do
+    case "$_l" in
+        "@progress "*) _p=${_l#@progress }; progress $((85 + ${_p%% *} / 10)) "${_p#* }" ;;
+        *) printf '%s\n' "$_l" ;;
+    esac
+done
+rc=$(cat "$migrc")
+set -e
+if [ "$rc" != 0 ]; then
+    restore_old
+    [ "$rc" = 3 ] && { echo "Not updated: the migration left conflicts; $PROFILE is as it was" >&2; exit 3; }
+    die "migrate-profile failed (rc=$rc); $PROFILE is as it was"
+fi
+drop_migrate_snapshots
+
+progress 95 Checking
+after=$(tool check-profile "$PROFILE") || after=error
+case "$after" in
+    pristine|booted|customized) ;;
+    *) restore_old; die "The updated $PROFILE checks out as '$after' against @${kind}_${BUILD}_stock; $PROFILE is as it was" ;;
+esac
+
+# Kept only when the update dropped something. The one running cannot go yet: set aside without
+# a boot entry, it goes at the next boot of $PROFILE.
+gone=""
+case "$status" in
+    packages|system) ;;
+    *)  if is_running_id "$(subvol_id "$TOP/$keep")" "$(target_running_id)"; then
+            aside="${PROFILE}_old_$(stamp)"
+            if rename_root "$keep" "$aside"; then
+                with_bls "boot entry not removed for $keep" remove_root_entries "$keep"
+                gone="Build $cur goes at the next boot of $PROFILE."
+            else
+                echo "Warning: could not set $keep aside" >&2
+            fi
+        elif tool delete-profile -y "$keep" >/dev/null; then
+            gone="Build $cur is deleted."
+        else
+            echo "Warning: could not delete $keep" >&2
+        fi ;;
+esac
+
+prune_stocks
+progress 100 Done
+echo
+echo "$PROFILE updated from build $cur to $BUILD ($after). Reboot into $PROFILE to use it."
+if [ -n "$gone" ]; then
+    echo "$gone"
+else
+    echo "Build $cur stays bootable as $keep; delete it from the boot menu or with delete-profile $keep,"
+    echo "or go back to it with: update-profile --rollback $PROFILE"
+fi

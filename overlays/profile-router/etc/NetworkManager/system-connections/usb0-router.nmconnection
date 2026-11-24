@@ -1,0 +1,8 @@
+[connection]
+id=Router LAN USB0
+type=ethernet
+interface-name=usb0
+master=br-lan
+slave-type=bridge
+autoconnect=true
+autoconnect-priority=200

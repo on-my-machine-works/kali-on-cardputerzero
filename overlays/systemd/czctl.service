@@ -1,0 +1,42 @@
+[Unit]
+Description=Kali Cyberdeck Shell (czctl) on M5Stack CardputerZero 320x170 LCD
+After=systemd-udev-settle.service systemd-logind.service NetworkManager.service
+Wants=systemd-udev-settle.service systemd-logind.service
+Before=lightdm.service display-manager.service
+
+[Service]
+Type=simple
+User=kali
+Group=kali
+SupplementaryGroups=sudo input video render dialout i2c spi plugdev gpio netdev bluetooth wireshark kismet
+
+Environment=HOME=/home/kali
+Environment=USER=kali
+Environment=LOGNAME=kali
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=LV_LINUX_FBDEV_DEVICE=/dev/fb_lcd
+Environment=FLIPPER_BLS_MIN_KERNEL=6.1
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games
+UnsetEnvironment=DISPLAY WAYLAND_DISPLAY XAUTHORITY
+
+# Wait up to 10s for CardputerZero SPI0 ST7789v3 DRM node & I2C1 TCA8418 keypad,
+# then release boot splash (fb_load --keep-open) so czctl can claim DRM master.
+ExecStartPre=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do [ -e /dev/dri/cardputer-zero-internal ] && [ -e /dev/input/cardputer-zero-internal ] && break; sleep 1; done; exit 0'
+ExecStartPre=-/usr/bin/sudo -n /usr/bin/systemctl stop fb_load.service
+
+WorkingDirectory=/home/kali
+StandardOutput=journal
+StandardError=journal
+ExecStart=/usr/bin/czctl --panel \
+    --kms-device /dev/dri/cardputer-zero-internal \
+    --remote [::]:8899 \
+    --assets /usr/share/czctl/assets/remote
+
+ExecStopPost=-/usr/bin/pkill -x sway
+Restart=on-failure
+RestartSec=2
+
+[Install]
+Alias=flipctl.service
+WantedBy=multi-user.target
+WantedBy=graphical.target

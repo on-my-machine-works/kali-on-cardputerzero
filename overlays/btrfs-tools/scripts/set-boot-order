@@ -1,0 +1,197 @@
+#!/bin/sh
+# set-boot-order - say what boots. The boot menu's order IS its state: entries are sorted by their
+# BLS sort-key and the first one boots, so choosing a profile or a kernel means writing digits into
+# that key rather than recording a choice anywhere else. Nothing here reboots; changes take effect
+# next boot.
+#
+# The key is the os-release id plus a suffix this image owns (see flipper-bls.sh):
+#
+#     debian-0100-Desktop-0
+#            │└┬┘ └──┬──┘ └── rank:     0 = the profile's chosen kernel, 1 = its others
+#            │ │     └─────── profile
+#            │ └───────────── band, ascending, from the profile list
+#            └─────────────── autoboot: 0 for the profile that boots by itself, 1 for the rest
+#
+# --autoboot moves the single 0 in the autoboot column; --kernel moves the single 0 in one
+# profile's rank column and puts that entry back on trial. --init stamps a whole filesystem whose
+# entries predate the scheme, which is also the upgrade path.
+set -eu
+[ -r /usr/lib/flipper-btrfs.sh ] || { echo "Error: /usr/lib/flipper-btrfs.sh not found" >&2; exit 1; }
+. /usr/lib/flipper-btrfs.sh
+[ -r /usr/lib/flipper-blsname.sh ] || die "/usr/lib/flipper-blsname.sh not found"
+. /usr/lib/flipper-blsname.sh
+
+usage() {
+    cat <<EOF
+Usage: set-boot-order --autoboot @PROFILE      boot that profile when nobody presses anything
+       set-boot-order --kernel ENTRY-ID        boot that kernel for its profile, on trial again
+                                               (installing a kernel does this for you)
+       set-boot-order --init                   stamp every entry that has no order yet
+       set-boot-order --list                   print the boot order, first line boots
+       set-boot-order --help
+  -d,--device DEV   operate on btrfs filesystem DEV instead of the booted root
+  Entry ids are what --list prints: the .conf name without its boot counter or suffix.
+EOF
+}
+
+_action=""; _arg=""; _dev=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --autoboot) shift; [ $# -ge 1 ] || die "--autoboot needs a profile"; _action=autoboot; _arg=$1 ;;
+        --kernel)   shift; [ $# -ge 1 ] || die "--kernel needs an entry id"; _action=kernel; _arg=$1 ;;
+        --init)     _action=init ;;
+        --list)     _action=list ;;
+        -d|--device) shift; need_device_arg "$#"; _dev=$1 ;;
+        --device=*) _dev=${1#*=} ;;
+        -h|--help)  usage; exit 0 ;;
+        --)         shift; break ;;
+        -?*)        echo "Error: unknown option: $1" >&2; usage >&2; exit 1 ;;
+        *)          break ;;
+    esac
+    shift
+done
+[ -n "$_action" ] || { usage; exit 0; }
+[ "$_action" = list ] || need_root
+need_btrfs
+[ -n "$_dev" ] && ROOTDEV=$_dev
+case "$_action" in
+    autoboot) validate_profile_name "$_arg" ;;
+    kernel) case "$_arg" in *..*|*/*) die "Invalid entry id: $_arg" ;; esac; _arg="${_arg%.conf}" ;;
+esac
+
+# Entries belong to the filesystem the profiles are on, so read them through a top-level mount as
+# every other tool does: /boot is the same subvolume when it is the booted filesystem, and the
+# card's own when it is not.
+mount_top
+ENTRIES="$TOP/boot/loader/entries"
+[ -d "$ENTRIES" ] || die "No loader entries on $ROOTDEV"
+
+# The key is written by the shared library; here it is always against a profile on $TOP.
+# $4 is a band to force, or '-' to keep the one the entry carries.
+restamp() { restamp_entry "$1" "$2" "$3" "${4:--}" "$TOP/$(entry_subvol_of "$1")"; }
+
+case "$_action" in
+    list)
+        # SORT-KEY leads, because it is what the order is made of; BOOT marks the one line that
+        # boots. TRIES is the counter as the file carries it: a number while the entry is on trial,
+        # 'bad' once it has spent them all, and '-' for an entry with no counter at all. Not
+        # 'good': the spec removes the counter on a boot that worked, so an entry that was blessed
+        # and one that was never counted look identical on disk, and calling both good would say
+        # more than the file knows.
+        printf '%-30s %-5s %-6s %s\n' 'SORT-KEY' 'BOOT' 'TRIES' 'ENTRY'
+        _n=0
+        for _f in $(sorted_entries); do
+            _n=$((_n + 1))
+            _t="$(entry_tries_of "$_f")"
+            _mark=''; [ "$_n" = 1 ] && _mark='<-'
+            case "$_t" in
+                '') _t='-' ;;
+                0)  _t='bad' ;;
+            esac
+            _note=""
+            version_at_least "$(sed -n 's/^version[[:space:]]\{1,\}//p' "$_f" | head -n1)" \
+                || _note="  (below $BLS_MIN_KERNEL, not shown by the menu)"
+            printf '%-30s %-5s %-6s %s%s\n' \
+                "$(sed -n 's/^sort-key[[:space:]]\{1,\}//p' "$_f" | head -n1 | sed 's/^$/-/')" \
+                "$_mark" "$_t" "$(entry_id_of "$_f")" "$_note"
+        done
+        ;;
+    autoboot)
+        [ -d "$TOP/$_arg" ] || die "No such profile: $_arg (see list-profiles)"
+        _hit=0
+        for _f in "$ENTRIES"/*.conf; do
+            [ -f "$_f" ] || continue
+            if [ "$(entry_subvol_of "$_f")" = "$_arg" ]; then
+                restamp "$_f" 0 '-' '-'; _hit=1
+            else
+                restamp "$_f" 1 '-' '-'
+            fi
+        done
+        [ "$_hit" = 1 ] || die "$_arg has no boot entry to mark (install a kernel in it first)"
+        sync_rpi_cmdline_autoboot
+        echo "set-boot-order: $_arg boots when nobody presses anything"
+        ;;
+    kernel)
+        _target=""
+        for _f in "$ENTRIES"/*.conf; do
+            [ -f "$_f" ] || continue
+            [ "$(entry_id_of "$_f")" = "$_arg" ] && _target=$_f
+        done
+        [ -n "$_target" ] || die "No boot entry $_arg on this filesystem (see --list)"
+        _sv="$(entry_subvol_of "$_target")"
+        [ -n "$_sv" ] || die "$_arg mounts no subvolume"
+        for _f in "$ENTRIES"/*.conf; do
+            [ -f "$_f" ] || continue
+            [ "$(entry_subvol_of "$_f")" = "$_sv" ] || continue
+            if [ "$(entry_id_of "$_f")" = "$_arg" ]; then restamp "$_f" '-' 0 '-'
+            else restamp "$_f" '-' 1 '-'; fi
+        done
+        # Chosen, so the next boot of it is on trial: this is a kernel nobody has proven with
+        # this profile's device tree, and a kernel that will not boot has to hand the device back.
+        _target="$(rearm_entry "$_target")"
+        echo "set-boot-order: $_sv boots kernel $(sed -n 's/^version[[:space:]]\{1,\}//p' "$_target" | head -n1)"
+        ;;
+    init)
+        # A filesystem whose entries were written before the order was in them, or under an older
+        # rule. Every band is recomputed from the entry's own token rather than kept: a band is a
+        # position in the profile list, and a stale one is how a clone ends up ahead of the profile
+        # it came from. Counters are left alone: an entry that boots today is proven, and putting
+        # a whole disk on trial would be a lie.
+        #
+        # Which profile boots by itself: the one that already holds the digit, else the lowest band
+        # there is, which is the first line of the profile list.
+        _have_auto=""
+        for _f in "$ENTRIES"/*.conf; do
+            [ -f "$_f" ] || continue
+            [ "$(sort_key_field "$_f" auto)" = 0 ] && _have_auto="$(entry_subvol_of "$_f")"
+        done
+        if [ -z "$_have_auto" ]; then
+            _have_auto="$(for _f in "$ENTRIES"/*.conf; do
+                [ -f "$_f" ] || continue
+                printf '%s %s\n' "$(sort_band "$(token_band "$(entry_id_of "$_f")")")" "$(entry_subvol_of "$_f")"
+            done | sort -n | head -n1 | cut -d' ' -f2)"
+        fi
+        # Before deciding anything, put each entry's timestamp back to the kernel it names. The
+        # order breaks ties by newest file, and "newest" is meant to say when that kernel arrived,
+        # but an entry file is also rewritten whenever an overlay or a key changes, and an
+        # upgrade from before this scheme has no true timestamps left at all. The kernel image
+        # itself is the honest record: it was written when the package was installed.
+        for _f in "$ENTRIES"/*.conf; do
+            [ -f "$_f" ] || continue
+            _k="$(sed -n 's/^linux[[:space:]]\{1,\}//p' "$_f" | head -n1)"
+            [ -n "$_k" ] && [ -f "$TOP$_k" ] || continue
+            touch -r "$TOP$_k" "$_f"
+        done
+        # The chosen kernel per profile: a kernel the menu will show, then the highest version,
+        # then the newest of that version, then the name. Every part earns its place. Without the
+        # floor a profile ends up booting a 6.1 BSP kernel, whose image happens to be newer on disk
+        # than the mainline one and which the menu hides, so the profile would boot something
+        # nobody can see or change. Without the version, install order alone decides, and a rebuilt
+        # old kernel outranks a new one. Without the name, two entries an image wrote in the same
+        # second decide it by coin toss.
+        _chosen="$(for _f in "$ENTRIES"/*.conf; do
+            [ -f "$_f" ] || continue
+            _ver="$(sed -n 's/^version[[:space:]]\{1,\}//p' "$_f" | head -n1)"
+            _old=1; version_at_least "$_ver" && _old=0
+            printf '%s|%s|%s|%s|%s\n' "$(entry_subvol_of "$_f")" "$_old" "$(version_rank "$_ver")" \
+                "$(stat -c %Y "$_f" 2>/dev/null || echo 0)" "$(entry_id_of "$_f")"
+        done | sort -t'|' -k1,1 -k2,2n -k3,3r -k4,4nr -k5,5r | awk -F'|' '!seen[$1]++ { print $5 }')"
+        for _f in "$ENTRIES"/*.conf; do
+            [ -f "$_f" ] || continue
+            _a=1; [ "$(entry_subvol_of "$_f")" = "$_have_auto" ] && _a=0
+            _r=1
+            for _c in $_chosen; do [ "$_c" = "$(entry_id_of "$_f")" ] && _r=0; done
+            _b="$(sort_band "$(token_band "$(entry_id_of "$_f")")")"
+            restamp "$_f" "$_a" "$_r" "${_b:--}"
+            _id="$(entry_id_of "$_f")"
+            echo "set-boot-order: stamped $_id as $(sed -n 's/^sort-key[[:space:]]\{1,\}//p' "$_f" | head -n1)"
+        done
+        sync_rpi_cmdline_autoboot
+        echo "set-boot-order: $_have_auto boots when nobody presses anything"
+        ;;
+esac
+
+# What boots is these files and nothing else, so a choice that is only in the page cache is
+# a choice the next boot may not have made. btrfs commits metadata on its own schedule, and
+# somebody who picks a profile and pulls the power is the case this exists for.
+[ "$_action" = list ] || sync

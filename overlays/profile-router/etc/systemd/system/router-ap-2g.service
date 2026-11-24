@@ -1,0 +1,15 @@
+[Unit]
+Description=Kali CardputerZero Router Wi-Fi AP (2.4 GHz wlan0 -> br-lan)
+Requires=router-lan-bridge.service
+After=router-lan-bridge.service
+PartOf=router-lan-bridge.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/sh -c 'i=0; while [ "$$i" -lt 25 ]; do nmcli -t -f DEVICE,STATE device status | grep -Eq "^wlan0:(disconnected|connected)" && exit 0; sleep 1; i=$$((i+1)); done; exit 0'
+ExecStart=-/usr/bin/nmcli connection up "Router Wi-Fi 2.4 GHz"
+ExecStop=-/usr/bin/nmcli connection down "Router Wi-Fi 2.4 GHz"
+
+[Install]
+WantedBy=multi-user.target

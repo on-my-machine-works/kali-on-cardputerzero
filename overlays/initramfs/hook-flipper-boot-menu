@@ -1,0 +1,63 @@
+#!/bin/sh
+# initramfs-tools hook: bundle cz-boot-menu (with flipper-boot-menu symlink),
+# Btrfs profile helpers, and CardputerZero SPI LCD + TCA8418 I2C keypad modules
+# for early-boot profile recovery.
+
+PREREQ=""
+prereqs() {
+    echo "$PREREQ"
+}
+case "${1:-}" in
+    prereqs)
+        prereqs
+        exit 0
+        ;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+# Kernel modules required for Btrfs + CardputerZero ST7789v3 SPI LCD + M5IOE1 + TCA8418 keypad
+for mod in \
+    btrfs crc32c_generic xxhash_generic zstd_compress xor raid6_pq \
+    spi_bcm2835 i2c_bcm2835 i2c_mux i2c_mux_pinctrl regmap_i2c \
+    gpio_forwarder m5ioe1 pwm_bl_m5stack \
+    drm_mipi_dbi panel_mipi_dbi panel_mipi_dbi_m \
+    tca8418_keypad tca8418_keypad_m5stack matrix_keymap
+do
+    manual_add_modules "$mod" 2>/dev/null || true
+done
+
+if [ -x /usr/bin/cz-boot-menu ]; then
+    copy_exec /usr/bin/cz-boot-menu /usr/bin/cz-boot-menu
+    ln -sfn cz-boot-menu "${DESTDIR}/usr/bin/flipper-boot-menu"
+elif [ -x /usr/bin/flipper-boot-menu ]; then
+    copy_exec /usr/bin/flipper-boot-menu /usr/bin/flipper-boot-menu
+    ln -sfn flipper-boot-menu "${DESTDIR}/usr/bin/cz-boot-menu"
+fi
+
+for cmd in btrfs lsblk findmnt blkid flock; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+        copy_exec "$(command -v "$cmd")"
+    fi
+done
+
+mkdir -p "${DESTDIR}/usr/local/sbin" "${DESTDIR}/usr/lib"
+for tool in list-profiles set-boot-order create-profile delete-profile rename-profile btrfs-show-space create-swap; do
+    if [ -x "/usr/local/sbin/$tool" ]; then
+        cp -a "/usr/local/sbin/$tool" "${DESTDIR}/usr/local/sbin/$tool"
+    fi
+done
+
+for lib in flipper-btrfs.sh flipper-bls.sh flipper-blsname.sh flipper-rootinfo.sh; do
+    if [ -r "/usr/lib/$lib" ]; then
+        cp -a "/usr/lib/$lib" "${DESTDIR}/usr/lib/$lib"
+    fi
+done
+
+if [ -r /usr/share/keymaps/tca8418_keypad_m5stack_keymap.map ]; then
+    mkdir -p "${DESTDIR}/usr/share/keymaps"
+    cp -a /usr/share/keymaps/tca8418_keypad_m5stack_keymap.map \
+        "${DESTDIR}/usr/share/keymaps/tca8418_keypad_m5stack_keymap.map"
+fi
+
+exit 0

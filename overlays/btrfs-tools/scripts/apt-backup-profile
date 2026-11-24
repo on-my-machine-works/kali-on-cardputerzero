@@ -1,0 +1,184 @@
+#!/bin/sh
+# apt-backup-profile - offer a bootable backup of the booted profile before apt changes packages.
+#
+# Called by /etc/apt/apt.conf.d/80-flipper-apt-backup (DPkg::Pre-Invoke, shipped by the image)
+# once per apt run, before dpkg. Asks whether to back up and under what name, then leaves the work
+# to create-profile, so the backup is a bootable root with its own boot entry: a broken upgrade is
+# undone by picking it in the boot menu.
+#
+# The exit status is apt's, and non-zero aborts the run before dpkg. One case does that: a backup
+# that failed, with the user declining to go ahead without it.
+set -u
+
+CREATE_PROFILE=/usr/local/sbin/create-profile
+LIB=/usr/lib/flipper-btrfs.sh
+ROOTINFO=/usr/lib/flipper-rootinfo.sh
+
+usage() {
+    cat <<EOF
+Usage: apt-backup-profile
+  Offer a bootable backup of the booted profile, then create it with create-profile.
+  Takes no options. Meant to run from /etc/apt/apt.conf.d/80-flipper-apt-backup before
+  apt calls dpkg, and asks nothing when there is nobody to ask (no terminal, apt -y,
+  DEBIAN_FRONTEND=noninteractive, a build-time chroot).
+EOF
+}
+
+# A hook that exits non-zero aborts apt, which is more than a typo is worth.
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    ?*)        usage >&2; exit 0 ;;
+esac
+
+# Nobody to ask, or nothing to ask about: behave as if the drop-in were not installed.
+[ -d /run/systemd/system ] || exit 0
+[ -x "$CREATE_PROFILE" ] && [ -r "$LIB" ] && [ -r "$ROOTINFO" ] || exit 0
+[ -t 0 ] && [ -t 2 ] || exit 0
+case "${DEBIAN_FRONTEND:-}" in noninteractive) exit 0 ;; esac
+
+# The apt process, whose argv says what it was asked to do. The apt.conf string runs under sh,
+# which may or may not have exec'd us, so walk the parents rather than trust $PPID.
+apt_pid() {
+    _p=$PPID
+    _n=0
+    while [ "${_p:-0}" -gt 1 ] && [ "$_n" -lt 4 ]; do
+        case "$(cat "/proc/$_p/comm" 2>/dev/null)" in
+            apt|apt-get|aptitude) printf '%s' "$_p"; return 0 ;;
+        esac
+        _p=$(awk '/^PPid:/{print $2}' "/proc/$_p/status" 2>/dev/null)
+        _n=$((_n + 1))
+    done
+    return 1
+}
+
+# By hand there is no package change to back up before, and every question below would name one.
+# Before need_root, so the run explains itself to whoever tries it.
+if ! pid=$(apt_pid); then
+    echo "apt-backup-profile: apt runs this before it changes packages; by hand there is nothing to back up before." >&2
+    echo "For a backup now, see create-profile." >&2
+    exit 0
+fi
+
+. "$LIB"
+
+need_root
+root_is_btrfs || exit 0
+
+args=$(xargs -0 -n1 <"/proc/$pid/cmdline" 2>/dev/null) || args=""
+# the non-option words, skipping argv[0] and the options that take a separate value: the
+# subcommand, then the packages it was given
+words=$(printf '%s\n' "$args" | awk 'NR==1{next} s{s=0;next} /^-[octap]$/{s=1;next} /^-/{next} {print}')
+action=$(printf '%s\n' "$words" | head -n1)
+pkgs=$(printf '%s\n' "$words" | tail -n +2)
+# an apt told not to ask gets no questions from us either
+printf '%s\n' "$args" | grep -qx -e -y -e --yes -e --assume-yes && exit 0
+# what we protect; an argv we could not read (empty) is still a package change, dpkg is next
+case "$action" in
+    ''|install|reinstall|remove|purge|autoremove|autopurge|upgrade|full-upgrade|dist-upgrade|build-dep|satisfy|dselect-upgrade) ;;
+    *) exit 0 ;;
+esac
+
+booted=$(booted_subvol)
+[ -n "$booted" ] || exit 0
+# only a top-level profile can be backed up, a booted snapshot cannot
+case "$booted" in */*) exit 0 ;; esac
+is_reserved_subvol "$booted" && exit 0
+
+# A typed name as the boot menu encodes one (boot.rs encode_label): whitespace becomes '-',
+# anything else outside [A-Za-z0-9-] is dropped, runs collapse, the ends are trimmed.
+slugify() { printf '%s' "$1" | tr '[:space:]' '-' | tr -cd 'A-Za-z0-9-' | sed 's/-\{2,\}/-/g; s/^-*//; s/-*$//'; }
+
+# The name a backup takes ($1 = slug), in the @<base>__<label>__ shape the boot menu reads as a
+# profile a user made: it shows the label alone, in brackets, dashes as spaces, and offers Rename
+# and Delete. <base> is the origin _stock's base (@Desktop_974_stock -> Desktop, boot.rs
+# origin_base), or what stands before the first '__' when there is no origin. The label says what
+# the backup came from, as a clone's does (boot.rs clone_dest), then '--' and the typed name:
+# @Desktop__Desktop--Before-install-btop__.
+backup_name() {
+    _b=""
+    _o=$(sed -n 's/^origin_stock_name=//p' /etc/profile_origin 2>/dev/null | head -n1)
+    case "${_o#@}" in
+        *_stock) _o=${_o#@}; _o=${_o%_stock}
+                 case "${_o##*_}" in ''|*[!0-9]*) ;; *) _b=${_o%_*} ;; esac ;;
+    esac
+    _raw=${booted#@}
+    [ -n "$_b" ] || _b=${_raw%%__*}
+    # what it came from: the source's own label, or its plain name when it has none
+    case "$_raw" in
+        *__*) _src=${_raw#*__}; while [ "${_src%_}" != "$_src" ]; do _src=${_src%_}; done ;;
+        *)    _src=$_raw ;;
+    esac
+    [ -n "$_src" ] || _src=$_b
+    printf '@%s__%s--%s__' "$_b" "$_src" "$1"
+}
+
+# Ask $1 on stderr, yes -> 0. A blank line first, so the question stands out from apt's output.
+ask() {
+    printf '\n%s [y/N] ' "$1" >&2
+    read -r _ans || return 1
+    case "$_ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+# Everything that can fail runs in this subshell: the shared helpers die on their own errors, and
+# a die must not become apt's exit status unasked.
+# 0 created, 2 the user backed out at the name prompt, anything else failed.
+make_backup() (
+    mount_top
+    # numbered if it is taken, so accepting the suggestion twice does not bounce
+    suggest=$suggest_base
+    _n=2
+    while [ -e "$TOP/$(backup_name "$(slugify "$suggest")")" ]; do
+        suggest="$suggest_base $_n"
+        _n=$((_n + 1))
+    done
+    while :; do
+        printf 'Name for the backup profile [%s]: ' "$suggest" >&2
+        read -r label || exit 2
+        typed=1
+        [ -n "$label" ] || { label=$suggest; typed=0; }
+        slug=$(slugify "$label")
+        if [ -z "$slug" ]; then
+            echo "A name is needed: letters, digits and '-' (a space becomes '-')" >&2
+            continue
+        fi
+        # only a name the user typed is worth reporting an adjustment on
+        [ "$typed" = 0 ] || [ "$slug" = "$label" ] || echo "Name adjusted to '$slug': a name takes only letters, digits and '-'" >&2
+        name=$(backup_name "$slug")
+        # in a subshell, so a rejected name is reported and asked again instead of dying
+        ( validate_profile_name "$name" ) || continue
+        if [ -e "$TOP/$name" ]; then
+            echo "Error: $name already exists; pick another name (see list-profiles)" >&2
+        else
+            break
+        fi
+    done
+    # -y: the questions are asked and the name is free, so create-profile's replace path,
+    # the one it confirms for, cannot be reached
+    "$CREATE_PROFILE" -y "$booted" "$name" || exit 1
+    # closing blank line: apt picks its output back up here
+    echo
+    exit 0
+)
+
+what="apt $action"
+[ -n "$action" ] || what="this package change"
+
+# What to offer: the change apt is about to make, e.g. "Before install btop". Three packages is
+# as much as a name can carry and still read as one.
+suggest_base="Before $action"
+_i=0
+for _w in $pkgs; do
+    _i=$((_i + 1))
+    [ "$_i" -le 3 ] && suggest_base="$suggest_base $_w"
+done
+[ "$_i" -le 3 ] || suggest_base="$suggest_base and more"
+[ -n "$action" ] || suggest_base="Before this package change"
+ask "Create a bootable backup before $what?" || exit 0
+
+make_backup
+rc=$?
+[ "$rc" = 0 ] || [ "$rc" = 2 ] && exit 0
+
+ask "The backup was NOT created. Continue with $what anyway?" && exit 0
+echo "Aborted before dpkg ran; no package was installed, removed or upgraded." >&2
+exit 1

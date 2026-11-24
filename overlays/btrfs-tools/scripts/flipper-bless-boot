@@ -1,0 +1,58 @@
+#!/bin/sh
+# flipper-bless-boot: the boot worked, so remove the entry's boot counter (the spec's 'good').
+#
+# Run once per boot by flipper-bless-boot.service after boot-complete.target, which with
+# systemd-boot-check-no-failures.service enabled means no unit failed.
+#
+# Which entry booted: the id a soft-reboot left in /run/flipper-boot-entry, else the running
+# kernel plus the mounted subvolume, which name exactly one entry. Nothing of ours is on the
+# command line. A missing counter, id or file is a quiet success.
+set -eu
+[ -r /usr/lib/flipper-blsname.sh ] || { echo "flipper-bless-boot: /usr/lib/flipper-blsname.sh not found" >&2; exit 1; }
+. /usr/lib/flipper-blsname.sh
+[ -r /usr/lib/flipper-rootinfo.sh ] || { echo "flipper-bless-boot: /usr/lib/flipper-rootinfo.sh not found" >&2; exit 1; }
+. /usr/lib/flipper-rootinfo.sh
+
+ENTRIES="${FLIPPER_ENTRIES:-/boot/loader/entries}"
+NOTE="${FLIPPER_ENTRY_NOTE:-/run/flipper-boot-entry}"
+
+id=""
+if [ -r "$NOTE" ]; then
+    read -r id < "$NOTE" || id=""
+fi
+
+# No note is what a boot-menu pivot leaves: /run does not survive init's shutdown pass.
+# More than one match is duplicate entries, and guessing is worse than doing nothing.
+if [ -z "$id" ]; then
+    sv="$(booted_subvol)"; rel="$(uname -r)"
+    hits=""
+    for f in "$ENTRIES"/*.conf; do
+        [ -f "$f" ] || continue
+        [ "$(entry_subvol_of "$f")" = "$sv" ] || continue
+        [ "$(sed -n "s/^version[[:space:]]\{1,\}//p" "$f" | head -n1)" = "$rel" ] || continue
+        hits="$hits $(entry_id_of "$f")"
+    done
+    set -- $hits
+    case $# in
+        0) echo "flipper-bless-boot: no entry for $rel in ${sv:-this root}, nothing to bless"; exit 0 ;;
+        1) id=$1; echo "flipper-bless-boot: no note from a pivot, so $id is what $rel in $sv came from" ;;
+        *) echo "flipper-bless-boot: $# entries claim $rel in $sv ($hits), not guessing" >&2; exit 0 ;;
+    esac
+fi
+case "$id" in *..*|*/*) echo "flipper-bless-boot: refusing an entry id with a path in it: $id" >&2; exit 1 ;; esac
+
+blessed=0
+for f in $(entry_files_for "$id"); do
+    counter="$(entry_counter_of "$f")"
+    [ -n "$counter" ] || continue
+    mv -f "$f" "$ENTRIES/$id.conf"
+    echo "flipper-bless-boot: $id booted cleanly, counter $counter removed"
+    blessed=1
+done
+if [ "$blessed" = 1 ]; then
+    # A rename reaches the disk with the next btrfs commit; lost, the counter comes back on a
+    # machine that just proved it boots.
+    sync
+fi
+[ "$blessed" = 1 ] || echo "flipper-bless-boot: $id carries no counter, already good"
+exit 0

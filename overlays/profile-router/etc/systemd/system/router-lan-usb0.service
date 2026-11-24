@@ -1,0 +1,14 @@
+[Unit]
+Description=Kali CardputerZero Router LAN USB-C Downlink (usb0 -> br-lan)
+Wants=router-lan-bridge.service
+After=router-lan-bridge.service
+PartOf=router-lan-bridge.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=-/usr/bin/nmcli connection up "Router LAN USB0"
+ExecStop=-/usr/bin/nmcli connection down "Router LAN USB0"
+
+[Install]
+WantedBy=multi-user.target

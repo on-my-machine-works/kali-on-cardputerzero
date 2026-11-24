@@ -1,0 +1,13 @@
+[Unit]
+Description=CardputerZero Router USB-C LAN Gadget (usb0)
+Before=router-lan-bridge.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=-/usr/local/bin/cz-flipper-gadget router-lan
+ExecStop=-/usr/local/bin/cz-flipper-gadget off
+
+[Install]
+WantedBy=multi-user.target

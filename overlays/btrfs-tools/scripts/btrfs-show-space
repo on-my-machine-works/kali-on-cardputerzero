@@ -1,0 +1,148 @@
+#!/bin/sh
+# btrfs-show-space [-q|--quick] [<@subvol>] - btrfs usage + per-root-subvolume space.
+# (-q/--quick skips the compsize REFERENCED column, one less extent-walk per subvol.)
+# With a <@subvol> argument, measures only that subvolume and prints machine-readable human
+# sizes (TOTAL=, UNIQUE=, and REFERENCED= unless -q) instead of the table: one extent-walk, no
+# per-subvolume sweep. This is how the UI sizes a single profile.
+# Lists EVERY subvolume: profile roots and @_old_* leftovers, the snapshots under @snapshots,
+# the _stock bases under @stock-snapshots, and the shared @home / @var-* / boot.
+#   UNIQUE     - data only this subvolume holds; freed if you delete IT ALONE,
+#                others kept (btrfs fi du, exact, uncompressed)
+#   REFERENCED - real on-disk size of all data it references, compressed
+#                (compsize, exact). Counts extents SHARED with other roots, so it
+#                is NOT additive across rows.
+#   TOTAL      - apparent/uncompressed size (btrfs fi du, exact)
+# The currently booted subvolume is marked  <- booted. Columns auto-size to fit.
+#
+# Example:
+#   btrfs-show-space --quick     # usage + per-subvol space (skips the slow REFERENCED column)
+#   btrfs-show-space -q @Desktop # just @Desktop: TOTAL=.../UNIQUE=... (machine-readable)
+set -eu
+[ -r /usr/lib/flipper-btrfs.sh ] || { echo "Error: /usr/lib/flipper-btrfs.sh not found" >&2; exit 1; }
+. /usr/lib/flipper-btrfs.sh
+
+usage() {
+    cat <<EOF
+Usage: btrfs-show-space [-q|--quick] [-d|--device DEV] [<@subvol>]
+  Btrfs usage plus per-root-subvolume space (UNIQUE / REFERENCED / TOTAL).
+  With <@subvol>, print only that subvolume's sizes as TOTAL=/UNIQUE=/REFERENCED=.
+  -q,--quick  skip the compsize REFERENCED column (one less extent-walk per subvol)
+$HELP_DEVICE
+EOF
+}
+
+quick=0
+target=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -q|--quick)  quick=1 ;;
+        -d|--device) shift; need_device_arg "$#"; ROOTDEV=$1 ;;
+        --device=*)  ROOTDEV=${1#*=} ;;
+        -h|--help)   usage; exit 0 ;;
+        --)          shift; break ;;
+        -?*)         echo "Error: unknown option: $1" >&2; usage >&2; exit 1 ;;
+        *)           break ;;
+    esac
+    shift
+done
+if [ $# -gt 0 ]; then
+    target=$1; shift
+    [ $# -eq 0 ] || { echo "Error: one subvolume at a time" >&2; usage >&2; exit 1; }
+    case "$target" in *..*|/*) die "Invalid name: $target" ;; esac
+fi
+
+need_root
+need_btrfs
+have_cs=0
+if [ "$quick" = 0 ] && command -v compsize >/dev/null 2>&1; then have_cs=1; fi
+
+# Measure one subvolume: sets M_TOT / M_EXC (bytes) and M_REF (bytes, or '' when compsize is off).
+# $1 = fs path
+measure() {
+    _line=$(btrfs filesystem du -s --raw "$1" 2>/dev/null | awk 'NR==2{print $1, $2}')
+    M_TOT=$(printf '%s' "$_line" | awk '{print $1}'); case "$M_TOT" in ''|*[!0-9]*) M_TOT=0 ;; esac
+    M_EXC=$(printf '%s' "$_line" | awk '{print $2}'); case "$M_EXC" in ''|*[!0-9]*) M_EXC=0 ;; esac
+    if [ "$have_cs" = 1 ]; then
+        M_REF=$(compsize -b "$1" 2>/dev/null | awk '/^TOTAL/{print $3; exit}')
+        case "$M_REF" in ''|*[!0-9]*) M_REF=0 ;; esac
+    else
+        M_REF=""
+    fi
+}
+
+# Single-subvolume query: just that subvolume's human sizes, no table or fs-usage header.
+if [ -n "$target" ]; then
+    mount_top
+    [ -e "$TOP/$target" ] || die "No such subvolume: $target (see list-profiles / list-snapshots)"
+    btrfs subvolume show "$TOP/$target" >/dev/null 2>&1 || die "Not a subvolume: $target"
+    measure "$TOP/$target"
+    printf 'TOTAL=%s\n'  "$(human "$M_TOT")"
+    printf 'UNIQUE=%s\n' "$(human "$M_EXC")"
+    if [ "$have_cs" = 1 ]; then
+        printf 'REFERENCED=%s\n' "$(human "$M_REF")"
+        # compression factor: apparent (uncompressed) over on-disk (compressed)
+        awk -v t="$M_TOT" -v r="$M_REF" 'BEGIN { if (r+0 > 0) printf "COMPRESSION=%.2f\n", t/r }'
+    fi
+    exit 0
+fi
+
+rows=$(mktemp)
+list=$(mktemp)
+TOP_TMPFILES="$rows $list"
+mount_top
+cur_id=$(target_running_id)
+
+echo "== filesystem =="
+btrfs filesystem usage -T "$TOP"
+echo
+
+# $1=display name  $2=fs path  -> append a TSV row
+row() {
+    measure "$2"
+    if [ "$have_cs" = 1 ]; then ref_h=$(human "$M_REF"); else ref_h="-"; fi
+    id=$(subvol_id "$2")
+    mark=""; is_running_id "$id" "$cur_id" && mark="<- booted"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$mark" "$(human "$M_EXC")" "$ref_h" "$(human "$M_TOT")" >> "$rows"
+}
+
+# collect EVERY subvolume (cheap), then measure with progress: each row walks extents (slow on
+# flash). btrfs subvolume list gives top-relative paths: profile roots + @_old_*, the nested
+# @snapshots/* and @stock-snapshots/* children, and the shared @home / @var-* / boot.
+btrfs subvolume list "$TOP" 2>/dev/null | sed -n 's/.* path //p' | sort | while read -r p; do
+    printf '%s\t%s\n' "$p" "$TOP/$p" >> "$list"
+done
+total=$(wc -l < "$list" 2>/dev/null | tr -d ' '); [ -n "$total" ] || total=0
+
+printf 'NAME\t\tUNIQUE\tREFERENCED\tTOTAL\n' > "$rows"
+if [ "$total" -gt 0 ]; then
+    if [ "$have_cs" = 1 ]; then note="du + compsize"; else note="du only"; fi
+    printf 'Measuring %s subvolume(s) (%s), please wait...\n' "$total" "$note" >&2
+fi
+i=0; tab=$(printf '\t')
+while IFS="$tab" read -r nm pth; do
+    i=$((i + 1))
+    [ -t 2 ] && printf '\r  [%d/%d] %s\033[K' "$i" "$total" "$nm" >&2 || true
+    row "$nm" "$pth"
+done < "$list"
+{ [ -t 2 ] && [ "$total" -gt 0 ] && printf '\r\033[K' >&2; } || true
+
+echo "== subvolumes =="
+# align: NAME auto-width; marker column after NAME; numeric columns right-justified
+awk -F'\t' '
+{ r[NR]=$0; if (length($1) > w) w = length($1) }
+END {
+    for (i = 1; i <= NR; i++) {
+        split(r[i], f, "\t")
+        # Width in the format string, not a star argument: see flipper-btrfs.sh.
+        printf "%-" w "s  %-9s %11s %11s %11s\n", f[1], f[2], f[3], f[4], f[5]
+    }
+}' "$rows"
+
+echo
+echo "UNIQUE     = freed if you delete that subvolume alone (uncompressed)."
+echo "REFERENCED = real on-disk size, compressed; counts shared extents, so NOT additive."
+if [ "$have_cs" = 0 ]; then
+    if [ "$quick" = 1 ]; then echo "REFERENCED '-': skipped for speed (--quick); run without it for compressed sizes."
+    else echo "REFERENCED shows '-': install 'compsize' (apt install compsize)."; fi
+fi
+echo "TOTAL      = apparent (uncompressed)."

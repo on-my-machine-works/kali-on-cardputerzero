@@ -1,0 +1,397 @@
+#!/usr/bin/env bash
+# cz-flipper-gadget — Composite USB-C OTG Gadget Manager for Kali Cyberdeck on CardputerZero
+#
+# Combines CardputerZero's M5IOE1 OTG mux (`ext_usb_gpio_fun`) & HID BadUSB with
+# composite NCM/ECM networking, non-routing point-to-point DHCP,
+# MTP `/home/kali` file sharing (`umtprd`), CDC-ACM serial console, and ISO/IMG boot/loot drive.
+#
+# Modes:
+#   net                      — USB Ethernet (`usb0` @ 10.55.0.1/24 + non-routing DHCP 10.55.0.2)
+#   router-lan               — USB Ethernet (`usb0` link up, no standalone IP/DHCP; for `@Router` `br-lan`)
+#   hid                      — USB HID Boot Keyboard (`/dev/hidg0`)
+#   combo                    — USB Ethernet + HID Keyboard (`/dev/hidg0` + `usb0` @ 10.55.0.1)
+#   mtp                      — USB Ethernet + MTP (`/home/kali` as `kali`) + USB Serial (`ttyGS0`)
+#   iso <file>               — USB Ethernet + Read-Only Bootable USB/CD-ROM (`file.iso` / `file.img`)
+#   loot <file>              — USB Ethernet + Read-Write USB Mass Storage (`file.img`, e.g. FAT32 loot)
+#   create-loot [mb] [path]  — Create formatted FAT32 loot image (default 64 MB at /home/kali/isos/kali-loot-64m.img)
+#   off                      — Tear down gadget and return USB mux to Host mode
+#   status                   — Report UDC, OTG mux, active functions, and IP
+
+set -euo pipefail
+
+GADGET_DIR="/sys/kernel/config/usb_gadget/kali_cz"
+USB_MUX_LED="/sys/class/leds/ext_usb_gpio_fun/brightness"
+USB_IP_CIDR="10.55.0.1/24"
+USB_IP_HOST="10.55.0.2"
+DHCP_PIDFILE="/run/cz-flipper-usb-dhcp.pid"
+FFS_DIR="/dev/ffs-mtp"
+MTP_USER="kali"
+
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        exec sudo "$0" "$@"
+    fi
+}
+
+get_udc() {
+    [[ -d /sys/class/udc ]] && ls /sys/class/udc 2>/dev/null | head -n 1 || true
+}
+
+device_serial() {
+    if [[ -r /sys/firmware/devicetree/base/serial-number ]]; then
+        tr -d '\0' < /sys/firmware/devicetree/base/serial-number | tr 'a-f' 'A-F'
+    elif [[ -r /etc/machine-id ]]; then
+        printf "CZFLIP-%s\n" "$(sha256sum < /etc/machine-id | cut -c1-8 | tr 'a-f' 'A-F')"
+    else
+        printf "CZFLIP0001\n"
+    fi
+}
+
+stop_helpers() {
+    if [[ -f "$DHCP_PIDFILE" ]]; then
+        kill "$(cat "$DHCP_PIDFILE" 2>/dev/null)" 2>/dev/null || true
+        rm -f "$DHCP_PIDFILE"
+    fi
+    systemctl stop serial-getty@ttyGS0.service 2>/dev/null || true
+    pkill -x umtprd 2>/dev/null || true
+    if [[ -e "$GADGET_DIR/functions/mass_storage.0/lun.0/forced_eject" ]]; then
+        echo 1 > "$GADGET_DIR/functions/mass_storage.0/lun.0/forced_eject" 2>/dev/null || true
+    elif [[ -e "$GADGET_DIR/functions/mass_storage.0/lun.0/file" ]]; then
+        echo "" > "$GADGET_DIR/functions/mass_storage.0/lun.0/file" 2>/dev/null || true
+    fi
+    grep -q " $FFS_DIR functionfs " /proc/mounts 2>/dev/null && umount "$FFS_DIR" 2>/dev/null || true
+}
+
+teardown_gadget() {
+    stop_helpers
+    if [[ -d "$GADGET_DIR" ]]; then
+        echo "" > "$GADGET_DIR/UDC" 2>/dev/null || true
+        rm -f "$GADGET_DIR/configs/c.1/"* 2>/dev/null || true
+        rmdir "$GADGET_DIR/configs/c.1/strings/0x409" 2>/dev/null || true
+        rmdir "$GADGET_DIR/configs/c.1" 2>/dev/null || true
+        for fn in "$GADGET_DIR/functions/"*; do
+            [[ -d "$fn" ]] && rmdir "$fn" 2>/dev/null || true
+        done
+        rmdir "$GADGET_DIR/strings/0x409" 2>/dev/null || true
+        rmdir "$GADGET_DIR" 2>/dev/null || true
+    fi
+}
+
+init_base_gadget() {
+    local product="$1" pid="$2" composite="${3:-1}"
+    modprobe libcomposite
+    mountpoint -q /sys/kernel/config || mount -t configfs none /sys/kernel/config
+
+    mkdir -p "$GADGET_DIR/strings/0x409" "$GADGET_DIR/configs/c.1/strings/0x409"
+    echo "0x1d6b" > "$GADGET_DIR/idVendor"
+    echo "$pid"   > "$GADGET_DIR/idProduct"
+    echo "0x0100" > "$GADGET_DIR/bcdDevice"
+    echo "0x0200" > "$GADGET_DIR/bcdUSB"
+    if [[ "$composite" == "1" ]]; then
+        # IAD composite class so Windows/macOS/Linux bind multi-interface NCM + HID/MTP/MSC cleanly
+        echo "0xEF" > "$GADGET_DIR/bDeviceClass"
+        echo "0x02" > "$GADGET_DIR/bDeviceSubClass"
+        echo "0x01" > "$GADGET_DIR/bDeviceProtocol"
+    fi
+
+    device_serial > "$GADGET_DIR/strings/0x409/serialnumber"
+    echo "Kali Cyberdeck x M5Stack" > "$GADGET_DIR/strings/0x409/manufacturer"
+    echo "$product"                 > "$GADGET_DIR/strings/0x409/product"
+    echo "Config 1: $product"       > "$GADGET_DIR/configs/c.1/strings/0x409/configuration"
+    echo 250                        > "$GADGET_DIR/configs/c.1/MaxPower"
+}
+
+add_net_func() {
+    modprobe usb_f_ncm 2>/dev/null || modprobe usb_f_ecm 2>/dev/null || true
+    local func="ecm.usb0"
+    if mkdir -p "$GADGET_DIR/functions/ncm.usb0" 2>/dev/null; then
+        func="ncm.usb0"
+        if [[ -d "$GADGET_DIR/functions/$func/os_desc/interface.ncm" ]]; then
+            echo WINNCM > "$GADGET_DIR/functions/$func/os_desc/interface.ncm/compatible_id" 2>/dev/null || true
+        fi
+    else
+        mkdir -p "$GADGET_DIR/functions/ecm.usb0"
+    fi
+    local serial b1 b2
+    serial="$(device_serial)"
+    b1="$(printf "%s" "$serial" | sha256sum | cut -c1-2)"
+    b2="$(printf "%s" "$serial" | sha256sum | cut -c3-4)"
+    echo "02:55:00:00:${b1}:${b2}" > "$GADGET_DIR/functions/$func/dev_addr"
+    echo "02:55:00:01:${b1}:${b2}" > "$GADGET_DIR/functions/$func/host_addr"
+    ln -sf "$GADGET_DIR/functions/$func" "$GADGET_DIR/configs/c.1/"
+}
+
+add_hid_kbd_func() {
+    modprobe usb_f_hid 2>/dev/null || true
+    mkdir -p "$GADGET_DIR/functions/hid.usb0"
+    echo 1 > "$GADGET_DIR/functions/hid.usb0/protocol"
+    echo 1 > "$GADGET_DIR/functions/hid.usb0/subclass"
+    echo 8 > "$GADGET_DIR/functions/hid.usb0/report_length"
+    printf '\x05\x01\x09\x06\xa1\x01\x05\x07\x19\xe0\x29\xe7\x15\x00\x25\x01\x75\x01\x95\x08\x81\x02\x95\x01\x75\x08\x81\x03\x95\x05\x75\x01\x05\x08\x19\x01\x29\x05\x91\x02\x95\x01\x75\x03\x91\x03\x95\x06\x75\x08\x15\x00\x25\x65\x05\x07\x19\x00\x29\x65\x81\x00\xc0' \
+        > "$GADGET_DIR/functions/hid.usb0/report_desc"
+    ln -sf "$GADGET_DIR/functions/hid.usb0" "$GADGET_DIR/configs/c.1/"
+}
+
+add_acm_func() {
+    modprobe usb_f_acm 2>/dev/null || true
+    mkdir -p "$GADGET_DIR/functions/acm.gs0"
+    ln -sf "$GADGET_DIR/functions/acm.gs0" "$GADGET_DIR/configs/c.1/"
+}
+
+add_mtp_func() {
+    if ! command -v umtprd >/dev/null 2>&1; then
+        echo "WARNING: umtprd (umtp-responder) not installed; skipping MTP function." >&2
+        return 0
+    fi
+    modprobe usb_f_fs 2>/dev/null || true
+    mkdir -p "$GADGET_DIR/functions/ffs.mtp" "$FFS_DIR"
+    ln -sf "$GADGET_DIR/functions/ffs.mtp" "$GADGET_DIR/configs/c.1/"
+
+    local uid gid serial
+    uid="$(id -u "$MTP_USER" 2>/dev/null || true)"
+    gid="$(id -g "$MTP_USER" 2>/dev/null || true)"
+    serial="$(device_serial)"
+
+    if [[ -n "$uid" && -n "$gid" ]]; then
+        install -d -m 755 -o "$uid" -g "$gid" /home/kali/isos /home/kali/payloads /home/kali/Apps 2>/dev/null || true
+    fi
+
+    if [[ -f /etc/umtprd/umtprd.conf ]]; then
+        sed -E "s/^serial .*/serial \"$serial\"/" /etc/umtprd/umtprd.conf > /run/umtprd.conf
+    else
+        cat > /run/umtprd.conf <<CONF
+loop_on_disconnect 1
+storage "/home/kali" "Kali Home" "rw"
+manufacturer "Kali Cyberdeck x M5Stack"
+product "CardputerZero Kali Deck"
+serial "$serial"
+interface "MTP"
+usb_class 0x6
+usb_subclass 0x1
+usb_protocol 0x1
+usb_functionfs_mode 0x1
+usb_dev_path   "/dev/ffs-mtp/ep0"
+usb_epin_path  "/dev/ffs-mtp/ep1"
+usb_epout_path "/dev/ffs-mtp/ep2"
+usb_epint_path "/dev/ffs-mtp/ep3"
+usb_max_packet_size 0x200
+CONF
+    fi
+
+    if [[ -n "$uid" && -n "$gid" ]] && command -v setpriv >/dev/null 2>&1; then
+        grep -q " $FFS_DIR functionfs " /proc/mounts \
+            || mount -t functionfs -o "uid=$uid,gid=$gid" mtp "$FFS_DIR"
+        setpriv --reuid "$uid" --regid "$gid" --init-groups umtprd -conf /run/umtprd.conf >/dev/null 2>&1 &
+    else
+        grep -q " $FFS_DIR functionfs " /proc/mounts \
+            || mount -t functionfs mtp "$FFS_DIR"
+        umtprd -conf /run/umtprd.conf >/dev/null 2>&1 &
+    fi
+
+    # Wait for umtprd to write FunctionFS descriptors before binding UDC
+    local i=0
+    while [[ ! -e "$FFS_DIR/ep1" && "$i" -lt 40 ]]; do
+        sleep 0.1
+        i=$((i + 1))
+    done
+    if [[ ! -e "$FFS_DIR/ep1" ]]; then
+        echo "ERROR: umtprd did not initialize $FFS_DIR/ep1" >&2
+        exit 1
+    fi
+}
+
+add_msc_func() {
+    local img="$1" rw="${2:-0}"
+    [[ -f "$img" ]] || { echo "ERROR: Image file not found: $img" >&2; exit 1; }
+    modprobe usb_f_mass_storage 2>/dev/null || true
+    mkdir -p "$GADGET_DIR/functions/mass_storage.0"
+    echo 1 > "$GADGET_DIR/functions/mass_storage.0/stall"
+    echo 1 > "$GADGET_DIR/functions/mass_storage.0/lun.0/removable"
+    if [[ "$img" == *.iso || "$img" == *.ISO ]]; then
+        echo 1 > "$GADGET_DIR/functions/mass_storage.0/lun.0/cdrom"
+        echo 1 > "$GADGET_DIR/functions/mass_storage.0/lun.0/ro"
+    else
+        echo 0 > "$GADGET_DIR/functions/mass_storage.0/lun.0/cdrom"
+        if [[ "$rw" == "1" ]]; then
+            echo 0 > "$GADGET_DIR/functions/mass_storage.0/lun.0/ro"
+        else
+            echo 1 > "$GADGET_DIR/functions/mass_storage.0/lun.0/ro"
+        fi
+    fi
+    echo "Kali Flipper Drive" > "$GADGET_DIR/functions/mass_storage.0/lun.0/inquiry_string"
+    echo "$img" > "$GADGET_DIR/functions/mass_storage.0/lun.0/file"
+    ln -sf "$GADGET_DIR/functions/mass_storage.0" "$GADGET_DIR/configs/c.1/"
+}
+
+bind_udc() {
+    local udc
+    udc="$(get_udc)"
+    if [[ -z "$udc" ]]; then
+        echo "ERROR: No USB Device Controller (/sys/class/udc) found. Check dtoverlay=dwc2." >&2
+        exit 1
+    fi
+    [[ -w "$USB_MUX_LED" ]] && echo 1 > "$USB_MUX_LED" || true
+    echo "$udc" > "$GADGET_DIR/UDC"
+    [[ -e /dev/hidg0 ]] && chmod 666 /dev/hidg0 2>/dev/null || true
+}
+
+bring_up_usb_net() {
+    local mode="${1:-standalone}"
+    sleep 0.8
+    local iface=""
+    for cand in usb0 flipusb0; do
+        if ip link show "$cand" >/dev/null 2>&1; then
+            iface="$cand"
+            break
+        fi
+    done
+    [[ -n "$iface" ]] || return 0
+    ip link set "$iface" up
+
+    if [[ "$mode" == "router" ]]; then
+        echo "$iface link UP for @Router br-lan bridge"
+        return 0
+    fi
+
+    ip addr replace "$USB_IP_CIDR" dev "$iface"
+
+    # Flipper One style non-routing DHCP: assigns 10.55.0.2 with NO gateway/DNS (--dhcp-option=3 / =6)
+    # so the laptop keeps its Wi-Fi internet while reaching ssh kali@10.55.0.1 and http://10.55.0.1:8899/
+    if command -v dnsmasq >/dev/null 2>&1; then
+        dnsmasq --conf-file=/dev/null --port=0 \
+            --interface="$iface" --bind-dynamic --dhcp-authoritative --leasefile-ro \
+            --dhcp-range="${USB_IP_HOST},${USB_IP_HOST},255.255.255.0,1h" \
+            --dhcp-option=3 --dhcp-option=6 \
+            --pid-file="$DHCP_PIDFILE" 2>/dev/null || true
+    fi
+    echo "$iface up at ${USB_IP_CIDR} (SSH: kali@10.55.0.1 | Web UI: http://10.55.0.1:8899/)"
+}
+
+create_loot_img() {
+    local mb="${1:-64}"
+    local out="${2:-/home/kali/isos/kali-loot-${mb}m.img}"
+    install -d -m 755 "$(dirname "$out")"
+    echo "Creating ${mb}MB FAT32 loot image at $out ..."
+    truncate -s "${mb}M" "$out"
+    if command -v mkfs.vfat >/dev/null 2>&1; then
+        mkfs.vfat -F 32 -n KALILOOT "$out" >/dev/null
+    elif command -v mkdosfs >/dev/null 2>&1; then
+        mkdosfs -F 32 -n KALILOOT "$out" >/dev/null
+    else
+        echo "ERROR: mkfs.vfat (dosfstools) not installed." >&2
+        rm -f "$out"
+        exit 1
+    fi
+    if id "$MTP_USER" >/dev/null 2>&1; then
+        chown "$MTP_USER:$MTP_USER" "$(dirname "$out")" "$out" 2>/dev/null || true
+    fi
+    echo "Created FAT32 loot image: $out"
+}
+
+show_status() {
+    echo "UDC controller : $(get_udc || echo none)"
+    if [[ -r "$USB_MUX_LED" ]]; then
+        echo "USB mux GPIO   : $(cat "$USB_MUX_LED") (0=Host, 1=Device/OTG)"
+    fi
+    if [[ -d "$GADGET_DIR" ]]; then
+        echo "USB gadget     : ACTIVE (UDC=$(cat "$GADGET_DIR/UDC" 2>/dev/null || echo unbound))"
+        ls -1 "$GADGET_DIR/configs/c.1" 2>/dev/null | grep -E '^(ncm|ecm|rndis|hid|ffs|acm|mass_storage)\.' | sed 's/^/  function: /' || true
+        if [[ -f "$GADGET_DIR/functions/mass_storage.0/lun.0/file" ]]; then
+            local backing
+            backing="$(cat "$GADGET_DIR/functions/mass_storage.0/lun.0/file" 2>/dev/null || true)"
+            [[ -n "$backing" ]] && echo "  backing : $backing (ro=$(cat "$GADGET_DIR/functions/mass_storage.0/lun.0/ro" 2>/dev/null || echo 1))"
+        fi
+    else
+        echo "USB gadget     : INACTIVE"
+    fi
+    ip -4 -br addr show usb0 2>/dev/null || true
+}
+
+cmd="${1:-status}"
+case "$cmd" in
+    status)
+        show_status
+        ;;
+    net)
+        require_root "$@"
+        teardown_gadget
+        init_base_gadget "CardputerZero Kali Flipper Net" "0x0104" 1
+        add_net_func
+        bind_udc
+        bring_up_usb_net standalone
+        ;;
+    router-lan)
+        require_root "$@"
+        teardown_gadget
+        init_base_gadget "CardputerZero Kali Router LAN" "0x0104" 1
+        add_net_func
+        bind_udc
+        bring_up_usb_net router
+        ;;
+    hid)
+        require_root "$@"
+        teardown_gadget
+        init_base_gadget "CardputerZero Kali HID" "0x0105" 0
+        add_hid_kbd_func
+        bind_udc
+        echo "HID keyboard gadget active at /dev/hidg0"
+        ;;
+    combo)
+        require_root "$@"
+        teardown_gadget
+        init_base_gadget "CardputerZero Kali Net+HID" "0x0106" 1
+        add_net_func
+        add_hid_kbd_func
+        bind_udc
+        bring_up_usb_net standalone
+        echo "Composite USB Net + HID gadget active (/dev/hidg0 + usb0)"
+        ;;
+    mtp)
+        require_root "$@"
+        teardown_gadget
+        init_base_gadget "CardputerZero Kali Net+MTP+Serial" "0x0107" 1
+        add_net_func
+        add_mtp_func
+        add_acm_func
+        bind_udc
+        bring_up_usb_net standalone
+        systemctl start serial-getty@ttyGS0.service 2>/dev/null || true
+        echo "Composite USB Net + MTP (/home/kali) + Serial (ttyGS0) active"
+        ;;
+    iso)
+        require_root "$@"
+        [[ $# -ge 2 ]] || { echo "Usage: $0 iso <path-to.iso|.img>" >&2; exit 1; }
+        teardown_gadget
+        init_base_gadget "CardputerZero Kali Boot Drive" "0x0108" 1
+        add_net_func
+        add_msc_func "$2" 0
+        bind_udc
+        bring_up_usb_net standalone
+        echo "Read-only Bootable ISO/IMG gadget active: $2"
+        ;;
+    loot)
+        require_root "$@"
+        [[ $# -ge 2 ]] || { echo "Usage: $0 loot <path-to-loot.img>" >&2; exit 1; }
+        teardown_gadget
+        init_base_gadget "CardputerZero Kali Loot Drive" "0x0109" 1
+        add_net_func
+        add_msc_func "$2" 1
+        bind_udc
+        bring_up_usb_net standalone
+        echo "Read-write Loot IMG gadget active: $2"
+        ;;
+    create-loot)
+        require_root "$@"
+        create_loot_img "${2:-64}" "${3:-}"
+        ;;
+    off)
+        require_root "$@"
+        teardown_gadget
+        [[ -w "$USB_MUX_LED" ]] && echo 0 > "$USB_MUX_LED" || true
+        echo "USB gadget disabled; mux returned to Host mode."
+        ;;
+    *)
+        echo "Usage: $0 {status|net|router-lan|hid|combo|mtp|iso <file>|loot <file>|create-loot [mb]|off}" >&2
+        exit 1
+        ;;
+esac

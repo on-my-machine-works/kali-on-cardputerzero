@@ -1,0 +1,26 @@
+# CardputerZero v5 display & input permissions for Kali Cyberdeck Shell (czctl) + fb_lcd apps.
+# Keeps internal 320x170 SPI0 ST7789v3 off X11/LightDM (HDMI stays independent on vc4)
+# while granting video/input/uinput access to user `kali`.
+
+ACTION!="remove", SUBSYSTEM=="drm", KERNEL=="card*", \
+  ENV{ID_PATH}=="platform-3f204000.spi-cs-0", \
+  SYMLINK+="dri/cardputer-zero-internal", \
+  GROUP="video", MODE="0660", \
+  TAG-="master-of-seat"
+
+ACTION!="remove", SUBSYSTEM=="graphics", KERNEL=="fb*", \
+  ATTRS{of_node/compatible}=="*st7789v*", \
+  SYMLINK+="fb_lcd", \
+  GROUP="video", MODE="0660"
+
+ACTION!="remove", SUBSYSTEM=="input", KERNEL=="event*", \
+  ENV{ID_PATH}=="platform-3f804000.i2c", \
+  SYMLINK+="input/cardputer-zero-internal", \
+  ENV{ID_SEAT}="seat1", \
+  GROUP="input", MODE="0660"
+
+ACTION!="remove", SUBSYSTEM=="backlight", KERNEL=="backlight", \
+  RUN+="/bin/chgrp video /sys%p/brightness", \
+  RUN+="/bin/chmod g+w /sys%p/brightness"
+
+KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="input", MODE="0660"

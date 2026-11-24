@@ -1,0 +1,6 @@
+REM Kali Cyberdeck CardputerZero — Linux Recon Terminal Demo
+REM Opens a terminal on Linux desktop and prints host/network summary
+DEFAULT_DELAY 80
+CTRL ALT t
+DELAY 650
+STRINGLN echo "=== Kali Cyberdeck CardputerZero BadUSB Check ===" && uname -a && ip -br addr

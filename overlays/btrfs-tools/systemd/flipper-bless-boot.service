@@ -1,0 +1,47 @@
+[Unit]
+Description=Bless the boot entry this boot came from
+Documentation=man:systemd.special(7)
+# No conditions, deliberately. Whether there is anything to bless is a question about the entries
+# on disk, and no Condition can ask it: a kexec'd boot names its entry on the command line, but a
+# pivoted one boots no kernel and so inherits the command line it was started from, and the note
+# the tool leaves in /run does not survive init's shutdown pass and switch_root. Conditioning on
+# either of those is how this unit came to be skipped on exactly the boots it was written for:
+#
+#   flipper-bless-boot.service … skipped, no trigger condition checks were met.
+#
+# So it always runs, and the script decides: it works the entry out from the running kernel and
+# the booted subvolume, and says so and exits 0 when nothing matches -- a recovery boot, or a
+# kernel started by hand.
+
+# boot-complete.target is what decides whether this boot counts as good, and with
+# systemd-boot-check-no-failures.service enabled it is only reached when no unit failed. Requires=
+# rather than Wants=, so a boot that fails the check does not bless the entry and the next boot
+# spends another of its tries.
+Requires=boot-complete.target
+After=boot-complete.target
+
+# Load-bearing, and the reason this unit did nothing on its first real boot: a target is implicitly
+# ordered AFTER the units it wants, so a service inside multi-user.target that waits for
+# boot-complete.target -- which is only reached after multi-user.target, by way of
+# systemd-boot-check-no-failures.service -- is a cycle. systemd breaks a cycle by deleting a job,
+# and the job it deleted was this one:
+#
+#   multi-user.target: Found ordering cycle on flipper-bless-boot.service/start
+#   Job flipper-bless-boot.service/start deleted to break ordering cycle
+#
+# Opting out of the default dependencies takes this unit out of that ordering, which is what
+# systemd's own systemd-bless-boot.service does for the same reason. The two lines after it are
+# what DefaultDependencies= would otherwise have supplied, so the unit still goes away cleanly at
+# shutdown.
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/flipper-bless-boot
+
+[Install]
+# The target is passive: something has to pull it in, and this is that something.
+WantedBy=multi-user.target

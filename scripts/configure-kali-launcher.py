@@ -153,13 +153,27 @@ KALI_APPS = [
         "glyph": [0x7E, 0xDB, 0xFF, 0x99, 0x99, 0x81, 0x81, 0xFF],
         "tag": "PKGS",
     },
+    {
+        "filename": "kali-czctl.desktop",
+        "name": "Kali Deck",
+        "icon_file": "kali_czctl_100.png",
+        "exec": "/usr/local/bin/cz-ui-mode czctl",
+        "terminal": False,
+        "sysplause": True,
+        "bg": (8, 12, 22),
+        "fg": (56, 188, 255),
+        "accent": (44, 132, 245),
+        "glyph": [0xFF, 0x81, 0xBD, 0x99, 0x99, 0xBD, 0x81, 0xFF],
+        "tag": "DECK",
+    },
 ]
 
 # Tiny 3x5 uppercase/digit font for bottom badge inside 100x100 icons
 TINY3X5 = {
     "0": [7, 5, 5, 5, 7], "2": [7, 1, 7, 4, 7], "4": [5, 5, 7, 1, 1],
     "8": [7, 5, 7, 5, 7], "x": [0, 5, 2, 5, 0],
-    "A": [2, 5, 7, 5, 5], "C": [3, 4, 4, 4, 3], "F": [7, 4, 6, 4, 4],
+    "A": [2, 5, 7, 5, 5], "C": [3, 4, 4, 4, 3], "D": [6, 5, 5, 5, 6],
+    "E": [7, 4, 6, 4, 7], "F": [7, 4, 6, 4, 4],
     "G": [3, 4, 5, 5, 3], "H": [5, 5, 7, 5, 5], "I": [7, 2, 2, 2, 7],
     "K": [5, 5, 6, 5, 5], "L": [4, 4, 4, 4, 7], "M": [5, 7, 5, 5, 5],
     "N": [5, 7, 7, 5, 5], "O": [2, 5, 5, 5, 2], "P": [6, 5, 6, 4, 4],

@@ -1,0 +1,13 @@
+[Unit]
+Description=Kali CardputerZero Router LAN Bridge (br-lan @ 192.168.50.1/24)
+After=NetworkManager.service cz-router-usb.service
+Wants=NetworkManager.service cz-router-usb.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/nmcli connection up "Router LAN Bridge"
+ExecStop=/usr/bin/nmcli connection down "Router LAN Bridge"
+
+[Install]
+WantedBy=multi-user.target

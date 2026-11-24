@@ -1,0 +1,44 @@
+Filetype: IR signals file
+Version: 1
+#
+name: Samsung_TV_Power
+type: parsed
+protocol: Samsung32
+address: 07 00 00 00
+command: 02 00 00 00
+#
+name: Samsung_Mute
+type: parsed
+protocol: Samsung32
+address: 07 00 00 00
+command: 0F 00 00 00
+#
+name: LG_NEC_TV_Power
+type: parsed
+protocol: NEC
+address: 04 00 00 00
+command: 08 00 00 00
+#
+name: LG_NEC_Vol_Up
+type: parsed
+protocol: NEC
+address: 04 00 00 00
+command: 02 00 00 00
+#
+name: LG_NEC_Vol_Down
+type: parsed
+protocol: NEC
+address: 04 00 00 00
+command: 03 00 00 00
+#
+name: Sony_SIRC_Power
+type: parsed
+protocol: SIRC
+address: 01 00 00 00
+command: 15 00 00 00
+#
+name: Projector_NEC_Power
+type: parsed
+protocol: NECext
+address: 83 55 00 00
+command: 90 6F 00 00

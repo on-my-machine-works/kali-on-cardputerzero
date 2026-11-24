@@ -1,0 +1,7 @@
+REM Kali Cyberdeck CardputerZero — macOS Spotlight Terminal Demo
+DEFAULT_DELAY 80
+GUI SPACE
+DELAY 450
+STRINGLN Terminal
+DELAY 750
+STRINGLN echo "Hello from Kali Cyberdeck Edition on M5Stack CardputerZero!" && sw_vers && ifconfig | grep "inet "

@@ -1,0 +1,8 @@
+REM Kali Cyberdeck CardputerZero — Windows Notepad Greeting Demo
+DEFAULT_DELAY 80
+GUI r
+DELAY 500
+STRINGLN notepad
+DELAY 700
+STRINGLN Hello from Kali Cyberdeck Edition on M5Stack CardputerZero!
+STRINGLN Composite USB Net (10.55.0.1) + BadUSB HID active.

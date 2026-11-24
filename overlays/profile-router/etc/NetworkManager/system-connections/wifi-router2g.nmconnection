@@ -1,0 +1,19 @@
+[connection]
+id=Router Wi-Fi 2.4 GHz
+type=wifi
+interface-name=wlan0
+autoconnect=false
+master=br-lan
+slave-type=bridge
+
+[wifi]
+band=bg
+channel=6
+mode=ap
+ssid=KaliCZ_Router
+
+[wifi-security]
+key-mgmt=wpa-psk
+proto=rsn
+pairwise=ccmp
+psk=kaliflipper

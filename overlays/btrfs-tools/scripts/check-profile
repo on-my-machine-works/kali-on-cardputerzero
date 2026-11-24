@@ -1,0 +1,265 @@
+#!/bin/sh
+# check-profile - tell how far a profile is from what its _stock golden base shipped. Prints one
+# word, the worst that applies:
+#
+#   pristine    the same, never booted
+#   booted      booted, and nothing else: the units the presets enable, the system accounts and
+#               the Wi-Fi SSID a first boot fills in, and the state every running system writes
+#   customized  changed where an update carries the change: /etc, /usr/local, /opt, /var/lib
+#   packages    packages installed, removed or upgraded
+#   system      files of the build itself, under /usr, changed outside the package manager
+#
+# Diffs the profile against its origin _stock (from /etc/profile_origin) with a metadata-only
+# send, so an untouched profile costs almost nothing. Rewrites that left a file as it was do not
+# count, nor do the install's own edits (the fs UUID in fstab and cmdline).
+#
+# Example:
+#   check-profile              # the booted profile
+#   check-profile -v @Router   # and list what differs
+set -eu
+[ -r /usr/lib/flipper-btrfs.sh ] || { echo "Error: /usr/lib/flipper-btrfs.sh not found" >&2; exit 1; }
+. /usr/lib/flipper-btrfs.sh
+
+usage() {
+    cat <<EOF
+Usage: check-profile [-v|--verbose] [-d|--device DEV] [<@profile>]
+$HELP_DEVICE
+  -v,--verbose list every path that differs from the _stock and what it counts as (on stderr)
+  Print how far <@profile> (default: the booted one) is from its origin _stock: pristine,
+  booted, customized, packages or system.
+EOF
+}
+
+VERBOSE=0
+PROFILE=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v|--verbose) VERBOSE=1 ;;
+        -d|--device)  shift; need_device_arg "$#"; ROOTDEV=$1 ;;
+        --device=*)   ROOTDEV=${1#*=} ;;
+        -h|--help)    usage; exit 0 ;;
+        -?*)          echo "Error: unknown option: $1" >&2; usage >&2; exit 1 ;;
+        *)            [ -z "$PROFILE" ] || { echo "Error: unexpected argument: $1" >&2; usage >&2; exit 1; }
+                      PROFILE=$1 ;;
+    esac
+    shift
+done
+
+# Runtime state, not configuration: a new root regenerates it. Anchored regexes on the path.
+export CHECK_PROFILE_IGNORE="$RUNTIME_STATE"'
+^etc/adjtime$
+^var/lib/systemd/(backlight|linger)(/|$)
+^var/lib/(bluetooth|alsa|udisks2|samba|sddm|polkit-1|sudo|logrotate|AccountsService|ModemManager|power-profiles-daemon|colord|fwupd|plocate|private|iwd)(/|$)
+^var/backups(/|$)
+^root(/|$)'
+
+need_root
+need_btrfs
+need_cmd cmp diffutils
+
+failed=$(mktemp)
+TOP_TMPFILES="$failed"
+mount_top
+set_lock
+
+if [ -z "$PROFILE" ]; then
+    PROFILE=$(target_running_subvol)
+    [ -n "$PROFILE" ] || die "Not booted from $ROOTDEV: name the profile"
+fi
+validate_profile_name "$PROFILE"
+PROF="$TOP/$PROFILE"
+btrfs subvolume show "$PROF" >/dev/null 2>&1 || die "No such profile: $PROFILE"
+
+origin=$(sed -n 's/^origin_stock_name=//p' "$PROF/etc/profile_origin" 2>/dev/null | head -n1)
+[ -n "$origin" ] || die "$PROFILE has no origin _stock (/etc/profile_origin)"
+STOCK="$TOP/@stock-snapshots/$origin"
+btrfs subvolume show "$STOCK" >/dev/null 2>&1 || die "Origin _stock of $PROFILE is gone: $origin"
+is_ro "$STOCK" || die "Origin _stock is writable, so it is no reference: $origin"
+
+# The installer rewrites the fs UUID the stock was built with into these files.
+stock_uuid=$(awk '$2 == "/" { sub(/^UUID=/, "", $1); print $1; exit }' "$STOCK/etc/fstab" 2>/dev/null || true)
+dev_uuid=$(target_fsuuid)
+
+TAB=$(printf '\t')
+
+# Sets WHY to why path $1 differs between stock and profile, empty when it does not. In fstab
+# and cmdline the installer's fs UUID is put back to the stock's before calling it content.
+differs() {
+    path_differs "$STOCK" "$PROF" "$1"
+    [ "$WHY" = content ] && [ -n "$stock_uuid" ] && [ -n "$dev_uuid" ] || return 0
+    case "$1" in
+        etc/fstab|etc/kernel/cmdline)
+            sed "s/$stock_uuid/$dev_uuid/g" "$STOCK/$1" | cmp -s - "$PROF/$1" && WHY="" ;;
+    esac
+    return 0
+}
+
+# The states, mildest first; a profile is the worst of what its differences make it.
+STATES="pristine booted customized packages system"
+# $1 = state -> its place in STATES
+level() { _l=0; for _s in $STATES; do [ "$_s" = "$1" ] && { echo "$_l"; return; }; _l=$((_l + 1)); done; }
+# $1 = state; raises $state to it
+worse() { [ "$(level "$1")" -gt "$(level "$state")" ] && state=$1; return 0; }
+
+# A package installed, removed or upgraded shows in dpkg's status, without a diff. The files of
+# those packages are then theirs, not edits to the build, so they are listed to be passed over.
+owned=$(mktemp)
+TOP_TMPFILES="$TOP_TMPFILES $owned"
+state=pristine
+differs var/lib/dpkg/status
+if [ -n "$WHY" ]; then
+    state=packages
+    # $1 = root -> "<package> <version>" per installed package
+    installed() {
+        awk 'BEGIN { RS = "" } {
+            p = ""; v = ""; ok = 0; n = split($0, l, "\n")
+            for (i = 1; i <= n; i++) {
+                if (l[i] ~ /^Package: /) p = substr(l[i], 10)
+                else if (l[i] ~ /^Version: /) v = substr(l[i], 10)
+                else if (l[i] ~ /^Status: .* installed$/) ok = 1
+            }
+            if (ok) print p, v }' "$1/var/lib/dpkg/status" | sort
+    }
+    _was=$(mktemp); _now=$(mktemp)
+    TOP_TMPFILES="$TOP_TMPFILES $_was $_now"
+    installed "$STOCK" > "$_was"
+    installed "$PROF" > "$_now"
+    for _n in $(comm -3 "$_was" "$_now" | awk '{ print $1 }' | sort -u); do
+        for _r in "$STOCK" "$PROF"; do
+            cat "$_r/var/lib/dpkg/info/$_n.list" "$_r/var/lib/dpkg/info/$_n":*.list 2>/dev/null || true
+        done
+    done | sed 's,^/,,' | sort -u > "$owned"
+fi
+
+# The unit-file presets a first boot applies: the stock's files, a name in /etc overriding the
+# same name in /usr/lib, read in name order. $1 = unit; true if they enable it. A unit no rule
+# names is enabled, which is systemd's own default.
+preset_files=$(for _d in usr/lib etc; do ls "$STOCK/$_d/systemd/system-preset/" 2>/dev/null; done | sort -u |
+    while read -r _f; do
+        if [ -f "$STOCK/etc/systemd/system-preset/$_f" ]; then echo "$STOCK/etc/systemd/system-preset/$_f"
+        else echo "$STOCK/usr/lib/systemd/system-preset/$_f"; fi
+    done)
+preset_enables() {
+    for _pf in $preset_files; do
+        while read -r _act _pat _rest; do
+            case "$_act" in enable|disable) ;; *) continue ;; esac
+            # shellcheck disable=SC2254
+            case "$1" in $_pat) [ "$_act" = enable ]; return ;; esac
+        done < "$_pf"
+    done
+    return 0
+}
+
+# Whether the difference at $1 is what booting does to a root, rather than a change of the
+# user's: a unit link the presets make, a system account added (id below 1000), or the Wi-Fi
+# SSID placeholder filled in.
+boot_work() {
+    case "$1" in
+        etc/systemd/system/*)
+            [ -d "$PROF/$1" ] && [ ! -L "$PROF/$1" ] && return 0
+            _t=$(readlink "$PROF/$1") || return 1
+            case "$_t" in /usr/lib/systemd/system/*|/lib/systemd/system/*) ;; *) return 1 ;; esac
+            [ -e "$PROF$_t" ] && preset_enables "${_t##*/}" ;;
+        etc/passwd|etc/passwd-|etc/group|etc/group-|etc/shadow|etc/shadow-|etc/gshadow|etc/gshadow-)
+            # Only lines added, each an account whose id, in passwd or group, is below 1000.
+            case "$1" in
+                etc/shadow*)  _ids=etc/passwd ;;
+                etc/gshadow*) _ids=etc/group ;;
+                *)            _ids=$1 ;;
+            esac
+            awk -F: -v ids="$PROF/$_ids" '
+                BEGIN { while ((getline l < ids) > 0) { split(l, f, ":"); id[f[1]] = f[3] } }
+                FNR == NR { was[$0] = 1; next }
+                $0 in was { delete was[$0]; next }
+                !($1 in id) || id[$1] == "" || id[$1] + 0 >= 1000 { bad = 1 }
+                END { for (k in was) bad = 1; exit bad }' "$STOCK/$1" "$PROF/$1" ;;
+        etc/*)
+            # The same lines, but where the stock has WIFISSIDSERIAL the profile has a serial.
+            grep -q WIFISSIDSERIAL "$STOCK/$1" 2>/dev/null || return 1
+            awk 'FNR == NR { was[FNR] = $0; n = FNR; next }
+                { a = was[FNR]; if (a == $0) next
+                  i = index(a, "WIFISSIDSERIAL"); pre = substr(a, 1, i - 1); post = substr(a, i + 14)
+                  if (!i || index($0, pre) != 1 || length($0) <= length(pre) + length(post) \
+                      || substr($0, length($0) - length(post) + 1) != post) { bad = 1; exit }
+                  mid = substr($0, length(pre) + 1, length($0) - length(pre) - length(post))
+                  if (mid !~ /^[0-9A-Za-z]+$/) { bad = 1; exit } }
+                END { if (FNR != n) bad = 1; exit bad }' "$STOCK/$1" "$PROF/$1" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Reads "<x|->TAB<u|o>TAB<path>" lines, u for the build's own files under /usr and o for the
+# rest, and prints the state. Only system settles it early: nothing is worse.
+check_paths() {
+    while IFS="$TAB" read -r _xa _cls _path; do
+        differs "$_path"
+        # Any other difference also comes as a '-' line, which reports it
+        if [ "$_xa" = x ]; then
+            if [ -n "$WHY" ]; then WHY=""; else WHY=xattrs; fi
+        fi
+        [ -n "$WHY" ] || continue
+        if [ "$_cls" = u ]; then _kind=system
+        elif boot_work "$_path"; then _kind=booted
+        else _kind=customized
+        fi
+        worse "$_kind"
+        if [ "$VERBOSE" = 1 ]; then printf '%s (%s): %s\n' "$WHY" "$_kind" "$_path" >&2
+        elif [ "$state" = system ]; then break
+        fi
+    done
+    # Nothing beyond the state a running system writes still means it has run.
+    if [ "$state" = pristine ]; then
+        _id=$(cat "$PROF/etc/machine-id" 2>/dev/null || true)
+        [ -z "$_id" ] || [ "$_id" = uninitialized ] || state=booted
+    fi
+    echo "$state"
+}
+
+# A probe, because send needs a read-only source. Not '@'-named, so no tool lists it.
+probe=".check-profile.$$"
+trap 'btrfs subvolume delete "$TOP/$probe" >/dev/null 2>&1 || true; top_cleanup' EXIT
+btrfs subvolume snapshot -r "$PROF" "$TOP/$probe" >/dev/null || die "Cannot snapshot $PROFILE"
+
+# Each path the diff touches, once, as the stream goes, so the check can stop it early. An
+# 'x' line marks an xattr change, which cannot be compared here (no getfattr). Orphans
+# (o<ino>-<gen>-0) are send's temporary names, always renamed or unlinked later. Whitespace
+# in names comes escaped as '\ '.
+status=$({ btrfs send -q --no-data -p "$STOCK" "$TOP/$probe" || echo send >> "$failed"; } |
+    { btrfs receive --dump || echo receive >> "$failed"; } |
+    awk -v pre="./$probe/" -v owned="$owned" '
+    BEGIN {
+        n = split(ENVIRON["CHECK_PROFILE_IGNORE"], re, "\n"); sp = sprintf("%c", 1)
+        while ((getline l < owned) > 0) own[l] = 1
+    }
+    function emit(p, x,   i, k, c) {
+        gsub(sp, " ", p)
+        if (index(p, pre) != 1) return
+        p = substr(p, length(pre) + 1)
+        if (p ~ /^o[0-9]+-[0-9]+-[0-9]+(\/|$)/) return
+        for (i = 1; i <= n; i++) if (p ~ re[i]) return
+        # The package manager records, which the status comparison has read already.
+        if (p ~ /^var\/lib\/(dpkg|apt)(\/|$)/) return
+        c = "o"
+        if (p ~ /^usr(\/|$)/ && p !~ /^usr\/local(\/|$)/) {
+            if (p in own) return
+            c = "u"
+        }
+        k = (x ? "x" : "-") "\t" c "\t" p
+        if (k in seen) return
+        seen[k] = 1
+        print k
+        fflush()
+    }
+    {
+        gsub(/\\ /, sp)
+        op = $1
+        if (op == "snapshot" || op == "subvol" || op == "utimes" || op == "end") next
+        if (op == "rename") { d = $3; sub(/^dest=/, "", d); emit($2, 0); emit(d, 0); next }
+        emit($2, op == "set_xattr" || op == "remove_xattr")
+    }' | check_paths)
+
+# Stopping early cuts the stream, so send and receive fail then by design.
+if [ "$VERBOSE" = 1 ] || [ "$status" != system ]; then
+    [ ! -s "$failed" ] || die "Diff against $origin failed in btrfs $(tr '\n' ' ' < "$failed")"
+fi
+echo "$status"
