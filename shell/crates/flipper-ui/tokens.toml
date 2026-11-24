@@ -1,0 +1,519 @@
+# Design tokens for Kali Linux x Flipper One UI on M5Stack CardputerZero (320x170 RGB565).
+#
+# Single source of truth. build.rs generates the Rust and Slint theme from this
+# file; nothing else may contain a colour literal or a layout constant.
+#
+# Palette matched directly to `cz_ui.h` (Kali Dark) and bottom softkeys aligned
+# to physical keys '4', '5', '6', '7', '8' at X centers 48, 104, 160, 216, 272.
+
+[meta]
+panel_width = 320
+panel_height = 170
+
+[color]
+# Default theme: Kali Dark on pure Flipper One UI elements (`[palette.og_flipper]`
+# and `[palette.flipper_mono]` below provide live-switchable OG Flipper & Mono options).
+white         = "#080c16"   # canvas ground, modal/card base
+black         = "#ebf3ff"   # primary text, crisp glyphs, active highlights
+
+divider       = "#22385c"   # rules, inactive frames
+disabled_bg   = "#0f1626"   # subtle recessed ground
+disabled_fg   = "#526888"   # muted disabled ink
+status_dim    = "#8098b9"   # secondary/status labels
+card_stroke   = "#22385c"   # unselected interface card outline
+pill          = "#14223a"   # card top-right backdrop
+chevron_bar   = "#2c84f5"   # drill-in bar
+rule_light    = "#1b2e4d"   # modal section rule
+rule_faint    = "#14223a"   # subtle row divider inside modals
+chip_fill     = "#14223a"   # settings value chip ground
+pick_rule     = "#22385c"   # dropdown option divider
+app_bar       = "#0c1c3a"   # hosted app title bar
+chevron_flash = "#38bcff"   # < > arrow tap flash
+popup_edge    = "#2c84f5"   # popup accent edge
+keycap_dim    = "#8098b9"   # keyboard language-switcher & secondary labels
+sw_tab        = "#2c84f5"   # app switcher background card stroke
+sw_tab_deep   = "#22385c"   # deepest card stroke
+sw_bar_deep   = "#0f1626"   # off-deck card header bar
+dialog_body   = "#8098b9"   # discard-modal secondary line
+field_label   = "#38bcff"   # Idle screen field labels (Temperature, Hostname, IPv4)
+
+# Pure Flipper inverted status bar tokens.
+bar_bg        = "#0c1c3a"   # top status bar ground
+bar_fg        = "#ebf3ff"   # status bar icons & text
+header_bg     = "#0c1c3a"   # boot menu & popup header band
+bar_bg_light  = "#14223a"   # alternate bar ground
+bar_fg_light  = "#ebf3ff"
+
+# Modal scrim.
+overlay       = "#050811"
+
+# Unified Flipper selector, soft-tab, press-invert & accent tokens.
+sel_bg        = "#122648"   # unpressed SelectorFrame body fill
+sel_edge      = "#38bcff"   # SelectorFrame 45-deg stair border & 1px drop shadow
+soft_bg       = "#0d172a"   # unpressed SoftButton open-bottom tab fill
+soft_edge     = "#2c84f5"   # unpressed SoftButton 45-deg stair border
+press_bg      = "#2c84f5"   # pressed row & SoftButton inverted fill
+press_fg      = "#ffffff"   # pressed row & SoftButton inverted ink
+accent        = "#38bcff"   # active status text, breadcrumbs, spinners & focus stroke
+status_low    = "#f84e5c"   # critical <=15% battery warning in StatusBar
+
+# Legacy aliases retained for downstream compatibility.
+kali_panel    = "#0f1626"
+kali_sel_bg   = "#122648"
+kali_tab_act  = "#2c84f5"
+kali_btn_bg   = "#0d172a"
+kali_cyan     = "#38bcff"
+kali_green    = "#26da84"
+kali_yellow   = "#fac430"
+kali_red      = "#f84e5c"
+kali_exit_bg  = "#401824"
+kali_exit_fg  = "#ffb4bc"
+badge_fg      = "#ffffff"
+
+[palette.og_flipper]
+# OG Flipper homage: iconic #FF8200 orange backlit LCD + pure #000000 pixel-art ink.
+white         = "#ff8200"
+black         = "#000000"
+divider       = "#b85800"
+disabled_bg   = "#e87400"
+disabled_fg   = "#8a4200"
+status_dim    = "#5c2800"
+card_stroke   = "#000000"
+pill          = "#e87400"
+chevron_bar   = "#000000"
+rule_light    = "#b85800"
+rule_faint    = "#d86a00"
+chip_fill     = "#e06e00"
+pick_rule     = "#b85800"
+app_bar       = "#000000"
+chevron_flash = "#5c2800"
+popup_edge    = "#000000"
+keycap_dim    = "#5c2800"
+sw_tab        = "#5c2800"
+sw_tab_deep   = "#8a4200"
+sw_bar_deep   = "#5c2800"
+dialog_body   = "#5c2800"
+field_label   = "#5c2800"
+bar_bg        = "#000000"
+bar_fg        = "#ff8200"
+header_bg     = "#000000"
+bar_bg_light  = "#e87400"
+bar_fg_light  = "#000000"
+overlay       = "#e87400"
+sel_bg        = "#ff8200"
+sel_edge      = "#000000"
+soft_bg       = "#ff8200"
+soft_edge     = "#000000"
+press_bg      = "#000000"
+press_fg      = "#ff8200"
+accent        = "#000000"
+status_low    = "#ff8200"
+kali_panel    = "#ff8200"
+kali_sel_bg   = "#ff8200"
+kali_tab_act  = "#000000"
+kali_btn_bg   = "#ff8200"
+kali_cyan     = "#000000"
+kali_green    = "#ff8200"
+kali_yellow   = "#000000"
+kali_red      = "#ff8200"
+kali_exit_bg  = "#ff8200"
+kali_exit_fg  = "#000000"
+badge_fg      = "#ff8200"
+
+[palette.flipper_mono]
+# Flipper One original monochrome paper/ink LCD palette.
+white         = "#ffffff"
+black         = "#000000"
+divider       = "#b8b8b8"
+disabled_bg   = "#eeeeee"
+disabled_fg   = "#888888"
+status_dim    = "#6d6d6d"
+card_stroke   = "#000000"
+pill          = "#e5e5e5"
+chevron_bar   = "#000000"
+rule_light    = "#cccccc"
+rule_faint    = "#e5e5e5"
+chip_fill     = "#e5e5e5"
+pick_rule     = "#cccccc"
+app_bar       = "#000000"
+chevron_flash = "#6d6d6d"
+popup_edge    = "#000000"
+keycap_dim    = "#6d6d6d"
+sw_tab        = "#6d6d6d"
+sw_tab_deep   = "#999999"
+sw_bar_deep   = "#6d6d6d"
+dialog_body   = "#6d6d6d"
+field_label   = "#6d6d6d"
+bar_bg        = "#000000"
+bar_fg        = "#ffffff"
+header_bg     = "#000000"
+bar_bg_light  = "#eeeeee"
+bar_fg_light  = "#000000"
+overlay       = "#ffffff"
+sel_bg        = "#ffffff"
+sel_edge      = "#000000"
+soft_bg       = "#ffffff"
+soft_edge     = "#000000"
+press_bg      = "#000000"
+press_fg      = "#ffffff"
+accent        = "#000000"
+status_low    = "#ffffff"
+kali_panel    = "#ffffff"
+kali_sel_bg   = "#ffffff"
+kali_tab_act  = "#000000"
+kali_btn_bg   = "#ffffff"
+kali_cyan     = "#000000"
+kali_green    = "#ffffff"
+kali_yellow   = "#000000"
+kali_red      = "#ffffff"
+kali_exit_bg  = "#ffffff"
+kali_exit_fg  = "#000000"
+badge_fg      = "#ffffff"
+
+[alpha]
+overlay = 0.78
+wash = 0.86
+
+[metric]
+margin_h            = 8
+pad_left            = 4
+scrollbar_w         = 3
+
+status_bar_h        = 13    # pure Flipper One 13px solid status bar
+status_pad_top      = 3
+
+item_h              = 12
+
+menu_line_h         = 20
+menu_line_w         = 288   # +64px for 320px panel width
+icon_pad            = 3
+icon_text_gap       = 4
+text_draw_y         = 3
+label_tag_gap       = 6
+table_left_w        = 96
+table_gap           = 6
+table_right_w       = 104
+status_pad_r        = 5
+
+toggle_spacing      = 15
+value_spacing       = 6
+
+# Ethernet interface cards (320px width).
+eth_x               = 4
+eth_y               = 28
+eth_w               = 312
+eth_h               = 22
+eth_h_connected     = 34
+eth_gap             = 4
+eth_icon_pad_l      = 6
+eth_icon_pad_t      = 4
+eth_text_gap        = 4
+eth_status_pad_r    = 10
+eth_name_draw_y     = 3
+eth_info_draw_y     = 4
+card_pill_h         = 17
+card_pill_r         = 4
+card_chevron_w      = 7
+eth_bottom_pad_b    = 5
+eth_bottom_pad_l    = 5
+eth_bottom_gap      = 2
+eth_bottom_col_gap  = 8
+
+# Generic stacked cards (320px width).
+card_x              = 4
+card_w              = 310
+card_h              = 26
+card_gap            = 2
+card_icon_x         = 9
+card_icon_y         = 6
+card_text_x         = 30
+card_name_y         = 0
+card_name_y_alone   = 5
+card_info_y         = 13
+card_right_y        = 0
+card_pad_r          = 6
+
+cards_top_pad       = 14
+cards_bar_gap       = 2
+cards_marker_w      = 5
+
+# Verbose interface dump modal.
+eth_modal_x         = 4
+eth_modal_y         = 18
+eth_modal_w         = 312
+eth_modal_h         = 132
+eth_modal_pad_x     = 6
+eth_modal_pad_y     = 6
+eth_modal_line_h    = 12
+eth_modal_divider_h = 4
+eth_modal_label_gap = 4
+eth_modal_indent    = 8
+eth_modal_metric_gap = 14
+eth_modal_icon_gap  = 2
+eth_modal_arrow_dy  = 2
+
+# Wi-Fi page & modals (320x170).
+wifi_row_h          = 13
+wifi_selector_w     = 311
+wifi_selector_h     = 15
+wifi_container_y    = 30
+wifi_text_pad_l     = 5
+wifi_text_dy        = 1
+wifi_divider_h      = 3
+wifi_modal_pad      = 4
+wifi_modal_w        = 312
+wifi_modal_pad_t    = 3
+wifi_modal_pad_b    = 4
+wifi_saved_pad_b    = -1
+wifi_modal_gutter   = 6
+wifi_modal_max_bot  = 150
+wifi_row_pitch      = 14
+wifi_inner_pad      = 3
+wifi_scrollbar_pad  = 5
+wifi_placeholder_dy = 4
+wifi_tab_h          = 16
+wifi_tab_pad        = 4
+wifi_row_pad_r      = 3
+wifi_signal_gap     = 4
+wifi_kv_h           = 12
+wifi_label_gap      = 4
+wifi_value_indent   = 14
+wifi_section_h      = 2
+wifi_pw_pad         = 3
+wifi_pw_gap         = 6
+wifi_saved_min_gap  = 20
+wifi_saved_min_h    = 24
+wifi_card_pad       = 2
+wifi_card_inset     = 4
+wifi_card_gutter    = 6
+wifi_toast_h        = 14
+wifi_toast_pad      = 7
+wifi_toast_pad_b    = 4
+
+# Dropdown settings rows (320px width).
+drop_title_x        = 6
+drop_top_pad        = 2
+drop_chip_w         = 224
+drop_chip_h         = 11
+drop_chip_pad_r     = 5
+drop_arrow_pad      = 4
+drop_chip_inset     = 4
+drop_row_h          = 13
+drop_row_gap        = 2
+drop_selector_x     = 2
+drop_selector_w     = 316
+drop_selector_h     = 15
+drop_pick_item_h    = 13
+drop_pick_gap       = 1
+drop_pick_pad       = 1
+drop_pick_text_dy   = 1
+drop_pick_sel_h     = 15
+drop_pick_sel_inset = 1
+drop_rule_pad_x     = 5
+app_bar_h           = 16
+app_bar_icon_x      = 2
+app_bar_icon_w      = 14
+app_bar_icon_dy     = 1
+app_bar_title_x     = 18
+app_bar_title_dy    = 1
+drop_slider_min_w   = 11
+menu_bar_w          = 92
+menu_bar_y          = 4
+
+# Menu & list viewport: 6 rows * 20px + 5 dividers = 125px.
+# Main menu: y=24..149; Submenu: y=28..153; Softkey bar starts at y=154 (170 - 16).
+list_container_x    = 5
+list_container_y    = 24
+list_container_w    = 288
+list_viewport_h     = 125
+
+submenu_container_y = 28
+breadcrumb_x        = 4
+breadcrumb_y        = 16
+detail_container_y  = 16
+
+selector_x          = 4
+selector_w_scroll   = 308
+selector_w_full     = 311
+selector_h          = 22
+selector_y_offset   = -1
+
+scrollbar_x         = 317
+scrollbar_y         = 16
+scrollbar_h         = 136
+scrollbar_thumb_pad = 1
+scrollbar_thumb_min = 5
+
+# Blocking modal dialog (centred on 320x170).
+modal_x             = 28
+modal_y             = 46
+modal_w             = 264
+modal_h             = 64
+modal_line_h        = 12
+choice_pad          = 4
+choice_inset        = 4
+choice_text_x       = 4
+choice_title_gap    = 5
+choice_title_dy     = -3
+choice_hint_gap     = 2
+choice_col_gap      = 8
+
+sw_bar_h            = 14
+sw_bar_h_focused    = 16
+
+# Boot / OS Profiles menu: 7 rows * 18px from y=22 = 148 <= 154.
+boot_header_h       = 18
+boot_container_y    = 22
+boot_row_h          = 16
+boot_row_gap        = 2
+spin_w              = 22
+spin_h              = 20
+spin_frames         = 8
+boot_spin_lift      = 8
+
+# On-screen + physical keyboard text-input screen (aligned to keys 4, 5, 7, 8).
+kb_container_w      = 260
+kb_container_h      = 77
+kb_container_y      = 84
+kb_inner_y          = 5
+kb_btn_w            = 15
+kb_btn_h            = 16
+kb_wide_w           = 35
+kb_peek_visible     = 2
+kb_peek_fold_lift   = 1
+kb_peek_falloff     = 2
+kb_glyph_y          = 2
+kb_title_y          = 26
+kb_input_pad        = 6
+kb_input_min_w      = 160
+kb_input_max_w      = 296
+kb_input_h          = 14
+kb_input_gap        = 14
+kb_warning_gap      = 3
+kb_warning_line_h   = 11
+kb_warning_lift     = 8
+kb_text_ink_h       = 11
+# Tab 1 (123) at x=78..130 (center 104 = key '5'), Tab 2 (Bksp) at x=190..242 (center 216 = key '7')!
+kb_tab_w            = 52
+kb_tab_h            = 15
+kb_tab_inset        = 78
+kb_tab_gap_b        = 1
+kb_space_rule_w     = 9
+kb_space_stub_h     = 2
+
+popup_hdr_h         = 38
+popup_hdr_bare_h    = 22
+popup_line_h        = 11
+popup_row_h         = 16
+popup_pad_h         = 8
+popup_size_y        = 24
+popup_icon_y        = 6
+popup_max_w         = 312
+popup_body_pad      = 4
+popup_gutter        = 6
+popup_scrollbar_pad = 5
+size_gap            = 4
+boot_selector_h     = 16
+boot_icon_box_w     = 12
+boot_text_gap       = 2
+boot_title_y        = 1
+boot_auto_y         = 4
+boot_sd_w           = 14
+boot_sd_h           = 14
+boot_booting_spin_y = 44
+boot_booting_text_y = 84
+boot_booting_name_y = 98
+
+text_ink_top        = 3
+text_ink_h          = 9
+gauge_h             = 7
+gauge_col           = 34
+gauge_label_gap     = 4
+
+# CardputerZero physical softkey alignment (`cz_ui.h` `CZ_SOFTKEY_X = {48, 104, 160, 216, 272}`):
+#   Slot i starts at `soft_bar_x + i * (button_w + button_gap)` = `22 + i * 56`,
+#   placing button centers at `22 + 26 + i * 56` = `48, 104, 160, 216, 272`!
+soft_bar_x          = 22
+button_h            = 14    # pure Flipper One 14px open-bottom chamfered tab
+button_w            = 52
+button_gap          = 4
+button_corner       = 4
+
+popup_item_h        = 13
+popup_pad           = 3
+
+key_w               = 15
+key_h               = 16
+key_wide_w          = 35
+key_gap             = 0
+keyboard_w          = 260
+keyboard_h          = 77
+
+msgbox_pad          = 6
+msgbox_line_h       = 12
+msgbox_right_pad    = 12
+
+tab_h               = 17
+
+# Idle screen readout positions centred across 320px (+32px from 256px layout).
+battery_icon_x      = 68
+cpu_icon_x          = 114
+temp_label_x        = 89
+power_label_x       = 195
+readout_gap         = 3
+power_icon_x        = 194
+
+idle_line_h         = 12
+idle_card_gap       = 2
+
+qr_icon             = 34
+
+[count]
+list_visible_rows        = 6
+log_visible_lines        = 9
+boot_visible_rows        = 7
+detail_visible_rows      = 9
+detail_visible_rows_bare = 10
+msgbox_max_chars         = 34
+wifi_min_rows            = 2
+
+[radius]
+small = 2
+popup = 5
+menu  = 3
+box   = 4
+
+[timing]
+press_flash_ms   = 12
+toast_ms         = 1600
+notice_ms        = 1000
+chevron_flash_ms = 120
+press_commit_ms  = 150
+icon_frame_ms    = 200
+spin_frame_ms    = 100
+cursor_blink_ms  = 500
+kb_peek_wave_ms  = 160
+kb_caps_hold_ms  = 1000
+kb_double_ms     = 300
+
+[rule]
+overflow = "wrap"
+disabled = "outline-only"
+
+[font.title]
+name = "HaxrCorp4090FlipCTL"
+rows = 13
+cols = 16
+use  = "status bar, titles, dialogs, message box, most scenes"
+
+[font.row]
+name = "Busy9pxFlipCTL"
+rows = 16
+cols = 16
+use  = "MenuLine label and status in DEFAULT state"
+
+[font.row_active]
+name = "Born2bSportyV2FlipCTL"
+rows = 18
+cols = 16
+use  = "MenuLine label and status in SELECTED and PRESSED states"

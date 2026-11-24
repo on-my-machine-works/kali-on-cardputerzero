@@ -1,0 +1,860 @@
+//! Live system status for the status bar.
+//!
+//! Read straight from sysfs and procfs. The prototype gets these values by
+//! polling its Node server's `/api/power`, `/api/wifi` and `/api/ethernet`, which
+//! shell out to `nmcli` and friends; a native flipctl has no reason to spawn a
+//! process to learn its own battery level.
+
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+/// What the ethernet indicator should show.
+///
+/// The prototype distinguishes a real link from the USB gadget so the bar can
+/// signal "back-channel only" rather than implying a network.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum Ethernet {
+    #[default]
+    Down,
+    Real,
+    Usb,
+}
+
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub struct Status {
+    /// Battery charge 0..=100, or -1 while unknown. The bar shows `--%` for -1,
+    /// which is what the prototype does before its first poll answers.
+    pub battery: i32,
+    pub charging: bool,
+    pub wifi_connected: bool,
+    /// Signal quality 0..=100.
+    pub wifi_quality: i32,
+    pub ethernet: Ethernet,
+    /// No modem present means the whole signal-bars-and-tech block is hidden,
+    /// rather than drawn empty.
+    pub modem_available: bool,
+    pub access_tech: &'static str,
+    pub modem_quality: i32,
+}
+
+impl Default for Status {
+    fn default() -> Self {
+        Self {
+            battery: -1,
+            charging: false,
+            wifi_connected: false,
+            wifi_quality: 0,
+            ethernet: Ethernet::Down,
+            modem_available: false,
+            access_tech: "--",
+            modem_quality: 0,
+        }
+    }
+}
+
+/// Polls sysfs on an interval and caches the result.
+pub struct StatusSource {
+    interval: Duration,
+    last: Instant,
+    current: Status,
+}
+
+impl StatusSource {
+    pub fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            // Force a read on the first poll rather than waiting out one interval.
+            last: Instant::now() - interval,
+            current: Status::default(),
+        }
+    }
+
+    /// Returns `Some` only when something changed, so a caller can avoid marking
+    /// the screen dirty for an unchanged battery reading.
+    pub fn poll(&mut self) -> Option<Status> {
+        if self.last.elapsed() < self.interval {
+            return None;
+        }
+        self.last = Instant::now();
+
+        let fresh = read_status();
+        if fresh == self.current {
+            return None;
+        }
+        self.current = fresh;
+        Some(fresh)
+    }
+
+    pub fn current(&self) -> Status {
+        self.current
+    }
+}
+
+fn read(path: impl AsRef<Path>) -> Option<String> {
+    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+}
+
+fn read_status() -> Status {
+    let (battery, charging) = read_battery();
+    let (wifi_connected, wifi_quality) = read_wifi();
+    let modem = modem::latest();
+    Status {
+        battery,
+        charging,
+        wifi_connected,
+        wifi_quality,
+        ethernet: read_ethernet(),
+        modem_available: modem_present(),
+        access_tech: modem.tech,
+        modem_quality: modem.quality,
+    }
+}
+
+/// Charge level and whether it is charging.
+///
+/// `status` is the authority on charging: this device reports `Not charging` when
+/// a charger is attached but the pack is full enough to stop, which is not the
+/// same as `Charging`.
+fn read_battery() -> (i32, bool) {
+    let Some(pack) = crate::battery::latest() else {
+        return (-1, false);
+    };
+    let level = pack
+        .get("capacity")
+        .and_then(|s| s.parse::<i32>().ok())
+        .map(|v| v.clamp(0, 100))
+        .unwrap_or(-1);
+    let charging = matches!(pack.get("status").map(String::as_str), Some("Charging" | "Full"));
+    (level, charging)
+}
+
+/// A wireless interface counts as connected only with a carrier, not merely up:
+/// an associated-but-not-linked radio should not claim a connection.
+fn read_wifi() -> (bool, i32) {
+    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+        return (false, 0);
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.join("wireless").is_dir() {
+            continue;
+        }
+        let up = read(dir.join("carrier")).as_deref() == Some("1")
+            && read(dir.join("operstate")).as_deref() == Some("up");
+        if !up {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        return (true, wifi_quality(&name));
+    }
+    (false, 0)
+}
+
+/// Link quality, from `/proc/net/wireless` where there is one and from the kernel
+/// itself where there is not.
+///
+/// The file is the cheap source and the one to prefer: a read of a few hundred
+/// bytes, no socket, and it works for any driver. It comes from the
+/// wireless-extensions compat layer, which this board's kernel does not build
+/// (`CONFIG_CFG80211_WEXT` is off), so the file is absent and the answer used to
+/// be 0 -- which the status bar drew as an empty signal icon on a full-strength
+/// link. Turning WEXT on later is a one-line kernel change and this path picks it
+/// up with nothing to unpick, since the file is tried first.
+///
+/// Most drivers report the file's value out of 70, which is what wireless-tools
+/// assumes, so it is scaled on that basis. The icon has five buckets, so a driver
+/// with a different ceiling shifts the picture by at most one step.
+fn wifi_quality(iface: &str) -> i32 {
+    let Some(text) = read("/proc/net/wireless") else {
+        return crate::nl80211::signal_percent(iface).unwrap_or(0);
+    };
+    for line in text.lines().skip(2) {
+        let Some((name, rest)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim() != iface {
+            continue;
+        }
+        if let Some(link) = rest.split_whitespace().nth(1) {
+            let link: f32 = link.trim_end_matches('.').parse().unwrap_or(0.0);
+            return ((link / 70.0) * 100.0).clamp(0.0, 100.0) as i32;
+        }
+    }
+    // The file exists but says nothing about this interface, which is the same
+    // gap as its not being there at all.
+    crate::nl80211::signal_percent(iface).unwrap_or(0)
+}
+
+/// A real link wins over the USB gadget: if both are up the bar should say there
+/// is a network, not just a back channel.
+fn read_ethernet() -> Ethernet {
+    let mut usb = false;
+    // Hardware only, the same test the Ethernet page and the idle screen use: a docker
+    // bridge, a VPN tun or a wireguard interface all carry, and none of them is a cable
+    // in a socket.
+    for name in crate::sysinfo::hardware_ifaces() {
+        let dir = std::path::Path::new("/sys/class/net").join(&name);
+        if dir.join("wireless").is_dir() {
+            continue;
+        }
+        if read(dir.join("carrier")).as_deref() != Some("1") {
+            continue;
+        }
+        // A gadget rather than a port: this machine is the USB device, so the link
+        // goes to whatever it is plugged into. Asked of the interface rather than
+        // guessed from its name, which read a PC's USB dongle as a gadget.
+        if is_gadget(&name) {
+            usb = true;
+        } else {
+            return Ethernet::Real;
+        }
+    }
+    if usb {
+        Ethernet::Usb
+    } else {
+        Ethernet::Down
+    }
+}
+
+/// Whether `name` is a USB gadget interface: this machine acting as a USB device.
+///
+/// The gadget's netdev hangs off the UDC's gadget device, so the resolved
+/// `/sys/class/net/<name>/device` path passes through a gadget node. A USB ethernet
+/// adapter plugged into a host resolves under a usb device instead, which is why the
+/// name is no help: both are called `usb0` about half the time.
+fn is_gadget(name: &str) -> bool {
+    std::fs::canonicalize(format!("/sys/class/net/{name}/device"))
+        .map(|path| path.to_string_lossy().contains("/gadget"))
+        .unwrap_or(false)
+}
+
+/// Whether a cellular modem exists at all.
+///
+/// Presence only. The tech label and the bars need the modem to be registered on a
+/// network, which is ModemManager's to answer and not sysfs's, so they are left at
+/// `--` and zero here rather than guessed at.
+///
+/// Asked of the driver rather than of the name. The kernel calls the interface
+/// `wwan0` and udev renames it for where the device sits, so a Quectel on USB ends up
+/// as `wwu1u4i3`: matching names meant keeping a list of prefixes and losing a real
+/// modem to a spelling nobody had thought of. `DEVTYPE` is the driver's own word for
+/// what the interface is, it is there before the rename and unchanged after it, and
+/// wireless says `wlan` while plain ethernet says nothing at all.
+///
+/// `ppp` stays a name test: a dial-up link is a modem too, and it has no device in
+/// sysfs to ask.
+fn modem_present() -> bool {
+    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        if e.file_name().to_string_lossy().starts_with("ppp") {
+            return true;
+        }
+        std::fs::read_to_string(e.path().join("uevent"))
+            .is_ok_and(|said| said.lines().any(|line| line.trim() == "DEVTYPE=wwan"))
+    })
+}
+
+/// One network interface worth showing on the idle screen, with every address it has.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct Link {
+    pub name: String,
+    pub v4: Vec<String>,
+    pub v6: Vec<String>,
+}
+
+/// One line of the idle screen's address list: an interface's first line carries its
+/// name, and every line after it is one more address.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct IdleLine {
+    /// The interface, on the first line of its card; empty on the lines below.
+    pub name: String,
+    pub label: &'static str,
+    pub value: String,
+    /// Top of the line, from the top of the first card.
+    pub y: i32,
+}
+
+/// The idle screen's address list, laid out: one line per address, cards stacked with
+/// a gap between them. Here rather than in the component because a card is as tall as
+/// its interface has addresses, and Slint cannot carry a running total down a model.
+pub fn idle_lines(links: &[Link]) -> Vec<IdleLine> {
+    use crate::theme::metric::{IDLE_CARD_GAP, IDLE_LINE_H};
+    let mut out = Vec::new();
+    let mut y = 0;
+    for link in links {
+        let addrs =
+            link.v4.iter().map(|a| ("IPv4:", a)).chain(link.v6.iter().map(|a| ("IPv6:", a)));
+        for (i, (label, value)) in addrs.enumerate() {
+            out.push(IdleLine {
+                name: if i == 0 { link.name.clone() } else { String::new() },
+                label,
+                value: value.clone(),
+                y,
+            });
+            y += IDLE_LINE_H;
+        }
+        y += IDLE_CARD_GAP;
+    }
+    out
+}
+
+/// The furthest the list can scroll, in lines: the first line from which everything to
+/// the end fits in `room` pixels.
+pub fn idle_scroll_max(lines: &[IdleLine], room: i32) -> usize {
+    let Some(last) = lines.last() else { return 0 };
+    let bottom = last.y + crate::theme::metric::IDLE_LINE_H;
+    lines.iter().position(|line| bottom - line.y <= room).unwrap_or(lines.len() - 1)
+}
+
+/// Everything the idle screen shows beyond the status bar.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct Idle {
+    /// Tenths of a degree C, or None while unknown.
+    pub battery_temp: Option<i32>,
+    pub cpu_temp: Option<i32>,
+    /// Milliwatts. Positive is flowing into the battery.
+    pub power_mw: Option<i32>,
+    pub hostname: String,
+    /// Booted btrfs subvolume with its leading `@` dropped, as the prototype
+    /// displays it.
+    pub profile: String,
+    pub links: Vec<Link>,
+}
+
+impl Idle {
+    /// Everything at once, for a first paint.
+    pub fn read_all() -> Self {
+        let mut idle = Self::default();
+        idle.read_identity();
+        idle.refresh_sensors();
+        idle.power_mw = charger_power_mw();
+        idle.refresh_links();
+        idle
+    }
+
+    /// The two temperatures on the idle screen: the pack's, as the gauge last
+    /// announced it, and the SoC package's. Power is not here: it is a charger
+    /// read, which the loop makes only while the idle screen is up.
+    ///
+    /// Reports a change only when a value actually moved, so the screen redraws
+    /// when a temperature does rather than on the clock.
+    pub fn refresh_sensors(&mut self) -> bool {
+        let before = (self.battery_temp, self.cpu_temp);
+        self.battery_temp = battery_temp();
+        self.cpu_temp = cpu_temp();
+        before != (self.battery_temp, self.cpu_temp)
+    }
+
+    /// Interface addresses, every few seconds: a cable or a DHCP renewal changes
+    /// them and the panel showing a stale address is worse than the reading is
+    /// expensive. Measured at a few hundred microseconds on the device, which is
+    /// under a tenth of a percent of a core at this cadence, and it repaints only
+    /// when the set actually differs.
+    ///
+    /// One /sys/class/net walk, one getifaddrs, one /proc/net/if_inet6 parse and one
+    /// rtnetlink link dump for the dummies. The kernel could say all of this over
+    /// rtnetlink instead, which `route_watch.rs` already has the socket for.
+    pub fn refresh_links(&mut self) -> bool {
+        let fresh = links();
+        let changed = fresh != self.links;
+        self.links = fresh;
+        changed
+    }
+
+    /// Hostname and booted profile, read once.
+    ///
+    /// The profile is the subvolume `/` is mounted from, and it cannot change under a
+    /// running flipctl: entering another profile restarts userspace even when it does not
+    /// restart the kernel, so this process is replaced either way. The hostname can change
+    /// in principle, but not without something restarting anyway, and polling either on a
+    /// timer is pure waste.
+    pub fn read_identity(&mut self) {
+        self.hostname = read("/proc/sys/kernel/hostname").unwrap_or_default();
+        self.profile = booted_profile();
+    }
+}
+
+/// Millidegrees to tenths, rounded rather than truncated.
+///
+/// The prototype formats with `toFixed(1)`, so 60999 millidegrees reads 61.0.
+/// Integer division gives 60.9, which is a visible disagreement with the device
+/// for a reading that changes constantly.
+fn tenths_from_milli(milli: i32) -> i32 {
+    let sign = if milli < 0 { -1 } else { 1 };
+    sign * ((milli.abs() + 50) / 100)
+}
+
+/// Temperature of the thermal zone whose type is `name`, in tenths.
+fn zone_temp(name: &str) -> Option<i32> {
+    let entries = std::fs::read_dir("/sys/class/thermal").ok()?;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if read(dir.join("type")).as_deref() != Some(name) {
+            continue;
+        }
+        return Some(tenths_from_milli(read(dir.join("temp"))?.parse().ok()?));
+    }
+    None
+}
+
+/// The pack's temperature, in tenths of a degree, as the gauge last announced it.
+/// Not through the thermal zone the gauge registers, as the prototype does: reading
+/// that asks the chip.
+fn battery_temp() -> Option<i32> {
+    crate::battery::num("temp").map(|t| t as i32)
+}
+
+/// SoC package temperature, in tenths of a degree.
+///
+/// `package-thermal` is the one to report: this board also exposes bigcore,
+/// littlecore, gpu, npu and ddr zones, plus a `bq28x610-0` zone that duplicates
+/// the battery.
+fn cpu_temp() -> Option<i32> {
+    zone_temp("cpu-thermal")
+        .or_else(|| zone_temp("package-thermal"))
+        .or_else(|| {
+            let entries = std::fs::read_dir("/sys/class/thermal").ok()?;
+            for entry in entries.flatten() {
+                let dir = entry.path();
+                if let Some(kind) = read(dir.join("type")) {
+                    if kind.contains("cpu") || kind.contains("package") || kind.contains("bcm2835") {
+                        return Some(tenths_from_milli(read(dir.join("temp"))?.parse().ok()?));
+                    }
+                }
+            }
+            Some(tenths_from_milli(read("/sys/class/thermal/thermal_zone0/temp")?.parse().ok()?))
+        })
+}
+
+/// Power into or out of the battery, in milliwatts, from CardputerZero's BQ27220
+/// fuel gauge (or Flipper One's bq257xx charger).
+pub fn charger_power_mw() -> Option<i32> {
+    let num = |field: &str| read(format!("{CHARGER}/{field}"))?.parse::<i64>().ok();
+    if let (Some(i), Some(v)) = (num("current_now"), num("voltage_now")) {
+        return Some(((i * v) / 1_000_000_000) as i32);
+    }
+    if let (Some(i), Some(v)) = (crate::battery::num("current_now"), crate::battery::num("voltage_now")) {
+        return Some(((i * v) / 1_000_000_000) as i32);
+    }
+    crate::battery::num("power_avg").map(|uw| (uw / 1_000) as i32)
+}
+
+/// The bq257xx driver's fixed supply name.
+const CHARGER: &str = "/sys/class/power_supply/bq257xx-charger";
+
+/// The running profile: the subvolume `/` is mounted from, named the way the boot menu
+/// names it.
+///
+/// From the mount, not from `rootflags=subvol=` on the kernel command line. A pivot
+/// replaces the root without restarting the kernel -- systemd's soft-reboot, which is how
+/// `boot-profile` enters a profile whose kernel and device tree are already running -- so
+/// the command line still names the profile we came *from*, and the idle screen said
+/// Desktop while the clone was running.
+///
+/// Field 4 of a `/proc/self/mountinfo` line is the directory within the filesystem that
+/// this mount was made from, which for a btrfs subvolume root is `/@<profile>`. A plain
+/// file read, so this stays out of the business of shelling out to `findmnt`.
+///
+/// Through `boot::display_name` rather than by trimming the `@` here: a profile has one
+/// name on this machine, and the idle screen showing `Desktop__Desktop-clone__` where
+/// the menu shows `[Desktop clone]` makes the same profile look like two.
+pub fn booted_profile() -> String {
+    read("/proc/self/mountinfo")
+        .unwrap_or_default()
+        .lines()
+        .find_map(|line| {
+            let mut field = line.split_whitespace();
+            let root = field.nth(3)?;
+            (field.next()? == "/").then_some(root)
+        })
+        .map(|root| crate::boot::display_name(root.trim_start_matches('/')))
+        .unwrap_or_default()
+}
+
+/// Every interface that has an address, each with all of them.
+///
+/// Everything but loopback and dummies: a bridge, a VPN tunnel or a container's veth
+/// is an address the machine answers on, and this screen exists to show those. The
+/// physical ports come first, so the cards a person is looking for lead the list.
+///
+/// IPv6 comes from `/proc/net/if_inet6`, which is plain text. There is no
+/// equivalent for IPv4, so that side uses `getifaddrs`; the alternative was
+/// shelling out to `ip`, which a UI process has no business doing.
+fn links() -> Vec<Link> {
+    let mut v4 = ipv4_by_interface();
+    let mut v6 = ipv6_by_interface();
+    let dummies = dummies();
+    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+        return Vec::new();
+    };
+    let mut names: Vec<(bool, String)> = entries
+        .flatten()
+        .filter(|e| read(e.path().join("type")).as_deref() != Some(ARPHRD_LOOPBACK))
+        .map(|e| (!e.path().join("device").exists(), e.file_name().to_string_lossy().to_string()))
+        .filter(|(_, name)| !dummies.contains(name))
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .filter_map(|(_, name)| {
+            let link_v4 = v4.remove(&name).unwrap_or_default();
+            let link_v6 = v6.remove(&name).unwrap_or_default();
+            if link_v4.is_empty() && link_v6.is_empty() {
+                return None;
+            }
+            // Labelled from the port's own name, by the same function the Ethernet
+            // page uses, so the two screens agree about which port is which: end0 is
+            // ETH0 on both and the gadget is USB ETH on both.
+            //
+            // Wireless is the exception, because its name carries nothing a person can
+            // use: wlxb06b11673af2 is one card, and what matters is that it is the wifi.
+            let label = if Path::new("/sys/class/net").join(&name).join("wireless").is_dir() {
+                "WIFI".to_string()
+            } else {
+                crate::sysinfo::iface_display_name(&name)
+            };
+            Some(Link { name: label, v4: link_v4, v6: link_v6 })
+        })
+        .collect()
+}
+
+/// `/sys/class/net/<if>/type` for loopback, `ARPHRD_LOOPBACK`.
+const ARPHRD_LOOPBACK: &str = "772";
+
+/// The interfaces whose link kind is `dummy`.
+///
+/// sysfs has no word for what kind of virtual interface something is, so this asks
+/// rtnetlink for every link and reads `IFLA_LINKINFO`. One dump, answered at once;
+/// the timeout is only there so a kernel that never answers cannot hold the render
+/// loop this runs on.
+fn dummies() -> std::collections::HashSet<String> {
+    use crate::netlink::{self, each_attr, each_message, Socket, NLM_F_DUMP};
+    const RTM_NEWLINK: u16 = 16;
+    const RTM_GETLINK: u16 = 18;
+    const IFINFOMSG: usize = 16;
+    const IFLA_IFNAME: u16 = 3;
+    const IFLA_LINKINFO: u16 = 18;
+    const IFLA_INFO_KIND: u16 = 1;
+
+    let mut out = std::collections::HashSet::new();
+    let Ok(socket) = Socket::open(netlink::ROUTE) else { return out };
+    if socket.set_timeout(Duration::from_millis(100)).is_err()
+        || socket.send(&netlink::message(RTM_GETLINK, NLM_F_DUMP, &[0; IFINFOMSG], &[])).is_err()
+    {
+        return out;
+    }
+    let mut buf = vec![0u8; 32 * 1024];
+    // A dump can take more than one read, and `each_message` stops at DONE without
+    // saying so, so the end is looked for here.
+    while let Ok(got @ 1..) = socket.recv(&mut buf) {
+        let mut done = false;
+        let ok = each_message(&buf[..got], |kind, body| {
+            if kind != RTM_NEWLINK || body.len() < IFINFOMSG {
+                return;
+            }
+            let (mut name, mut dummy) = (None, false);
+            each_attr(&body[IFINFOMSG..], |attr, value| match attr {
+                IFLA_IFNAME => {
+                    name = Some(String::from_utf8_lossy(value).trim_end_matches('\0').to_string())
+                }
+                IFLA_LINKINFO => each_attr(value, |info, kind| {
+                    dummy |= info == IFLA_INFO_KIND
+                        && kind.strip_suffix(b"\0").unwrap_or(kind) == b"dummy";
+                }),
+                _ => {}
+            });
+            if let Some(name) = name.filter(|_| dummy) {
+                out.insert(name);
+            }
+        });
+        let mut at = 0;
+        while at + netlink::NLMSG_HDR <= got {
+            let len = u32::from_ne_bytes(buf[at..at + 4].try_into().expect("4 bytes")) as usize;
+            done |= u16::from_ne_bytes([buf[at + 4], buf[at + 5]]) == netlink::NLMSG_DONE;
+            if len < netlink::NLMSG_HDR {
+                break;
+            }
+            at += netlink::align4(len);
+        }
+        if done || !ok {
+            break;
+        }
+    }
+    out
+}
+
+/// Every IPv6 address per interface, from procfs. The address arrives as 32 hex
+/// digits with no separators.
+///
+/// Sorted, because procfs promises no order and a list that reshuffled itself between
+/// reads would flicker at the three-second cadence. Link-local last, so the address
+/// worth reading leads.
+fn ipv6_by_interface() -> std::collections::HashMap<String, Vec<String>> {
+    let mut map: std::collections::HashMap<String, Vec<String>> = Default::default();
+    for (iface, addr) in ipv6_list() {
+        map.entry(iface).or_default().push(addr);
+    }
+    for addrs in map.values_mut() {
+        addrs.sort_by_key(|a| (a.starts_with("fe80:"), a.clone()));
+    }
+    map
+}
+
+/// Every IPv6 address but loopback's, as (interface, address).
+///
+/// Written out in shortest form by `sysinfo::format_ipv6`, which is the same
+/// RFC 5952 collapse this used to carry its own copy of.
+fn ipv6_list() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Some(text) = read("/proc/net/if_inet6") else {
+        return out;
+    };
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(hex) = fields.next() else { continue };
+        let Some(iface) = fields.nth(4) else { continue };
+        if iface == "lo" || hex.len() != 32 {
+            continue;
+        }
+        let mut groups = [0u16; 8];
+        for (i, g) in groups.iter_mut().enumerate() {
+            *g = u16::from_str_radix(&hex[i * 4..i * 4 + 4], 16).unwrap_or(0);
+        }
+        out.push((iface.to_string(), crate::sysinfo::format_ipv6(&groups)));
+    }
+    out
+}
+
+/// Every IPv6 address on one interface.
+pub fn ipv6_all(want: &str) -> Vec<String> {
+    ipv6_list().into_iter().filter(|(iface, _)| iface == want).map(|(_, addr)| addr).collect()
+}
+
+/// Every IPv4 address on one interface, via `getifaddrs`.
+pub fn ipv4_all(want: &str) -> Vec<String> {
+    ipv4_by_interface().remove(want).unwrap_or_default()
+}
+
+/// Every IPv4 address on the machine, by interface, from one `getifaddrs` walk.
+fn ipv4_by_interface() -> std::collections::HashMap<String, Vec<String>> {
+    use std::ffi::CStr;
+
+    let mut found: std::collections::HashMap<String, Vec<String>> = Default::default();
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs allocates the list and we free it below on every path.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return found;
+    }
+    let mut cur = head;
+    while !cur.is_null() {
+        // SAFETY: cur is non-null and getifaddrs guarantees the field layout.
+        let entry = unsafe { &*cur };
+        if !entry.ifa_name.is_null() && !entry.ifa_addr.is_null() {
+            // SAFETY: ifa_name is a NUL-terminated C string.
+            let name = unsafe { CStr::from_ptr(entry.ifa_name) }.to_string_lossy();
+            // SAFETY: sa_family is the first field of every sockaddr variant.
+            let family = unsafe { (*entry.ifa_addr).sa_family };
+            if i32::from(family) == libc::AF_INET {
+                // SAFETY: family says this is a sockaddr_in.
+                let sin = unsafe { &*(entry.ifa_addr as *const libc::sockaddr_in) };
+                // s_addr already holds the address in network order, so read the
+                // bytes as they sit in memory. to_be_bytes() would reverse them on
+                // a little-endian host and turn 192.168.1.241 into 241.1.168.192.
+                let octets = sin.sin_addr.s_addr.to_ne_bytes();
+                found
+                    .entry(name.to_string())
+                    .or_default()
+                    .push(format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3]));
+            }
+        }
+        cur = entry.ifa_next;
+    }
+    // SAFETY: head came from getifaddrs and is freed exactly once.
+    unsafe { libc::freeifaddrs(head) };
+    found
+}
+
+/// The modem's own numbers, which sysfs does not carry.
+///
+/// Signal quality and the access technology belong to the modem, and on this system
+/// ModemManager is what has them: they arrive over D-Bus, or through `mmcli`, and
+/// neither belongs on the render loop that reads the rest of the bar. So a thread
+/// asks every few seconds and leaves the answer here, and the status read takes it
+/// with a lock and no syscall at all.
+///
+/// The thread starts on the first reading rather than at startup, so a build that
+/// never draws a status bar never spawns it.
+mod modem {
+    use std::sync::{Mutex, Once, OnceLock};
+    use std::time::Duration;
+
+    /// How often the modem is asked.
+    ///
+    /// Not as often as the bar is drawn, and no faster than this is worth spending.
+    /// Signal quality is not in sysfs and cannot be: it lives in the modem's
+    /// firmware, reachable only over its control channel, and the kernel's qmi_wwan
+    /// is a pipe for the data path that never decodes a QMI message. So each reading
+    /// is ModemManager, through two processes, while the bar moves in fifths and
+    /// ModemManager refreshes the number on a schedule of its own.
+    const EVERY: Duration = Duration::from_secs(5);
+
+    #[derive(Copy, Clone, PartialEq, Debug)]
+    pub struct Reading {
+        /// One of the labels the bar draws, or `--` when the modem is not registered
+        /// and there is no technology to name.
+        pub tech: &'static str,
+        /// 0..=100, as ModemManager reports it.
+        pub quality: i32,
+    }
+
+    impl Default for Reading {
+        fn default() -> Self {
+            Self { tech: "--", quality: 0 }
+        }
+    }
+
+    fn cell() -> &'static Mutex<Reading> {
+        static LATEST: OnceLock<Mutex<Reading>> = OnceLock::new();
+        LATEST.get_or_init(|| Mutex::new(Reading::default()))
+    }
+
+    pub fn latest() -> Reading {
+        static STARTED: Once = Once::new();
+        STARTED.call_once(|| {
+            std::thread::spawn(watch);
+        });
+        cell().lock().map(|held| *held).unwrap_or_default()
+    }
+
+    fn watch() {
+        // The index is kept between readings. It only moves when the modem
+        // re-enumerates, which is a SIM change or a replug, so asking for it every
+        // time was a process spent to be told the same number. Losing it is how a
+        // re-enumeration is noticed: the next reading looks it up again.
+        let mut index: Option<String> = None;
+        loop {
+            if index.is_none() {
+                index = find_index();
+            }
+            let fresh = index.as_deref().and_then(read_from).unwrap_or_else(|| {
+                index = None;
+                Reading::default()
+            });
+            if let Ok(mut held) = cell().lock() {
+                *held = fresh;
+            }
+            std::thread::sleep(EVERY);
+        }
+    }
+
+    /// One `key : value` line's value, from mmcli's machine-readable output.
+    fn value<'a>(out: &'a str, key: &str) -> Option<&'a str> {
+        out.lines().find_map(|line| {
+            let (name, said) = line.split_once(':')?;
+            (name.trim() == key).then(|| said.trim())
+        })
+    }
+
+    fn mmcli(args: &[&str]) -> Option<String> {
+        let out = std::process::Command::new("mmcli").args(args).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// Which modem to ask for, as mmcli numbers them.
+    fn find_index() -> Option<String> {
+        let list = mmcli(&["-L", "--output-keyvalue"])?;
+        let path = value(&list, "modem-list.value[1]")?;
+        path.rsplit('/').next().map(str::to_string)
+    }
+
+    /// One reading, or `None` when that modem is no longer there to answer.
+    fn read_from(index: &str) -> Option<Reading> {
+        let out = mmcli(&["-m", index, "--output-keyvalue"])?;
+        let quality = value(&out, "modem.generic.signal-quality.value")
+            .and_then(|q| q.parse::<i32>().ok())
+            .unwrap_or(0)
+            .clamp(0, 100);
+        Some(Reading { tech: label(value(&out, "modem.generic.access-technologies")), quality })
+    }
+
+    /// The bar has room for a word, not for a list. ModemManager names every
+    /// technology the modem is using at once, newest first, so the first one it
+    /// recognises is the one worth showing.
+    fn label(said: Option<&str>) -> &'static str {
+        let Some(said) = said else {
+            return "--";
+        };
+        for part in said.split(',').map(str::trim) {
+            let named = match part {
+                "5gnr" => "5G",
+                "lte" => "LTE",
+                "umts" | "hspa" | "hspa-plus" | "hsupa" | "hsdpa" => "3G",
+                "gsm" | "gprs" | "edge" | "gsm-compact" => "2G",
+                _ => continue,
+            };
+            return named;
+        }
+        "--"
+    }
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+    use crate::theme::metric::{IDLE_CARD_GAP, IDLE_LINE_H};
+
+    fn link(name: &str, v4: &[&str], v6: &[&str]) -> Link {
+        Link {
+            name: name.into(),
+            v4: v4.iter().map(|a| a.to_string()).collect(),
+            v6: v6.iter().map(|a| a.to_string()).collect(),
+        }
+    }
+
+    /// Every address is a line, the name is on a card's first one only, and IPv4
+    /// comes before IPv6. An interface with only IPv6 still gets a card.
+    #[test]
+    fn every_address_is_a_line() {
+        let lines = idle_lines(&[
+            link("ETH0", &["192.168.1.2", "10.0.0.2"], &["fe80::1"]),
+            link("WG0", &[], &["fd00::2"]),
+        ]);
+        let shown: Vec<_> =
+            lines.iter().map(|l| (l.name.as_str(), l.label, l.value.as_str(), l.y)).collect();
+        let second = 3 * IDLE_LINE_H + IDLE_CARD_GAP;
+        assert_eq!(
+            shown,
+            [
+                ("ETH0", "IPv4:", "192.168.1.2", 0),
+                ("", "IPv4:", "10.0.0.2", IDLE_LINE_H),
+                ("", "IPv6:", "fe80::1", 2 * IDLE_LINE_H),
+                ("WG0", "IPv6:", "fd00::2", second),
+            ]
+        );
+    }
+
+    /// Two two-address cards are the old 26px pitch, so a machine with one address of
+    /// each kind per port looks as it did.
+    #[test]
+    fn a_two_line_card_keeps_the_old_pitch() {
+        let lines = idle_lines(&[link("ETH0", &["a"], &["b"]), link("ETH1", &["c"], &["d"])]);
+        assert_eq!(lines[2].y, 26);
+    }
+
+    /// The list stops scrolling once its last line is on screen, and a list that fits
+    /// does not scroll at all.
+    #[test]
+    fn the_list_scrolls_only_as_far_as_its_end() {
+        let lines =
+            idle_lines(&[link("ETH0", &["a", "b", "c"], &["d"]), link("ETH1", &["e"], &[])]);
+        // Five lines and one gap: 62px.
+        assert_eq!(idle_scroll_max(&lines, 62), 0);
+        assert_eq!(idle_scroll_max(&lines, 61), 1);
+        assert_eq!(idle_scroll_max(&lines, 26), 3);
+        // Room for less than one line still leaves the last one reachable.
+        assert_eq!(idle_scroll_max(&lines, 0), lines.len() - 1);
+        assert_eq!(idle_scroll_max(&[], 50), 0);
+    }
+}

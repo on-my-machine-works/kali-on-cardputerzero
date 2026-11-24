@@ -1,0 +1,143 @@
+[package]
+name = "flipper-ui"
+# Literal rather than inherited from the workspace, as its two sibling crates
+# already are: an app's build takes this crate by path from outside the workspace,
+# where `edition.workspace = true` fails with "failed to find a workspace root".
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Shared UI component library for the Flipper One 256x144 panel"
+
+[features]
+default = []
+# DRM/KMS panel sink and raw evdev input. Off by default so host-side tests and
+# the golden-image harness build without touching /dev.
+device = ["drm", "drm-ffi"]
+# Built-in browser remote view. Default off so flipperos-installer and
+# flipper-boot-menu never pay for it.
+remote = []
+# Hosting other programs: they are clients of a compositor, read with
+# wlr-screencopy and driven with a virtual keyboard. Off by default, and
+# deliberately so: the installer, the boot menu and recovery draw their own UI and
+# never host anything, so they must not pull wlroots in.
+wayland = [
+    "dep:serde",
+    "dep:serde_json",
+    "dep:wayland-client",
+    "dep:wayland-protocols",
+    "dep:wayland-protocols-wlr",
+    "dep:wayland-protocols-misc",
+]
+# Convert and scale a hosted app's frames on the GPU rather than the CPU. Hosting
+# only: nothing in the boot menu, the installer or recovery goes near EGL.
+gpu = [
+    "wayland",
+    "dep:khronos-egl",
+    "dep:libloading",
+]
+# Slint software renderer targeting Gray8. No backend: we own KMS and input, so
+# `renderer-software` is taken on its own and the LinuxKMS backend (with its
+# libinput/libxkbcommon/fontconfig tree) is never pulled in.
+#
+# The renderer and the glue that paints a Slint window into a panel frame, and
+# nothing else. A consumer that composes its own screens from ui/ takes this and
+# compiles its own entry file, the way an app does, so it links one set of
+# components rather than two.
+slint = ["dep:slint", "dep:i-slint-common"]
+# The screens themselves: ui/screens.slint compiled into this crate as `ui`, which
+# is Root and therefore every screen there is. flipctl wants this; the boot menu and
+# the installer draw one screen each and would otherwise pay for a second component
+# set and a second glyph atlas beside their own.
+screens = ["slint", "dep:slint-build"]
+# Reading an AppImage's manifest and icon out of its squashfs without running it:
+# ~/Apps is where a person drops any bundle, and the scan must not execute one to
+# find out what it is. Off by default; flipctl's `wayland` feature takes it, and the
+# boot menu and the installer never do.
+bundle = ["dep:backhand"]
+# The terminal drawing side, for a serial console. The parallel of `slint`: the
+# view models are shared, this is a second way to put one on a screen. Pure Rust,
+# so an image needs no ncurses and no terminfo, and nothing here is linked unless
+# a consumer asks for it.
+tui = ["dep:cursive"]
+
+[dependencies]
+# getifaddrs, for the idle screen's IPv4 addresses. procfs exposes IPv6 as text
+# but has no IPv4 equivalent, and a UI process should not be shelling out to `ip`.
+libc = "0.2"
+# A script app's icon may sit in its manifest as a data URI, so the app stays one file.
+base64 = "0.22"
+drm = { version = "0.14", optional = true }
+# For one ioctl the safe crate cannot express: ADDFB2 with a fourcc its enum has no
+# name for. drm-fourcc 2.2.0 predates DRM_FORMAT_Y8, and the drm crate funnels every
+# framebuffer through that enum, so the Y8 framebuffer is added a layer down.
+drm-ffi = { version = "0.9", optional = true }
+khronos-egl = { version = "6", features = ["dynamic"], optional = true }
+libloading = { version = "0.8", optional = true }
+# For sway's IPC replies. Hand-parsing them cost three bugs: a `num` field on every
+# node in the tree, a workspace bounded by "the next num", and finally pretty-printed
+# JSON that no substring search matched. A parser is smaller than those mistakes.
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+wayland-client = { version = "0.31", optional = true }
+wayland-protocols = { version = "0.32", features = ["client"], optional = true }
+wayland-protocols-wlr = { version = "0.3", features = ["client"], optional = true }
+wayland-protocols-misc = { version = "0.3", features = ["client"], optional = true }
+
+# Not used directly. Present only to switch fontique's fontconfig binding to
+# dlopen, which the `slint` facade does not re-export. Cargo unifies features
+# across the graph, so this reaches the fontique that i-slint-core pulls in via
+# parley and removes libfontconfig (plus freetype, expat, png, brotli, bz2) from
+# the link line. We embed glyphs at compile time and never enumerate system
+# fonts, so nothing looks for the library at runtime either.
+[dependencies.i-slint-common]
+version = "=1.17.1"
+features = ["fontconfig-dlopen"]
+optional = true
+
+# The terminal front end. `crossterm-backend` alone: cursive's other backends are
+# ncurses and termion, and a C terminfo library is exactly what an initramfs does
+# not have. Same version flipperos-installer runs on its serial console.
+[dependencies.cursive]
+version = "0.21"
+default-features = false
+features = ["crossterm-backend"]
+optional = true
+
+[dependencies.slint]
+version = "1.17"
+default-features = false
+features = ["compat-1-2", "renderer-software", "std", "unsafe-single-threaded"]
+optional = true
+
+# zstd alone: the bundles are packed with it, and the default set brings xz, lz4,
+# rayon and tracing, none of them wanted in the panel binary.
+[dependencies.backhand]
+version = "0.25"
+default-features = false
+features = ["zstd"]
+optional = true
+
+[build-dependencies]
+flipper-tokens = { path = "../flipper-tokens" }
+slint-build = { version = "1.17", optional = true }
+
+[dev-dependencies]
+png = "0.17"
+
+# Declared so `cargo test` does not try to build them without the feature: examples
+# are built by the test profile, and these use a module that is gated out.
+[[example]]
+name = "gpu_probe"
+required-features = ["gpu"]
+
+[[example]]
+name = "wl_probe"
+required-features = ["wayland"]
+
+[[example]]
+name = "wl_sink_probe"
+required-features = ["wayland"]
+
+[[example]]
+name = "tui_probe"
+required-features = ["tui"]

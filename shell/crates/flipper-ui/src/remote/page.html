@@ -1,0 +1,203 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kali CardputerZero — Web KVM</title>
+<style>
+  html, body {
+    margin: 0; min-height: 100%;
+    background: #060911;
+    color: #ebf3ff;
+    font: 13px system-ui, -apple-system, sans-serif;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+  }
+  .deck {
+    background: linear-gradient(180deg, #0f1626 0%, #090e1a 100%);
+    border: 1px solid #22385c;
+    border-radius: 16px;
+    padding: 20px 24px 22px;
+    box-shadow: 0 22px 60px rgba(0, 0, 0, .65), inset 0 1px 0 rgba(56, 188, 255, .15);
+    display: flex; flex-direction: column; align-items: center; gap: 14px;
+    max-width: 96vw;
+  }
+  .deck-hdr {
+    width: 100%; display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; color: #8098b9; font-size: 12px;
+  }
+  .deck-hdr strong { color: #38bcff; font-family: monospace; letter-spacing: .04em; }
+  .status-pill {
+    padding: 3px 10px; border-radius: 999px; font: 600 11px monospace;
+    background: #14223a; border: 1px solid #22385c; color: #26da84;
+  }
+  .hdr-right { display: flex; align-items: center; gap: 8px; }
+  .kbd-toggle {
+    padding: 3px 10px; border-radius: 999px; font: 600 11px monospace; cursor: pointer;
+    background: #14223a; border: 1px solid #22385c; color: #8098b9; user-select: none;
+  }
+  .kbd-toggle:hover { border-color: #38bcff; color: #ebf3ff; }
+  .kbd-toggle.active { background: #2c84f5; border-color: #38bcff; color: #fff; }
+  body.nosignal .status-pill { color: #f84e5c; border-color: #f84e5c; }
+  #bezel {
+    position: relative;
+    width: 640px; height: 340px;
+    max-width: 90vw;
+    aspect-ratio: 320 / 170;
+    background: #080c16;
+    border: 2px solid #22385c;
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: 0 0 0 4px #050811, 0 8px 24px rgba(0,0,0,.6);
+  }
+  #panel {
+    width: 100%; height: 100%;
+    display: block;
+    image-rendering: pixelated;
+  }
+  #nosignal {
+    position: absolute; inset: 0; display: none;
+    align-items: center; justify-content: center;
+    background: rgba(8, 12, 22, .92);
+    font: 700 22px monospace; letter-spacing: .12em; color: #f84e5c;
+  }
+  body.nosignal #nosignal { display: flex; }
+  /* Softkey row aligned to CardputerZero physical keys 4, 5, 6, 7, 8 (centers 48, 104, 160, 216, 272 / 320) */
+  .soft-strip {
+    position: relative;
+    width: 640px; max-width: 90vw; height: 38px;
+  }
+  .zone {
+    box-sizing: border-box;
+    cursor: pointer; touch-action: none; user-select: none;
+    background: #14223a; color: #ebf3ff;
+    border: 1px solid #22385c; border-radius: 6px;
+    font: 600 12px monospace;
+    display: inline-flex; align-items: center; justify-content: center; gap: 5px;
+    transition: background .08s, border-color .08s, transform .05s;
+  }
+  .zone small { color: #38bcff; font-size: 11px; }
+  .zone:hover { border-color: #38bcff; background: #1c3258; }
+  .zone.down { background: #2c84f5; border-color: #38bcff; color: #fff; transform: translateY(1px); }
+  .zone.down small { color: #fff; }
+  .soft-strip .zone {
+    position: absolute; top: 0; height: 36px; width: 16.25%;
+  }
+  .controls-grid {
+    width: 640px; max-width: 90vw;
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    padding-top: 4px; border-top: 1px solid #162642;
+  }
+  .sys-keys { display: flex; flex-wrap: wrap; gap: 8px; }
+  .sys-keys .zone { padding: 8px 14px; }
+  .dpad {
+    display: grid;
+    grid-template-columns: repeat(3, 46px);
+    grid-template-rows: repeat(3, 34px);
+    gap: 5px;
+  }
+  .hint { color: #526888; font-size: 11px; font-family: monospace; }
+</style>
+
+<div class="deck">
+  <div class="deck-hdr">
+    <div><strong>ST7789v3 320&times;170 RGB565</strong> &middot; Kali Cyberdeck Shell (czctl)</div>
+    <div class="hdr-right">
+      <button type="button" class="kbd-toggle" id="kbdmode" title="Forward full PC QWERTY keystrokes directly to Terminal, TextInput &amp; apps">KBD: OFF</button>
+      <div class="status-pill">LINK: <span id="stat">connecting</span></div>
+    </div>
+  </div>
+
+  <div id="bezel">
+    <canvas id="panel" width="320" height="170"></canvas>
+    <div id="nosignal">NO SIGNAL</div>
+  </div>
+
+  <div class="soft-strip" id="softrow"></div>
+
+  <div class="controls-grid">
+    <div class="sys-keys" id="syskeys"></div>
+    <div class="hint" id="kbdhint">Keys: 4 5 6 7 8 &middot; Arrows / F Z X C &middot; Enter &middot; Esc &middot; Tab</div>
+    <div class="dpad" id="dpad"></div>
+  </div>
+</div>
+
+<script src="remote.js"></script>
+<script>
+flipperTabs();
+
+// Wire names kept 1:1 with FlipperKey::ALL ('esc','view','power','edit','run','up','down','left','right','ok','back','appsw','ptt')
+const SOFT_ZONES = [
+  { a: 'esc',   k: '4', sub: 'ESC',  leftPct: (22 / 320) * 100 },
+  { a: 'view',  k: '5', sub: 'VIEW', leftPct: (78 / 320) * 100 },
+  { a: 'power', k: '6', sub: 'ACT',  leftPct: (134 / 320) * 100 },
+  { a: 'edit',  k: '7', sub: 'EDIT', leftPct: (190 / 320) * 100 },
+  { a: 'run',   k: '8', sub: 'RUN',  leftPct: (246 / 320) * 100 },
+];
+
+const SYS_ZONES = [
+  { a: 'back',  k: 'Esc',  sub: 'Back' },
+  { a: 'appsw', k: 'Tab',  sub: 'Deck' },
+  { a: 'ptt',   k: '~',    sub: 'Aux' },
+];
+
+const DPAD_ZONES = [
+  null,                         { a: 'up',    k: '\u2191' }, null,
+  { a: 'left',  k: '\u2190' },  { a: 'ok',    k: 'OK' },     { a: 'right', k: '\u2192' },
+  null,                         { a: 'down',  k: '\u2193' }, null,
+];
+
+function makeBtn(z) {
+  const el = document.createElement('button');
+  el.className = 'zone';
+  el.dataset.k = z.a;
+  el.innerHTML = z.sub ? `<span>${z.k}</span><small>${z.sub}</small>` : `<span>${z.k}</span>`;
+  return el;
+}
+
+const softrow = document.getElementById('softrow');
+for (const z of SOFT_ZONES) {
+  const b = makeBtn(z);
+  b.style.left = z.leftPct.toFixed(3) + '%';
+  softrow.appendChild(b);
+}
+
+const syskeys = document.getElementById('syskeys');
+for (const z of SYS_ZONES) syskeys.appendChild(makeBtn(z));
+
+const dpad = document.getElementById('dpad');
+for (const cell of DPAD_ZONES) {
+  if (!cell) {
+    dpad.appendChild(document.createElement('div'));
+  } else {
+    dpad.appendChild(makeBtn(cell));
+  }
+}
+
+flipperWireInput('.zone');
+
+const kbdBtn = document.getElementById('kbdmode');
+const kbdHint = document.getElementById('kbdhint');
+if (kbdBtn) {
+  kbdBtn.addEventListener('click', () => {
+    const on = flipperSetDirectKbd(!flipperDirectKbd());
+    kbdBtn.classList.toggle('active', on);
+    kbdBtn.textContent = on ? 'KBD: FULL QWERTY' : 'KBD: OFF';
+    if (kbdHint) {
+      kbdHint.textContent = on
+        ? 'Direct QWERTY active (Terminal / TextInput / Ctrl+C / Hold Esc)'
+        : 'Keys: 4 5 6 7 8 \u00b7 Arrows / F Z X C \u00b7 Enter \u00b7 Esc \u00b7 Tab';
+    }
+    kbdBtn.blur();
+  });
+}
+
+const panel = document.getElementById('panel');
+const stat = document.getElementById('stat');
+const blitter = new GreyBlitter(panel.getContext('2d'), 320, 170);
+
+flipperStream(
+  (bytes, x, y, w, h) => blitter.draw(bytes, x, y, w, h),
+  (text, ok) => {
+    stat.textContent = text;
+    document.body.classList.toggle('nosignal', ok === false);
+  }
+);
+</script>

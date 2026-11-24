@@ -2,6 +2,7 @@
 /cache/
 /work/
 /output/
+/shell/target/
 
 # Python bytecode
 __pycache__/
@@ -11,6 +12,7 @@ __pycache__/
 *.o
 *.so
 /src/cz-sysmon
+/src/cz-term
 /src/cz-term80
 /src/cz-wifiscan
 /src/cz-lanscan

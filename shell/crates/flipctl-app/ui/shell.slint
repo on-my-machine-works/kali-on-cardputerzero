@@ -1,0 +1,68 @@
+// The window a hosted app draws in, and the status the panel's bar shows.
+//
+// An app is a Wayland client with a 256x144 surface, so unlike flipctl's own Root
+// it has a real window and gets its keys from the compositor. Both of those are
+// boilerplate no app should repeat, so they live here.
+import { FlipperTheme } from "@theme";
+export { FlipperTheme }
+// Re-exported so an app imports the window and the bar it writes to from one place.
+import { PanelStatus } from "@flipctl/statusbar.slint";
+export { PanelStatus }
+
+// The keys, and how the soft bar and the chevrons show a press, for a page that
+// binds a global instead of forwarding a callback: a component cannot export a
+// callback it inherited, a global needs no forwarding at all.
+export global AppKeys {
+    // The key's text and whether it went down, as `Shell.key`.
+    callback key(string, bool);
+    // Which soft key is shown pressed, or -1.
+    in-out property <int> pressed_slot: -1;
+    // Which chevron is shown pressed: 0 none, 1 left, 2 right.
+    in-out property <int> arrow_pressed;
+}
+
+export component Shell inherits Window {
+    width: FlipperTheme.panel_w;
+    height: FlipperTheme.panel_h;
+    background: FlipperTheme.white;
+    default-font-family: "HaxrCorp 4090";
+    default-font-size: 16px;
+
+    // The key's text and whether it went down. The panel's buttons arrive as
+    // ordinary keys, and Key::from_slint gives them their names back.
+    //
+    // A component inheriting this one cannot export a callback it did not declare,
+    // so an app forwards this to one of its own:
+    //
+    //     callback keyed(string, bool);
+    //     key(text, down) => { root.keyed(text, down); }
+    callback key(string, bool);
+
+    // The keys go to the focused item, and a window that has never been asked has
+    // no focused item, so this is both declared and taken: forward-focus alone left
+    // the app deaf. The scope wraps the app's content and fills the window, because
+    // a zero-sized one is not an item the focus can rest on.
+    forward-focus: scope;
+
+    init => {
+        scope.focus();
+    }
+
+    scope := FocusScope {
+        width: 100%;
+        height: 100%;
+
+        key-pressed(event) => {
+            root.key(event.text, true);
+            AppKeys.key(event.text, true);
+            EventResult.accept
+        }
+        key-released(event) => {
+            root.key(event.text, false);
+            AppKeys.key(event.text, false);
+            EventResult.accept
+        }
+
+        @children
+    }
+}

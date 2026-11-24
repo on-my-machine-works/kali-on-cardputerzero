@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/flipper-tokens",
+    "crates/flipper-ui",
+    "crates/flipctl-app",
+    "bin/flipctl",
+    "bin/flipper-boot-menu",
+    "bin/kali-usb-deck",
+    "apps/sysmon",
+]
+# Apps are not listed here. Each app crate carries its own empty [workspace]
+# table, which keeps it independent without this file having to name it: a user
+# adding an app should not have to edit the workspace it happens to sit inside.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/on-my-machine-works/kali-on-cardputerzero"
+
+[workspace.dependencies]
+flipper-ui = { path = "crates/flipper-ui" }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

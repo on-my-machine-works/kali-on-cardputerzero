@@ -1,0 +1,23 @@
+[package]
+name = "flipctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Walks every flipper-ui component on the panel, a serial console or a browser"
+
+[features]
+default = []
+device = ["flipper-ui/device"]
+remote = ["flipper-ui/remote"]
+slint = ["flipper-ui/screens", "dep:png", "dep:slint", "dep:qrcodegen"]
+# Present through a compositor rather than to the card, and take its keys.
+wayland = ["flipper-ui/wayland", "flipper-ui/bundle"]
+# Let the GPU turn a hosted app's frames into panel frames.
+gpu = ["wayland", "flipper-ui/gpu"]
+
+[dependencies]
+flipper-ui.workspace = true
+libc = "0.2"
+png = { version = "0.17", optional = true }
+qrcodegen = { version = "1.8", optional = true }
+slint = { version = "1.17", default-features = false, features = ["compat-1-2", "renderer-software", "std", "unsafe-single-threaded"], optional = true }

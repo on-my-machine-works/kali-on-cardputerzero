@@ -1,6 +1,7 @@
 MIT License
 
 Copyright (c) 2026 Lwrless
+Portions of shell/ and overlays/btrfs-tools/ Copyright (c) 2026 Flipper Devices (see shell/LICENSE, shell/REUSE.toml, and overlays/btrfs-tools/LICENSE; compiled Slint UI binaries are distributed under GPL-3.0-only, HaxrCorp 4090 font glyphs under CC-BY-SA-3.0, ProFont under MIT in src/fonts/LICENSE-ProFont.txt, and flipper-bls.sh under LGPL-2.1-or-later)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
