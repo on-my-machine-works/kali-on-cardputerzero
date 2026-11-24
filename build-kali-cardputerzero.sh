@@ -2,7 +2,7 @@
 # ==============================================================================
 # build-kali-cardputerzero.sh
 #
-# Custom Kali Linux ARM64 Image Builder for M5Stack CardputerZero (v5/CM0)
+# Custom Kali Linux Cyberdeck Edition ARM64 Image Builder for M5Stack CardputerZero (v5/CM0)
 #
 # Follows & adapts the official Kali Linux Custom Raspberry Pi Image workflow:
 #   01. Bootstrap a clean ARM64 Kali Rolling rootfs (mmdebstrap / debootstrap)
@@ -10,11 +10,13 @@
 #   03. Partition (MBR: 512MiB FAT32 /boot/firmware + ext4 /) & loop-mount
 #   04. Populate rootfs, install CM0 bootloader + RPi 6.18.39 kernel + Wi-Fi/BT fw
 #   05. Compile all M5Stack CardputerZero kernel modules & DT overlays from source,
-#       install Kali tools + HDMI LXDE + native 320x170 LCD utilities +
-#       APPLaunch integration, run automated verification, finalize & compress.
+#       install Kali tools + HDMI LXDE + native 320x170 Kali Cyberdeck Shell (czctl) +
+#       12 Wayland apps + composite USB-C OTG Arsenal + APPLaunch integration,
+#       run automated verification, zerofree & compress.
 #
 # Usage:
-#   sudo ./build-kali-cardputerzero.sh                 # Run full pipeline (all)
+#   sudo ./build-kali-cardputerzero.sh                 # Run full pipeline (ROOT_FS=ext4 default)
+#   sudo ROOT_FS=btrfs ./build-kali-cardputerzero.sh   # Optional Btrfs multi-profile variant
 #   sudo ./build-kali-cardputerzero.sh verify          # Run verification suite
 #   sudo FLASH_DEV=/dev/sdX ./build-kali-cardputerzero.sh flash
 #   sudo DEPLOY_SSH_DEV=/dev/sdX ./build-kali-cardputerzero.sh deploy-ssh
@@ -28,12 +30,19 @@ WORK_DIR="${WORK_DIR:-$SCRIPT_DIR/work}"
 ROOTFS_STAGE_DIR="$WORK_DIR/rootfs"
 MNT_ROOT="$WORK_DIR/mnt_root"
 MNT_BOOT="$WORK_DIR/mnt_boot"
+MNT_TOP="$WORK_DIR/mnt_btrfs_top"
+PREBUILT_SHELL_DIR="${PREBUILT_SHELL_DIR:-$WORK_DIR/prebuilt-shell}"
 OUT_DIR="${OUT_DIR:-$SCRIPT_DIR/output}"
 
 IMG_NAME="${IMG_NAME:-kali-cardputerzero-arm64.img}"
 OUT_IMG="$OUT_DIR/$IMG_NAME"
 IMG_SIZE="${IMG_SIZE:-7G}"
 BOOT_MB="${BOOT_MB:-512}"
+ROOT_FS="${ROOT_FS:-ext4}"
+DEFAULT_UI="${DEFAULT_UI:-czctl}"
+BUILD_ID="${BUILD_ID:-1}"
+BTRFS_BUILD_OPTS="${BTRFS_BUILD_OPTS:-compress=zstd:3,noatime,ssd,space_cache=v2}"
+BTRFS_RUNTIME_OPTS="${BTRFS_RUNTIME_OPTS:-compress=zstd:3,noatime,ssd,space_cache=v2}"
 CZ_HOSTNAME="${CZ_HOSTNAME:-kali-cardputerzero}"
 WIFI_REGDOM="${WIFI_REGDOM:-US}"
 
@@ -160,19 +169,31 @@ run_chroot() {
         LANG=C.UTF-8 \
         TERM=dumb \
         KVER="$KVER" \
+        ROOT_FS="$ROOT_FS" \
         KERNEL_HOLD_PKGS="$KERNEL_HOLD_PKGS" \
         RPI_LIBCAMERA_DIR="$RPI_LIBCAMERA_DIR" \
         bash -e -s -- "$@"
 }
 
+unmount_tree() {
+    local target="$1"
+    if [[ -d "$target" ]] && findmnt -rno TARGET --submounts "$target" >/dev/null 2>&1; then
+        while read -r mp; do
+            [[ -n "$mp" ]] || continue
+            umount "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null || true
+        done < <(findmnt -rno TARGET --submounts "$target" | awk '{ print length, $0 }' | sort -rn | cut -d' ' -f2-)
+    fi
+    if mountpoint -q "$target" 2>/dev/null; then
+        sync
+        umount "$target" 2>/dev/null || umount -l "$target" 2>/dev/null || true
+    fi
+}
+
 unmount_image() {
     chroot_down
-    for m in "$MNT_ROOT" "$MNT_BOOT"; do
-        if mountpoint -q "$m" 2>/dev/null; then
-            sync
-            umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || true
-        fi
-    done
+    unmount_tree "$MNT_ROOT"
+    unmount_tree "$MNT_TOP"
+    unmount_tree "$MNT_BOOT"
     if [[ -f "$OUT_IMG" ]]; then
         while read -r lp; do
             [[ -n "$lp" ]] && losetup -d "$lp" 2>/dev/null || true
@@ -198,12 +219,25 @@ kernel_img_version() {
         | strings 2>/dev/null | grep -m1 'Linux version' | awk '{print $3}' || true
 }
 
-# ─── Stage 00: Check Host Dependencies ───────────────────────────────────────
+# ─── Stage 00: Check Host Dependencies & Prebuild Cortex-A53 Shell ───────────
 stage_check() {
     (( CHECK_DONE )) && return 0
-    log "Checking host build tools (Host arch: $HOST_ARCH)"
+    [[ "$ROOT_FS" == "btrfs" || "$ROOT_FS" == "ext4" ]] || err "ROOT_FS must be 'btrfs' or 'ext4' (got '$ROOT_FS')"
+    [[ "$DEFAULT_UI" == "czctl" || "$DEFAULT_UI" == "applaunch" ]] || err "DEFAULT_UI must be 'czctl' or 'applaunch' (got '$DEFAULT_UI')"
+
+    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+        local sudo_home
+        sudo_home="$(getent passwd "$SUDO_USER" | cut -d: -f6 || true)"
+        if [[ -n "$sudo_home" && -d "$sudo_home/.cargo/bin" && ":$PATH:" != *":$sudo_home/.cargo/bin:"* ]]; then
+            export PATH="$sudo_home/.cargo/bin:$PATH"
+        fi
+    fi
+
+    log "Checking host build tools (Host arch: $HOST_ARCH, ROOT_FS: $ROOT_FS)"
     local req=(parted partprobe losetup mkfs.vfat mkfs.ext4 e2fsck resize2fs blkid
-               rsync xz zstd ar tar dpkg-deb curl git sha256sum dtc strings python3)
+               rsync xz zstd ar tar dpkg-deb curl git sha256sum dtc strings python3
+               objdump readelf cargo rustc pkg-config)
+    [[ "$ROOT_FS" == "btrfs" ]] && req+=(mkfs.btrfs btrfs chattr)
     local missing=()
     for c in "${req[@]}"; do command -v "$c" >/dev/null 2>&1 || missing+=("$c"); done
     if ! command -v mmdebstrap >/dev/null 2>&1 && ! command -v debootstrap >/dev/null 2>&1; then
@@ -213,14 +247,38 @@ stage_check() {
         [[ -x /usr/bin/qemu-aarch64-static && -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]] \
             || missing+=("qemu-user-static+binfmt-support")
         command -v arch-test >/dev/null 2>&1 || missing+=("arch-test")
+        command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 || missing+=("gcc-aarch64-linux-gnu")
+        command -v aarch64-linux-gnu-objdump >/dev/null 2>&1 || missing+=("binutils-aarch64-linux-gnu")
     fi
     if [[ ${#missing[@]} -ne 0 ]]; then
         err "Missing host tools: ${missing[*]}
 Install on Debian/Ubuntu/Kali with:
-  sudo apt update && sudo apt install -y parted dosfstools e2fsprogs util-linux rsync xz-utils zstd binutils dpkg curl git ca-certificates device-tree-compiler python3 mmdebstrap debootstrap zerofree$( [[ "$HOST_ARCH" != "aarch64" ]] && printf ' qemu-user-static binfmt-support arch-test' )"
+  sudo apt update && sudo apt install -y parted dosfstools e2fsprogs btrfs-progs util-linux rsync xz-utils zstd binutils dpkg curl git ca-certificates device-tree-compiler python3 mmdebstrap debootstrap zerofree pkg-config libudev-dev libdrm-dev libgbm-dev libwayland-dev libxkbcommon-dev libfontconfig1-dev libpulse-dev libmp3lame-dev libogg-dev libvorbis-dev cargo rustc$( [[ "$HOST_ARCH" != "aarch64" ]] && printf ' qemu-user-static binfmt-support arch-test gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu' )"
     fi
+
+    # Build Cortex-A53 czctl shell & Wayland apps as invoking user before entering root stages
+    local need_shell=0
+    local req_shell_bins=(czctl kali-usb-deck flipctl-sysmon cz-term
+                          flipctl-recorder flipctl-radio flipctl-disk-bench flipctl-bt-hid)
+    [[ "$ROOT_FS" == "btrfs" ]] && req_shell_bins+=(cz-boot-menu)
+    [[ "${FORCE_SHELL_BUILD:-0}" == "1" ]] && need_shell=1
+    for sb in "${req_shell_bins[@]}"; do
+        [[ -x "$PREBUILT_SHELL_DIR/bin/$sb" ]] || need_shell=1
+    done
+    if (( need_shell )); then
+        log "Building Cortex-A53 czctl shell, Wayland apps & cz-term into $PREBUILT_SHELL_DIR"
+        mkdir -p "$WORK_DIR"
+        if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+            chown "${SUDO_UID:-$SUDO_USER}:${SUDO_GID:-$SUDO_USER}" "$WORK_DIR" 2>/dev/null || true
+            sudo -u "$SUDO_USER" env PATH="$PATH" ROOT_FS="$ROOT_FS" PREBUILT_SHELL_DIR="$PREBUILT_SHELL_DIR" \
+                "$SCRIPT_DIR/scripts/build-cz-shell.sh"
+        else
+            ROOT_FS="$ROOT_FS" PREBUILT_SHELL_DIR="$PREBUILT_SHELL_DIR" "$SCRIPT_DIR/scripts/build-cz-shell.sh"
+        fi
+    fi
+
     CHECK_DONE=1
-    ok "Host environment verified"
+    ok "Host environment & Cortex-A53 czctl binaries verified"
 }
 
 # ─── Stage 01a: Resolve & Verify Upstream Inputs ─────────────────────────────
@@ -288,6 +346,18 @@ EOF
 }
 
 # ─── Stage 02 & 03: Create, Partition, Format & Populate Image File ──────────
+mount_btrfs_layout() {
+    local root_part="$1" boot_part="$2"
+    mount -t btrfs -o "subvol=@Kali,$BTRFS_BUILD_OPTS" "$root_part" "$MNT_ROOT"
+    mkdir -p "$MNT_ROOT/boot" "$MNT_ROOT/home" "$MNT_ROOT/var/log" "$MNT_ROOT/var/cache" "$MNT_ROOT/var/swap"
+    mount -t btrfs -o "subvol=boot,$BTRFS_BUILD_OPTS"       "$root_part" "$MNT_ROOT/boot"
+    mount -t btrfs -o "subvol=@home,$BTRFS_BUILD_OPTS"      "$root_part" "$MNT_ROOT/home"
+    mount -t btrfs -o "subvol=@var-log,$BTRFS_BUILD_OPTS"   "$root_part" "$MNT_ROOT/var/log"
+    mount -t btrfs -o "subvol=@var-cache,$BTRFS_BUILD_OPTS" "$root_part" "$MNT_ROOT/var/cache"
+    mkdir -p "$MNT_ROOT/boot/firmware"
+    mount "$boot_part" "$MNT_BOOT"
+}
+
 stage_image() {
     if [[ -f "$OUT_IMG" && -f "$OUT_IMG.populated" ]]; then
         ok "Disk image $OUT_IMG already created and populated"
@@ -296,13 +366,13 @@ stage_image() {
     [[ -f "$ROOTFS_STAGE_DIR/.bootstrapped" ]] || stage_rootfs
 
     unmount_image
-    mkdir -p "$OUT_DIR" "$MNT_ROOT" "$MNT_BOOT"
+    mkdir -p "$OUT_DIR" "$MNT_ROOT" "$MNT_BOOT" "$MNT_TOP"
     rm -f "$OUT_IMG" "$OUT_IMG.populated"
 
-    log "Creating sparse image $OUT_IMG ($IMG_SIZE)"
+    log "Creating sparse image $OUT_IMG ($IMG_SIZE, ROOT_FS=$ROOT_FS)"
     truncate -s "$IMG_SIZE" "$OUT_IMG"
 
-    log "Partitioning $OUT_IMG (MBR: ${BOOT_MB}MiB FAT32 /boot/firmware + ext4 /)"
+    log "Partitioning $OUT_IMG (MBR: ${BOOT_MB}MiB FAT32 /boot/firmware + $ROOT_FS /)"
     parted --script "$OUT_IMG" \
         mklabel msdos \
         mkpart primary fat32 1MiB "$((BOOT_MB + 1))MiB" \
@@ -314,49 +384,96 @@ stage_image() {
     partprobe "$LOOP_DEV" || true
     udevadm settle 2>/dev/null || sleep 1
 
-    log "Formatting partitions (${LOOP_DEV}p1=FAT32, ${LOOP_DEV}p2=ext4)"
+    log "Formatting partitions (${LOOP_DEV}p1=FAT32, ${LOOP_DEV}p2=$ROOT_FS)"
     mkfs.vfat -F 32 -n BOOT "${LOOP_DEV}p1" >/dev/null
-    mkfs.ext4 -F -L ROOTFS -O ^metadata_csum_seed "${LOOP_DEV}p2" >/dev/null
 
-    mount -o noatime "${LOOP_DEV}p2" "$MNT_ROOT"
-    mkdir -p "$MNT_ROOT/boot/firmware"
-    mount "${LOOP_DEV}p1" "$MNT_BOOT"
-
-    log "Copying Kali rootfs into mounted image via rsync"
-    rsync -HPavz -q --exclude='.bootstrapped' --exclude='/boot/firmware/*' \
-        "$ROOTFS_STAGE_DIR/" "$MNT_ROOT/"
-
-    local boot_puuid root_puuid
+    local boot_puuid root_puuid root_fsuuid
     boot_puuid="$(blkid -s PARTUUID -o value "${LOOP_DEV}p1")"
     root_puuid="$(blkid -s PARTUUID -o value "${LOOP_DEV}p2")"
 
-    cat > "$MNT_ROOT/etc/fstab" <<EOF
+    if [[ "$ROOT_FS" == "btrfs" ]]; then
+        mkfs.btrfs -f -L kali-root "${LOOP_DEV}p2" >/dev/null
+        root_fsuuid="$(blkid -s UUID -o value "${LOOP_DEV}p2")"
+
+        mount -t btrfs -o "subvolid=5,$BTRFS_BUILD_OPTS" "${LOOP_DEV}p2" "$MNT_TOP"
+        for sv in @Kali boot @home @var-log @var-cache @snapshots @stock-snapshots @swap; do
+            btrfs subvolume create "$MNT_TOP/$sv" >/dev/null
+        done
+        chattr +C "$MNT_TOP/@var-log" 2>/dev/null || true
+        mkdir -p "$MNT_TOP/@var-log/journal"
+        chattr +C "$MNT_TOP/@var-log/journal" 2>/dev/null || true
+        btrfs filesystem mkswapfile --size 1g "$MNT_TOP/@swap/swapfile" >/dev/null
+        umount "$MNT_TOP"
+
+        mount_btrfs_layout "${LOOP_DEV}p2" "${LOOP_DEV}p1"
+
+        log "Copying Kali rootfs into zstd-compressed Btrfs subvolumes via rsync"
+        rsync -HPavz -q --exclude='.bootstrapped' --exclude='/boot/firmware/*' \
+            "$ROOTFS_STAGE_DIR/" "$MNT_ROOT/"
+        mkdir -p "$MNT_ROOT/var/log/journal" "$MNT_ROOT/var/swap"
+        chattr +C "$MNT_ROOT/var/log/journal" 2>/dev/null || true
+
+        cat > "$MNT_ROOT/etc/fstab" <<EOF
+proc            /proc           proc    defaults          0       0
+PARTUUID=${boot_puuid}  /boot/firmware  vfat    defaults          0       2
+UUID=${root_fsuuid}     /               btrfs   ${BTRFS_RUNTIME_OPTS}                     0       0
+UUID=${root_fsuuid}     /boot           btrfs   ${BTRFS_RUNTIME_OPTS},subvol=boot         0       0
+UUID=${root_fsuuid}     /home           btrfs   ${BTRFS_RUNTIME_OPTS},subvol=@home        0       0
+UUID=${root_fsuuid}     /var/log        btrfs   ${BTRFS_RUNTIME_OPTS},subvol=@var-log     0       0
+UUID=${root_fsuuid}     /var/cache      btrfs   ${BTRFS_RUNTIME_OPTS},subvol=@var-cache   0       0
+UUID=${root_fsuuid}     /var/swap       btrfs   noatime,ssd,space_cache=v2,nofail,subvol=@swap  0  0
+/var/swap/swapfile      none            swap    sw,nofail,pri=10                          0       0
+EOF
+    else
+        mkfs.ext4 -F -L ROOTFS -O ^metadata_csum_seed "${LOOP_DEV}p2" >/dev/null
+        mount -o noatime "${LOOP_DEV}p2" "$MNT_ROOT"
+        mkdir -p "$MNT_ROOT/boot/firmware"
+        mount "${LOOP_DEV}p1" "$MNT_BOOT"
+
+        log "Copying Kali rootfs into mounted ext4 image via rsync"
+        rsync -HPavz -q --exclude='.bootstrapped' --exclude='/boot/firmware/*' \
+            "$ROOTFS_STAGE_DIR/" "$MNT_ROOT/"
+
+        cat > "$MNT_ROOT/etc/fstab" <<EOF
 proc            /proc           proc    defaults          0       0
 PARTUUID=${boot_puuid}  /boot/firmware  vfat    defaults          0       2
 PARTUUID=${root_puuid}  /               ext4    defaults,noatime  0       1
 EOF
+    fi
 
     if [[ ! -L "$MNT_ROOT/boot/overlays" ]]; then
         ln -sf firmware/overlays "$MNT_ROOT/boot/overlays"
     fi
 
     touch "$OUT_IMG.populated"
-    ok "Image partitioned, formatted & populated (ROOT PARTUUID=$root_puuid)"
+    ok "Image partitioned, formatted ($ROOT_FS) & populated (ROOT PARTUUID=$root_puuid)"
 }
 
 stage_mount() {
     [[ -f "$OUT_IMG" ]] || stage_image
     if mountpoint -q "$MNT_ROOT" && mountpoint -q "$MNT_BOOT"; then
-        LOOP_DEV="$(findmnt -no SOURCE "$MNT_ROOT" | sed 's/p[0-9]*$//')"
+        local src_dev
+        src_dev="$(findmnt -no SOURCE "$MNT_ROOT")"
+        src_dev="${src_dev%%\[*}"
+        LOOP_DEV="$(sed 's/p[0-9]*$//' <<< "$src_dev")"
         return 0
     fi
-    mkdir -p "$MNT_ROOT" "$MNT_BOOT"
+    mkdir -p "$MNT_ROOT" "$MNT_BOOT" "$MNT_TOP"
     LOOP_DEV="$(losetup -fP --show "$OUT_IMG")"
     partprobe "$LOOP_DEV" || true
-    mount -o noatime "${LOOP_DEV}p2" "$MNT_ROOT"
-    mkdir -p "$MNT_ROOT/boot/firmware"
-    mount "${LOOP_DEV}p1" "$MNT_BOOT"
-    ok "Image loop-mounted on $LOOP_DEV"
+    udevadm settle 2>/dev/null || sleep 1
+    local detected_fs
+    detected_fs="$(blkid -s TYPE -o value "${LOOP_DEV}p2" 2>/dev/null || echo "$ROOT_FS")"
+    if [[ "$detected_fs" == "btrfs" ]]; then
+        ROOT_FS="btrfs"
+        mount_btrfs_layout "${LOOP_DEV}p2" "${LOOP_DEV}p1"
+    else
+        ROOT_FS="ext4"
+        mount -o noatime "${LOOP_DEV}p2" "$MNT_ROOT"
+        mkdir -p "$MNT_ROOT/boot/firmware"
+        mount "${LOOP_DEV}p1" "$MNT_BOOT"
+    fi
+    ok "Image loop-mounted on $LOOP_DEV ($ROOT_FS)"
 }
 
 # ─── Stage 04: Install CM0 Bootloader, 6.18.39 Kernel & Wireless Firmware ────
@@ -542,21 +659,25 @@ EOF
 ACTION!="remove", SUBSYSTEM=="drm", KERNEL=="card*", ENV{ID_PATH}=="platform-3f204000.spi-cs-0", TAG-="master-of-seat"
 EOF
     cat > "$MNT_ROOT/etc/udev/rules.d/70-cardputerzero-peripherals.rules" <<'EOF'
-# Allow kali user (video/i2c/plugdev/netdev) to use IR TX/RX, hardware RTC, USB HID gadgets, and rfkill
+# Allow kali user (video/i2c/plugdev/netdev/input) to use IR TX/RX, hardware RTC, USB HID gadgets, rfkill, and uinput
 SUBSYSTEM=="lirc", GROUP="video", MODE="0660"
 SUBSYSTEM=="rtc", GROUP="i2c", MODE="0664"
 ACTION=="add", SUBSYSTEM=="rtc", KERNEL=="rtc0", RUN+="/sbin/hwclock --hctosys --utc --noadjfile"
 KERNEL=="hidg[0-9]*", GROUP="plugdev", MODE="0660"
 KERNEL=="rfkill", SUBSYSTEM=="misc", GROUP="netdev", MODE="0664"
+KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="input", MODE="0660"
 EOF
+    install -m 644 "$SCRIPT_DIR/overlays/systemd/72-seat-cardputer-czctl.rules" \
+        "$MNT_ROOT/etc/udev/rules.d/72-seat-cardputer-czctl.rules"
 
-    # Ensure critical modules autoload reliably at boot
+    # Ensure critical modules autoload reliably at boot (including uinput for :8899 Web KVM)
     install -d "$MNT_ROOT/etc/modules-load.d"
     cat > "$MNT_ROOT/etc/modules-load.d/cardputerzero.conf" <<'EOF'
 i2c-dev
 panel_mipi_dbi_m
 rtc-ds1307
 libcomposite
+uinput
 EOF
 
     # Ensure fb_load splash service is linked into sysinit.target.wants and loads Kali splash.bmp
@@ -575,14 +696,14 @@ EOF
 }
 
 # ─── Stage 06: Install Kali Packages, Desktop, Audio & USB Wi-Fi DKMS ────────
-PACKAGES_STAMP="/var/lib/cz-kali/packages.v1"
+PACKAGES_STAMP="/var/lib/cz-kali/packages.v2"
 
 stage_packages() {
     if [[ -f "$MNT_ROOT$PACKAGES_STAMP" ]]; then
         ok "Kali & system packages already installed"
         return 0
     fi
-    log "Installing Kali packages, LXDE HDMI desktop, PipeWire & Realtek DKMS"
+    log "Installing Kali packages, LXDE HDMI desktop, sway Wayland host, PipeWire & Realtek DKMS"
 
     run_chroot <<'CHROOT'
 export APT_LISTCHANGES_FRONTEND=none
@@ -612,9 +733,18 @@ DEBCONF
 rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock
 dpkg --configure -a || true
 
+SYS_LIBCAM_PKG="$(apt-cache policy libcamera0.7 2>/dev/null | awk '/Candidate:/ && $2 != "(none)" {print "libcamera0.7"}')"
+if [ -z "$SYS_LIBCAM_PKG" ]; then
+    SYS_LIBCAM_PKG="$(apt-cache search --names-only '^libcamera0\.[0-9]+$' 2>/dev/null | awk '{print $1}' | sort -V | tail -1)"
+fi
+SYS_LIBCAM_PKG="${SYS_LIBCAM_PKG:-libcamera0.7}"
+EXTRA_FS_PKGS=()
+[ "$ROOT_FS" = "btrfs" ] && EXTRA_FS_PKGS+=(btrfs-progs)
+
 eatmydata apt-get install -y --no-install-recommends \
     -o Dpkg::Options::="--force-confdef" \
     -o Dpkg::Options::="--force-confold" \
+    "${EXTRA_FS_PKGS[@]}" \
     kali-defaults \
     kali-menu \
     kali-themes-common \
@@ -634,6 +764,11 @@ eatmydata apt-get install -y --no-install-recommends \
     util-linux-extra \
     zram-tools \
     cloud-guest-utils \
+    zstd \
+    fuse3 \
+    sway \
+    umtp-responder \
+    iperf3 \
     parted \
     psmisc \
     less \
@@ -687,7 +822,7 @@ eatmydata apt-get install -y --no-install-recommends \
     qterminal \
     feh \
     polkitd \
-    libcamera0.7 \
+    "$SYS_LIBCAM_PKG" \
     libcamera-ipa \
     ffmpeg \
     libfmt10 \
@@ -975,16 +1110,18 @@ rm -rf /var/cache/cz-build/apps /usr/src/cz-kali
 apt-get clean
 CHROOT
 
-    # Enable systemd user lingering for kali (UID 1000) so APPLaunch starts at boot
+    # Enable systemd user lingering for kali (UID 1000) so PipeWire & optional user units start at boot
     install -d "$MNT_ROOT/var/lib/systemd/linger"
     : > "$MNT_ROOT/var/lib/systemd/linger/kali"
-    rm -f "$MNT_ROOT/etc/systemd/user/default.target.wants/APPLaunch.service"
+    rm -f "$MNT_ROOT/etc/systemd/user/default.target.wants/APPLaunch.service" \
+          "$MNT_ROOT/home/kali/.config/systemd/user/default.target.wants/APPLaunch.service"
 
-    # Ensure APPLaunch user unit is enabled for kali
-    install -d -m 755 -o 1000 -g 1000 "$MNT_ROOT/home/kali/.config/systemd/user/default.target.wants"
-    ln -sfn /usr/lib/systemd/user/APPLaunch.service \
-        "$MNT_ROOT/home/kali/.config/systemd/user/default.target.wants/APPLaunch.service"
-    chown -h 1000:1000 "$MNT_ROOT/home/kali/.config/systemd/user/default.target.wants/APPLaunch.service"
+    if [[ "$DEFAULT_UI" == "applaunch" ]]; then
+        install -d -m 755 -o 1000 -g 1000 "$MNT_ROOT/home/kali/.config/systemd/user/default.target.wants"
+        ln -sfn /usr/lib/systemd/user/APPLaunch.service \
+            "$MNT_ROOT/home/kali/.config/systemd/user/default.target.wants/APPLaunch.service"
+        chown -h 1000:1000 "$MNT_ROOT/home/kali/.config/systemd/user/default.target.wants/APPLaunch.service"
+    fi
 
     # Prevent race between APPLaunch startup and udev creating keypad/LCD nodes,
     # export LV_LINUX_FBDEV_DEVICE=/dev/fb_lcd to all child LVGL apps, and stop
@@ -1003,6 +1140,34 @@ ExecStartPre=/bin/sh -c "for i in 1 2 3 4 5 6 7 8 9 10; do [ -e /dev/input/by-pa
 ExecStartPost=-/usr/bin/sudo -n /usr/bin/systemctl --no-block stop fb_load.service
 EOF
 
+    # Ensure /opt/rpi-libcamera matches camera_app.real's exact libcamera SONAME (e.g. if camera fell back to 1.0.3 / 0.7)
+    if [[ -x "$MNT_ROOT/usr/lib/cz-kali/camera_app.real" ]]; then
+        local cam_soname ipa_soname
+        cam_soname="$(readelf -d "$MNT_ROOT/usr/lib/cz-kali/camera_app.real" 2>/dev/null | grep -oE 'libcamera\.so\.[0-9]+\.[0-9]+' | head -n1 || true)"
+        ipa_soname="$(readelf -d "$MNT_ROOT$RPI_LIBCAMERA_DIR/usr/lib/aarch64-linux-gnu/libcamera/ipa/ipa_rpi_vc4.so" 2>/dev/null | grep -oE 'libcamera\.so\.[0-9]+\.[0-9]+' | head -n1 || true)"
+        if [[ "$cam_soname" == "libcamera.so.0.7" ]] && { [[ "$ipa_soname" != "libcamera.so.0.7" ]] || compgen -G "$MNT_ROOT$RPI_LIBCAMERA_DIR/usr/lib/aarch64-linux-gnu/libcamera*.so.0.8*" >/dev/null; }; then
+            log "Aligning $RPI_LIBCAMERA_DIR to libcamera.so.0.7 (0.7.2+rpt20261009-1) for camera_app.real"
+            local rpi_pool="https://archive.raspberrypi.com/debian/pool/main/libc/libcamera"
+            local deb07="libcamera0.7_0.7.2+rpt20261009-1_arm64.deb"
+            local sha07="371424b861f0a6611babab81561c66e7c8cb8160798fe31a2f011826673ff549"
+            local ipa07="libcamera-ipa_0.7.2+rpt20261009-1_arm64.deb"
+            local sha_ipa07="0ee197e03669f755dc437d5a1784b10eb12369fad299f5ef87dbc1bbc43a386f"
+            mkdir -p "$CACHE_DIR/camera"
+            local p d s
+            for p in "$deb07:$sha07" "$ipa07:$sha_ipa07"; do
+                d="${p%%:*}"; s="${p##*:}"
+                if [[ ! -f "$CACHE_DIR/camera/$d" ]] || [[ "$(sha256sum "$CACHE_DIR/camera/$d" | awk '{print $1}')" != "$s" ]]; then
+                    curl -fsSL --retry 3 -o "$CACHE_DIR/camera/$d" "$rpi_pool/$d"
+                fi
+                [[ "$(sha256sum "$CACHE_DIR/camera/$d" | awk '{print $1}')" == "$s" ]] || err "SHA256 mismatch for $d"
+            done
+            rm -f "$MNT_ROOT$RPI_LIBCAMERA_DIR/usr/lib/aarch64-linux-gnu/libcamera"*.so.0.8*
+            dpkg-deb -x "$CACHE_DIR/camera/$deb07" "$MNT_ROOT$RPI_LIBCAMERA_DIR"
+            dpkg-deb -x "$CACHE_DIR/camera/$ipa07" "$MNT_ROOT$RPI_LIBCAMERA_DIR"
+            rm -rf "$MNT_ROOT$RPI_LIBCAMERA_DIR/usr/share/doc" "$MNT_ROOT$RPI_LIBCAMERA_DIR/usr/share/lintian"
+        fi
+    fi
+
     cat > "$MNT_ROOT/usr/bin/camera_app" <<EOF
 #!/bin/sh
 R=$RPI_LIBCAMERA_DIR
@@ -1012,6 +1177,9 @@ export LIBCAMERA_IPA_MODULE_PATH="\$L/libcamera/ipa"
 export LIBCAMERA_IPA_PROXY_PATH="\$R/usr/libexec/aarch64-linux-gnu/libcamera"
 export LIBCAMERA_IPA_CONFIG_PATH="\$R/usr/share/libcamera/ipa"
 export LIBCAMERA_RPI_CONFIG_FILE="\${LIBCAMERA_RPI_CONFIG_FILE:-\$R/usr/share/libcamera/pipeline/rpi/vc4/rpi_apps.yaml}"
+export CAMERA_APP_FB_DEVICE="\${CAMERA_APP_FB_DEVICE:-/dev/fb_lcd}"
+export LV_LINUX_FBDEV_DEVICE="\${LV_LINUX_FBDEV_DEVICE:-/dev/fb_lcd}"
+export CAMERA_APP_KEYBOARD_GRAB="\${CAMERA_APP_KEYBOARD_GRAB:-0}"
 exec /usr/lib/cz-kali/camera_app.real "\$@"
 EOF
     chmod 755 "$MNT_ROOT/usr/bin/camera_app"
@@ -1029,24 +1197,45 @@ EOF
     ok "APPLaunch, AppStore, M5 hardware apps & IMX219 camera wrapper installed"
 }
 
-# ─── Stage 08: Build 320x170 LCD Utilities & Configure APPLaunch ─────────────
+# ─── Stage 08: Build 320x170 Shell, Wayland Apps, LCD Utilities & Launcher ───
 stage_launcher() {
-    log "Building native 320x170 LCD utilities, helper scripts & APPLaunch configuration"
+    log "Installing Kali Cyberdeck Shell (czctl), 12 Wayland apps, C utilities & APPLaunch"
 
-    install -d -m 755 "$MNT_ROOT/usr/local/bin" \
+    install -d -m 755 "$MNT_ROOT/usr/bin" \
+                      "$MNT_ROOT/usr/local/bin" \
+                      "$MNT_ROOT/usr/local/sbin" \
                       "$MNT_ROOT/usr/src/cz-kali" \
+                      "$MNT_ROOT/usr/share/czctl/assets" \
+                      "$MNT_ROOT/usr/share/czctl/apps" \
+                      "$MNT_ROOT/usr/share/czctl/payloads" \
+                      "$MNT_ROOT/etc/umtprd" \
+                      "$MNT_ROOT/etc/systemd/system/multi-user.target.wants" \
+                      "$MNT_ROOT/etc/systemd/system/graphical.target.wants" \
                       "$MNT_ROOT/usr/share/APPLaunch/applications" \
                       "$MNT_ROOT/usr/share/APPLaunch/share/images"
-    install -d -m 755 -o 1000 -g 1000 "$MNT_ROOT/home/kali/captures"
-    install -m 755 "$SCRIPT_DIR/scripts/cz-usb-gadget"   "$MNT_ROOT/usr/local/bin/cz-usb-gadget"
-    install -m 755 "$SCRIPT_DIR/scripts/cz-hw-status"    "$MNT_ROOT/usr/local/bin/cz-hw-status"
-    install -m 755 "$SCRIPT_DIR/scripts/cz-hdmi-hotplug" "$MNT_ROOT/usr/local/bin/cz-hdmi-hotplug"
-    install -m 755 "$SCRIPT_DIR/scripts/cz-kali-menu"    "$MNT_ROOT/usr/local/bin/cz-kali-menu"
-    install -m 755 "$SCRIPT_DIR/scripts/cz-kali-pkgs"    "$MNT_ROOT/usr/local/bin/cz-kali-pkgs"
+
+    install -d -m 755 -o 1000 -g 1000 \
+        "$MNT_ROOT/home/kali/Apps" \
+        "$MNT_ROOT/home/kali/isos" \
+        "$MNT_ROOT/home/kali/payloads" \
+        "$MNT_ROOT/home/kali/ir" \
+        "$MNT_ROOT/home/kali/captures" \
+        "$MNT_ROOT/home/kali/Recordings"
+
+    install -m 755 "$SCRIPT_DIR/scripts/cz-usb-gadget"     "$MNT_ROOT/usr/local/bin/cz-usb-gadget"
+    install -m 755 "$SCRIPT_DIR/scripts/cz-flipper-gadget" "$MNT_ROOT/usr/local/bin/cz-flipper-gadget"
+    install -m 755 "$SCRIPT_DIR/scripts/cz-badusb"         "$MNT_ROOT/usr/local/bin/cz-badusb"
+    install -m 755 "$SCRIPT_DIR/scripts/cz-ui-mode"        "$MNT_ROOT/usr/local/bin/cz-ui-mode"
+    install -m 755 "$SCRIPT_DIR/scripts/cz-hw-status"      "$MNT_ROOT/usr/local/bin/cz-hw-status"
+    install -m 755 "$SCRIPT_DIR/scripts/cz-hdmi-hotplug"   "$MNT_ROOT/usr/local/bin/cz-hdmi-hotplug"
+    install -m 755 "$SCRIPT_DIR/scripts/cz-kali-menu"      "$MNT_ROOT/usr/local/bin/cz-kali-menu"
+    install -m 755 "$SCRIPT_DIR/scripts/cz-kali-pkgs"      "$MNT_ROOT/usr/local/bin/cz-kali-pkgs"
 
     cp -f "$SCRIPT_DIR/src/Makefile" \
           "$SCRIPT_DIR/src/cz_ui.h" \
+          "$SCRIPT_DIR/src/flipper_term_fonts.h" \
           "$SCRIPT_DIR/src/cz-sysmon.c" \
+          "$SCRIPT_DIR/src/cz-term.c" \
           "$SCRIPT_DIR/src/cz-term80.c" \
           "$SCRIPT_DIR/src/cz-wifiscan.c" \
           "$SCRIPT_DIR/src/cz-lanscan.c" \
@@ -1059,6 +1248,81 @@ set -e
 make -C /usr/src/cz-kali install-apps
 rm -rf /usr/src/cz-kali
 CHROOT
+
+    # Install Cortex-A53 prebuilt binaries + compatibility symlinks
+    local shell_bins=(czctl kali-usb-deck flipctl-sysmon cz-term
+                      flipctl-recorder flipctl-radio flipctl-disk-bench flipctl-bt-hid)
+    [[ "$ROOT_FS" == "btrfs" ]] && shell_bins+=(cz-boot-menu)
+    for sb in "${shell_bins[@]}"; do
+        install -m 755 "$PREBUILT_SHELL_DIR/bin/$sb" "$MNT_ROOT/usr/bin/$sb"
+    done
+    ln -sfn czctl "$MNT_ROOT/usr/bin/flipctl"
+    ln -sfn cz-term "$MNT_ROOT/usr/bin/cz-flipper-term"
+    [[ "$ROOT_FS" == "btrfs" ]] && ln -sfn cz-boot-menu "$MNT_ROOT/usr/bin/flipper-boot-menu"
+
+    # Install Wayland .fap.sh bundles, :8899 Web KVM assets, payloads & /usr/share/flipctl symlink
+    rm -rf "$MNT_ROOT/usr/share/czctl/assets/remote" "$MNT_ROOT/usr/share/flipctl"
+    cp -a "$PREBUILT_SHELL_DIR/share/czctl/assets/remote" "$MNT_ROOT/usr/share/czctl/assets/remote"
+    install -m 755 "$SCRIPT_DIR/overlays/apps/"*.fap.sh "$MNT_ROOT/usr/share/czctl/apps/"
+    install -m 644 "$SCRIPT_DIR/overlays/payloads/"* "$MNT_ROOT/usr/share/czctl/payloads/"
+    ln -sfn czctl "$MNT_ROOT/usr/share/flipctl"
+    install -m 644 "$SCRIPT_DIR/overlays/etc/umtprd/umtprd.conf" "$MNT_ROOT/etc/umtprd/umtprd.conf"
+
+    # Install source/binary license & third-party attribution notices (MIT, GPL-3.0 Slint, CC-BY-SA-3.0 font, ProFont)
+    install -d -m 755 "$MNT_ROOT/usr/share/doc/czctl"
+    install -m 644 "$SCRIPT_DIR/LICENSE" "$MNT_ROOT/usr/share/doc/czctl/LICENSE"
+    install -m 644 "$SCRIPT_DIR/shell/THIRD-PARTY-LICENSES.md" "$MNT_ROOT/usr/share/doc/czctl/THIRD-PARTY-LICENSES.md"
+    install -m 644 "$SCRIPT_DIR/shell/third_party/flipctl-fonts/HaxrCorp4090-FlipCTL/LICENSE" \
+        "$MNT_ROOT/usr/share/doc/czctl/LICENSE-HaxrCorp4090-CC-BY-SA-3.0.txt"
+    install -m 644 "$SCRIPT_DIR/src/fonts/LICENSE-ProFont.txt" "$MNT_ROOT/usr/share/doc/czctl/LICENSE-ProFont.txt"
+    cat > "$MNT_ROOT/usr/share/doc/czctl/copyright" <<'DOCEOF'
+Kali Linux Cyberdeck Edition Shell (czctl) & Hosted Wayland Apps
+Source repository: https://github.com/on-my-machine-works/kali-on-cardputerzero
+
+- Repository scripts, C utilities, and shell/ Rust source code: MIT License (see LICENSE)
+  Adapted in part from https://github.com/flipperdevices/flipctl-slint (MIT)
+- Compiled czctl and hosted Slint Wayland binaries: GPL-3.0-only (links Slint; see /usr/share/common-licenses/GPL-3)
+- HaxrCorp 4090 font & title glyph table: CC-BY-SA-3.0 (sahwar & Flipper Devices; https://fontstruct.com/fontstructions/show/192981/haxrcorp_4089)
+- Busy9px font & ProFont terminal bitmaps: MIT License
+- Born2bSportyV2 font: The Unlicense (Public Domain)
+DOCEOF
+
+    for p in "$MNT_ROOT/usr/share/czctl/payloads/"*.duck; do
+        [[ -f "$p" ]] && install -m 644 -o 1000 -g 1000 "$p" "$MNT_ROOT/home/kali/payloads/$(basename "$p")"
+    done
+    for p in "$MNT_ROOT/usr/share/czctl/payloads/"*.ir; do
+        [[ -f "$p" ]] && install -m 644 -o 1000 -g 1000 "$p" "$MNT_ROOT/home/kali/ir/$(basename "$p")"
+    done
+
+    # Install Btrfs multi-profile & BLS management tools + pre-apt snapshot hook only when ROOT_FS=btrfs
+    if [[ "$ROOT_FS" == "btrfs" ]]; then
+        install -d -m 755 "$MNT_ROOT/etc/kernel/install.d" \
+                          "$MNT_ROOT/etc/apt/apt.conf.d" \
+                          "$MNT_ROOT/usr/lib/systemd/system"
+        install -m 755 "$SCRIPT_DIR/overlays/btrfs-tools/scripts/"* "$MNT_ROOT/usr/local/sbin/"
+        install -m 644 "$SCRIPT_DIR/overlays/btrfs-tools/libs/"* "$MNT_ROOT/usr/lib/"
+        install -m 755 "$SCRIPT_DIR/overlays/btrfs-tools/hooks/"* "$MNT_ROOT/etc/kernel/install.d/"
+        install -m 644 "$SCRIPT_DIR/overlays/btrfs-tools/systemd/"* "$MNT_ROOT/usr/lib/systemd/system/"
+        install -m 644 "$SCRIPT_DIR/overlays/btrfs-tools/apt/80-flipper-apt-backup" \
+            "$MNT_ROOT/etc/apt/apt.conf.d/80-flipper-apt-backup"
+        if [[ -f "$MNT_ROOT/usr/lib/systemd/system/flipper-bless-boot.service" ]]; then
+            ln -sfn /usr/lib/systemd/system/flipper-bless-boot.service \
+                "$MNT_ROOT/etc/systemd/system/multi-user.target.wants/flipper-bless-boot.service"
+        fi
+    fi
+
+    # Install czctl.service (with Alias=flipctl.service) and activate DEFAULT_UI
+    install -m 644 "$SCRIPT_DIR/overlays/systemd/czctl.service" "$MNT_ROOT/etc/systemd/system/czctl.service"
+    ln -sfn /etc/systemd/system/czctl.service "$MNT_ROOT/etc/systemd/system/flipctl.service"
+    if [[ "$DEFAULT_UI" == "czctl" ]]; then
+        rm -f "$MNT_ROOT/home/kali/.config/systemd/user/default.target.wants/APPLaunch.service" \
+              "$MNT_ROOT/etc/systemd/user/default.target.wants/APPLaunch.service"
+        ln -sfn /etc/systemd/system/czctl.service "$MNT_ROOT/etc/systemd/system/multi-user.target.wants/czctl.service"
+        ln -sfn /etc/systemd/system/czctl.service "$MNT_ROOT/etc/systemd/system/graphical.target.wants/czctl.service"
+    else
+        rm -f "$MNT_ROOT/etc/systemd/system/multi-user.target.wants/czctl.service" \
+              "$MNT_ROOT/etc/systemd/system/graphical.target.wants/czctl.service"
+    fi
 
     # Install Kali monstart / monstop wireless monitor mode helpers (auto-selects external USB Wi-Fi if present)
     cat > "$MNT_ROOT/usr/local/bin/monstart" <<'EOF'
@@ -1091,11 +1355,11 @@ iw dev
 EOF
     chmod 755 "$MNT_ROOT/usr/local/bin/monstart" "$MNT_ROOT/usr/local/bin/monstop"
 
-    # Generate icons, .desktop files, preinstalled-desktop-apps.tsv, config.json & carousel sort order
+    # Generate icons, .desktop files (incl. kali-czctl.desktop), preinstalled-desktop-apps.tsv, config.json & carousel sort order
     python3 "$SCRIPT_DIR/scripts/configure-kali-launcher.py" "$MNT_ROOT"
     chown -R 1000:1000 "$MNT_ROOT/home/kali/.config"
 
-    ok "320x170 LCD utilities & APPLaunch configuration installed"
+    ok "czctl shell, 12 Wayland apps, USB OTG Arsenal, C utilities & APPLaunch installed"
 }
 
 # ─── Stage 09: Boot Partition Configuration (config.txt, cmdline.txt, splash) ─
@@ -1189,18 +1453,30 @@ EOF
     local root_puuid
     root_puuid="$(blkid -s PARTUUID -o value "${LOOP_DEV}p2")"
     # Important:
-    # - NO console=serial0,115200: keeps /dev/ttyS0 free for the LoRa+GNSS Cap
-    # - fbcon=map:99: keeps kernel fbcon off /dev/fb_lcd so APPLaunch owns LCD cleanly
-    cat > "$MNT_BOOT/cmdline.txt" <<EOF
+    # - NO console=serial0,115200 / console=ttyS0: keeps /dev/ttyS0 free for the LoRa+GNSS Cap
+    # - fbcon=map:99: keeps kernel fbcon off /dev/fb_lcd so czctl / APPLaunch owns LCD cleanly
+    if [[ "$ROOT_FS" == "btrfs" ]]; then
+        local base_cmdline="console=tty1 root=PARTUUID=${root_puuid} rootfstype=btrfs rw rootwait quiet splash plymouth.ignore-serial-consoles fbcon=map:99 consoleblank=0 modules-load=dwc2 cfg80211.ieee80211_regdom=${WIFI_REGDOM}"
+        echo "${base_cmdline} rootflags=subvol=@Kali,compress=zstd:3,noatime" > "$MNT_BOOT/cmdline.txt"
+        install -d -m 755 "$MNT_ROOT/etc/kernel"
+        echo "$base_cmdline" > "$MNT_ROOT/etc/kernel/cmdline"
+        cat > "$MNT_ROOT/etc/kernel/flipper-profiles" <<'PROFILES'
+kali   |Kali Arsenal  |rootflags=subvol=@Kali,compress=zstd:3,noatime   | | |Primary Kali Cyberdeck + Wayland Apps + HDMI
+router |Wi-Fi Router  |rootflags=subvol=@Router,compress=zstd:3,noatime | | |2.4 GHz AP + USB0 LAN Bridge (192.168.50.1) + WAN NAT
+minimal|Kali Minimal  |rootflags=subvol=@Minimal,compress=zstd:3,noatime| | |Lean Low-RAM Field Deck (Desktop/BT off)
+PROFILES
+    else
+        cat > "$MNT_BOOT/cmdline.txt" <<EOF
 console=tty1 root=PARTUUID=${root_puuid} rootfstype=ext4 fsck.repair=yes rootwait quiet fbcon=map:99 consoleblank=0 modules-load=dwc2 cfg80211.ieee80211_regdom=${WIFI_REGDOM}
 EOF
+    fi
 
     for f in config.txt cmdline.txt; do
         printf "DO NOT EDIT THIS FILE\n\nThe active boot configuration is at /boot/firmware/%s\n" "$f" \
             > "$MNT_ROOT/boot/$f"
     done
 
-    ok "Boot partition configured (ROOT PARTUUID=$root_puuid)"
+    ok "Boot partition configured (ROOT PARTUUID=$root_puuid, ROOT_FS=$ROOT_FS)"
 }
 
 # ─── Stage 10: Hardware, Audio, Display, Low-RAM & System Configs ────────────
@@ -1501,6 +1777,68 @@ Storage=persistent
 SystemMaxUse=50M
 EOF
 
+    # 10. Firmware sync hooks (and optional Btrfs initramfs8 profile recovery selector)
+    install -d -m 755 "$MNT_ROOT/etc/kernel/postinst.d" \
+                      "$MNT_ROOT/etc/initramfs/post-update.d"
+
+    cat > "$MNT_ROOT/etc/kernel/postinst.d/zz-cz-firmware-sync" <<'KSYNC'
+#!/bin/sh
+set -e
+ver="${1:-}"
+img="${2:-}"
+[ -n "$ver" ] || exit 0
+if [ -n "$img" ] && [ -f "$img" ] && [ "$img" != "/boot/vmlinuz-$ver" ]; then
+    cmp -s "$img" "/boot/vmlinuz-$ver" 2>/dev/null || cp -f "$img" "/boot/vmlinuz-$ver"
+fi
+if [ -f "/boot/vmlinuz-$ver" ] && [ -f /boot/firmware/config.txt ] && [ -w /boot/firmware ]; then
+    cmp -s "/boot/vmlinuz-$ver" /boot/firmware/kernel8.img 2>/dev/null || cp -f "/boot/vmlinuz-$ver" /boot/firmware/kernel8.img
+fi
+exit 0
+KSYNC
+    chmod 755 "$MNT_ROOT/etc/kernel/postinst.d/zz-cz-firmware-sync"
+
+    cat > "$MNT_ROOT/etc/initramfs/post-update.d/zz-cz-firmware-sync" <<'ISYNC'
+#!/bin/sh
+set -e
+ver="${1:-}"
+initrd="${2:-/boot/initrd.img-$ver}"
+[ -n "$initrd" ] && [ -f "$initrd" ] || exit 0
+if [ -f /boot/firmware/config.txt ] && [ -w /boot/firmware ]; then
+    cmp -s "$initrd" /boot/firmware/initramfs8 2>/dev/null || cp -f "$initrd" /boot/firmware/initramfs8
+fi
+exit 0
+ISYNC
+    chmod 755 "$MNT_ROOT/etc/initramfs/post-update.d/zz-cz-firmware-sync"
+
+    if [[ "$ROOT_FS" == "btrfs" ]]; then
+        install -d -m 755 "$MNT_ROOT/etc/initramfs-tools/hooks" \
+                          "$MNT_ROOT/etc/initramfs-tools/scripts/local-top"
+        install -m 755 "$SCRIPT_DIR/overlays/initramfs/hook-flipper-boot-menu" \
+            "$MNT_ROOT/etc/initramfs-tools/hooks/flipper-boot-menu"
+        install -m 755 "$SCRIPT_DIR/overlays/initramfs/local-top-flipper-boot-menu" \
+            "$MNT_ROOT/etc/initramfs-tools/scripts/local-top/flipper-boot-menu"
+
+        for mod in \
+            btrfs crc32c_generic xxhash_generic zstd_compress xor raid6_pq \
+            spi_bcm2835 i2c_bcm2835 i2c_mux i2c_mux_pinctrl regmap_i2c \
+            gpio_forwarder m5ioe1 pwm_bl_m5stack \
+            drm_mipi_dbi panel_mipi_dbi_m \
+            tca8418_keypad_m5stack matrix_keymap
+        do
+            grep -qx "$mod" "$MNT_ROOT/etc/initramfs-tools/modules" 2>/dev/null \
+                || echo "$mod" >> "$MNT_ROOT/etc/initramfs-tools/modules"
+        done
+
+        run_chroot <<'CHROOT'
+set -e
+if [ ! -f "/boot/vmlinuz-$KVER" ] && [ -f /boot/firmware/kernel8.img ]; then
+    cp -f /boot/firmware/kernel8.img "/boot/vmlinuz-$KVER"
+fi
+update-initramfs -u -k "$KVER" || update-initramfs -c -k "$KVER"
+cp -f "/boot/initrd.img-$KVER" /boot/firmware/initramfs8
+CHROOT
+    fi
+
     ok "All hardware, audio, display, low-RAM & peripheral configs staged"
 }
 
@@ -1529,7 +1867,7 @@ ff02::1		ip6-allnodes
 ff02::2		ip6-allrouters
 EOF
 
-    # First-boot SD card root partition & ext4 online expansion
+    # First-boot SD card root partition & Btrfs/ext4 online expansion
     install -d -m 755 "$MNT_ROOT/usr/local/sbin" "$MNT_ROOT/etc/systemd/system/multi-user.target.wants"
     cat > "$MNT_ROOT/usr/local/sbin/cz-firstboot-resize.sh" <<'EOF'
 #!/bin/sh
@@ -1537,11 +1875,18 @@ set -e
 SENTINEL=/var/lib/cz-kali/.resized
 [ -e "$SENTINEL" ] && exit 0
 SRC=$(findmnt -no SOURCE /)
-DISK=$(lsblk -no PKNAME "$SRC" 2>/dev/null)
-PART=$(printf '%s' "$SRC" | grep -oE '[0-9]+$')
+DEV=${SRC%%\[*}
+FSTYPE=$(findmnt -no FSTYPE / 2>/dev/null || true)
+DISK=$(lsblk -no PKNAME "$DEV" 2>/dev/null || true)
+PART=$(printf '%s' "$DEV" | grep -oE '[0-9]+$' || true)
 if [ -n "$DISK" ] && [ -n "$PART" ]; then
     growpart "/dev/$DISK" "$PART" || true
-    resize2fs "$SRC" || true
+    partprobe "/dev/$DISK" 2>/dev/null || true
+    if [ "$FSTYPE" = "btrfs" ]; then
+        btrfs filesystem resize max / || true
+    else
+        resize2fs "$DEV" || true
+    fi
 fi
 mkdir -p "$(dirname "$SENTINEL")"
 : > "$SENTINEL"
@@ -1594,7 +1939,125 @@ EOF
               "$MNT_ROOT/run" "$MNT_ROOT/home"
     chmod 1777 "$MNT_ROOT/tmp"
 
-    ok "First-boot services, NetworkManager & hostname configured"
+    if [[ "$ROOT_FS" == "btrfs" ]]; then
+        log "Snapshotting Btrfs @Kali -> @Router, @Minimal, @stock-snapshots/* & BLS entries"
+        chroot_down
+
+        # Clean @Kali before snapshotting so @Router, @Minimal & stock snapshots carry zero build residue
+        cat > "$MNT_ROOT/etc/apt/sources.list" <<'EOF'
+deb http://http.kali.org/kali kali-rolling main contrib non-free non-free-firmware
+EOF
+        rm -rf "$MNT_ROOT/var/lib/apt/lists/"* \
+               "$MNT_ROOT/var/cache/apt/archives/"*.deb \
+               "$MNT_ROOT/var/cache/cz-build" \
+               "$MNT_ROOT/etc/ssh/"ssh_host_*_key* \
+               "$MNT_ROOT/root/.bash_history" \
+               "$MNT_ROOT/var/lib/dbus/machine-id"
+        rm -f "$MNT_ROOT/etc/resolv.conf"
+        echo "nameserver 1.1.1.1" > "$MNT_ROOT/etc/resolv.conf"
+        echo "uninitialized" > "$MNT_ROOT/etc/machine-id"
+
+        if ! grep -q '^BUILD_ID=' "$MNT_ROOT/etc/os-release"; then
+            echo "BUILD_ID=${BUILD_ID}" >> "$MNT_ROOT/etc/os-release"
+        fi
+        install -d -m 755 "$MNT_ROOT/etc/kernel"
+        printf 'origin_stock_name=%s\n' "@Kali_${BUILD_ID}_stock" > "$MNT_ROOT/etc/profile_origin"
+        printf '%s\n' "900-flipperos-Kali" > "$MNT_ROOT/etc/kernel/entry-token"
+        btrfs filesystem sync "$MNT_ROOT"
+
+        mkdir -p "$MNT_TOP"
+        mount -t btrfs -o "subvolid=5,$BTRFS_BUILD_OPTS" "${LOOP_DEV}p2" "$MNT_TOP"
+
+        # Remove any stale derived subvolumes if re-running stage_tweaks
+        local stale_sv
+        for stale_sv in \
+            "$MNT_TOP/@Router" \
+            "$MNT_TOP/@Minimal" \
+            "$MNT_TOP/@stock-snapshots/@Kali_${BUILD_ID}_stock" \
+            "$MNT_TOP/@stock-snapshots/@Router_${BUILD_ID}_stock" \
+            "$MNT_TOP/@stock-snapshots/@Minimal_${BUILD_ID}_stock"
+        do
+            if [[ -d "$stale_sv" ]]; then
+                btrfs property set "$stale_sv" ro false 2>/dev/null || true
+                btrfs subvolume delete "$stale_sv" >/dev/null
+            fi
+        done
+
+        # 1. Read-only stock snapshot of @Kali
+        btrfs subvolume snapshot -r "$MNT_TOP/@Kali" "$MNT_TOP/@stock-snapshots/@Kali_${BUILD_ID}_stock" >/dev/null
+
+        # 2. @Router profile (br-lan 192.168.50.1/24 + wlan0 2.4 GHz AP + usb0 slave + eth0 WAN NAT)
+        btrfs subvolume snapshot "$MNT_TOP/@Kali" "$MNT_TOP/@Router" >/dev/null
+        cp -a "$SCRIPT_DIR/overlays/profile-router/"* "$MNT_TOP/@Router/"
+        chmod 600 "$MNT_TOP/@Router/etc/NetworkManager/system-connections/"*.nmconnection
+        install -d -m 755 "$MNT_TOP/@Router/etc/systemd/system/multi-user.target.wants"
+        local rsvc
+        for rsvc in cz-router-usb.service router-lan-bridge.service router-ap-2g.service router-lan-usb0.service; do
+            ln -sfn "/etc/systemd/system/$rsvc" "$MNT_TOP/@Router/etc/systemd/system/multi-user.target.wants/$rsvc"
+        done
+        sed -i 's/^HDMI_DESKTOP_MODE=.*/HDMI_DESKTOP_MODE=off/' "$MNT_TOP/@Router/etc/default/cz-hdmi-desktop"
+        printf 'origin_stock_name=%s\n' "@Router_${BUILD_ID}_stock" > "$MNT_TOP/@Router/etc/profile_origin"
+        printf '%s\n' "800-flipperos-Router" > "$MNT_TOP/@Router/etc/kernel/entry-token"
+        btrfs subvolume snapshot -r "$MNT_TOP/@Router" "$MNT_TOP/@stock-snapshots/@Router_${BUILD_ID}_stock" >/dev/null
+
+        # 3. @Minimal profile (HDMI desktop off, LightDM/Bluetooth/ModemManager masked)
+        btrfs subvolume snapshot "$MNT_TOP/@Kali" "$MNT_TOP/@Minimal" >/dev/null
+        sed -i 's/^HDMI_DESKTOP_MODE=.*/HDMI_DESKTOP_MODE=off/' "$MNT_TOP/@Minimal/etc/default/cz-hdmi-desktop"
+        local heavy_svc
+        for heavy_svc in lightdm.service bluetooth.service ModemManager.service; do
+            rm -f "$MNT_TOP/@Minimal/etc/systemd/system/multi-user.target.wants/$heavy_svc" \
+                  "$MNT_TOP/@Minimal/etc/systemd/system/graphical.target.wants/$heavy_svc"
+            ln -sfn /dev/null "$MNT_TOP/@Minimal/etc/systemd/system/$heavy_svc"
+        done
+        printf 'origin_stock_name=%s\n' "@Minimal_${BUILD_ID}_stock" > "$MNT_TOP/@Minimal/etc/profile_origin"
+        printf '%s\n' "700-flipperos-Minimal" > "$MNT_TOP/@Minimal/etc/kernel/entry-token"
+        btrfs subvolume snapshot -r "$MNT_TOP/@Minimal" "$MNT_TOP/@stock-snapshots/@Minimal_${BUILD_ID}_stock" >/dev/null
+
+        # 4. Seed BLS entries in shared boot/loader/entries/
+        local os_key kver_id entries_dir root_puuid base_cmdline
+        os_key="$(. "$MNT_TOP/@Kali/etc/os-release"; printf '%s' "${IMAGE_ID:-$ID}")"
+        kver_id="${KVER//+/_}"
+        entries_dir="$MNT_TOP/boot/loader/entries"
+        root_puuid="$(blkid -s PARTUUID -o value "${LOOP_DEV}p2")"
+        base_cmdline="console=tty1 root=PARTUUID=${root_puuid} rootfstype=btrfs rw rootwait quiet splash plymouth.ignore-serial-consoles fbcon=map:99 consoleblank=0 modules-load=dwc2 cfg80211.ieee80211_regdom=${WIFI_REGDOM}"
+        install -d -m 755 "$entries_dir"
+        rm -f "$entries_dir/"*-flipperos-*.conf
+
+        cat > "$entries_dir/900-flipperos-Kali-${kver_id}.conf" <<BLS_KALI
+# Boot Loader Specification type#1 entry (Kali Cyberdeck CardputerZero)
+title      Kali Arsenal ${KVER}
+version    ${KVER}
+sort-key   ${os_key}-0100-Kali-0
+options    ${base_cmdline} rootflags=subvol=@Kali,compress=zstd:3,noatime
+linux      /boot/vmlinuz-${KVER}
+initrd     /boot/initrd.img-${KVER}
+BLS_KALI
+
+        cat > "$entries_dir/800-flipperos-Router-${kver_id}.conf" <<BLS_ROUTER
+# Boot Loader Specification type#1 entry (Kali Cyberdeck CardputerZero)
+title      Wi-Fi Router ${KVER}
+version    ${KVER}
+sort-key   ${os_key}-1200-Router-0
+options    ${base_cmdline} rootflags=subvol=@Router,compress=zstd:3,noatime
+linux      /boot/vmlinuz-${KVER}
+initrd     /boot/initrd.img-${KVER}
+BLS_ROUTER
+
+        cat > "$entries_dir/700-flipperos-Minimal-${kver_id}.conf" <<BLS_MIN
+# Boot Loader Specification type#1 entry (Kali Cyberdeck CardputerZero)
+title      Kali Minimal ${KVER}
+version    ${KVER}
+sort-key   ${os_key}-1300-Minimal-0
+options    ${base_cmdline} rootflags=subvol=@Minimal,compress=zstd:3,noatime
+linux      /boot/vmlinuz-${KVER}
+initrd     /boot/initrd.img-${KVER}
+BLS_MIN
+
+        btrfs filesystem sync "$MNT_TOP"
+        umount "$MNT_TOP"
+    fi
+
+    ok "First-boot services, NetworkManager, hostname & OS profiles configured"
 }
 
 # ─── Stage 12: Comprehensive Automated Hardware & System Verification ────────
@@ -1624,7 +2087,7 @@ if [ -x /usr/share/APPLaunch/bin/M5CardputerZero-AppStore ]; then
         echo "LDD_FAIL:M5CardputerZero-AppStore"
     fi
 fi
-# 3. Check framebuffer shim + all 6 native 320x170 Kali C binaries
+# 3. Check framebuffer shim + all 6 native 320x170 Kali C binaries + 9 Cortex-A53 shell/app binaries
 if ldd /usr/lib/cz-kali/libcz_fb_lcd.so | grep -q 'not found'; then
     echo "LDD_FAIL:libcz_fb_lcd.so"
 fi
@@ -1638,6 +2101,15 @@ for app in cz-sysmon cz-term80 cz-wifiscan cz-lanscan cz-pktsniff cz-usbgadget; 
     fi
     rm -f /tmp/cz_verify.ppm
 done
+for sb in czctl kali-usb-deck flipctl-sysmon cz-term \
+          flipctl-recorder flipctl-radio flipctl-disk-bench flipctl-bt-hid; do
+    if ldd "/usr/bin/$sb" | grep -q 'not found'; then
+        echo "LDD_FAIL:$sb"
+    fi
+done
+if [ "$ROOT_FS" = "btrfs" ] && ldd /usr/bin/cz-boot-menu | grep -q 'not found'; then
+    echo "LDD_FAIL:cz-boot-menu"
+fi
 echo "LCD_REDIRECT_OK" > /tmp/cz_fake_lcd
 redir_out=$(CZ_FORCE_FB_LCD=1 CZ_FB_TARGET=/tmp/cz_fake_lcd LD_PRELOAD=/usr/lib/cz-kali/libcz_fb_lcd.so \
     python3 -c 'import os, subprocess; fd=os.open("/dev/fb0", os.O_RDWR); d=os.read(fd, 32).decode().strip(); os.close(fd); c=subprocess.check_output(["/bin/sh","-c","printf %s \"${LD_PRELOAD:-CLEAN}\""]).decode(); print(f"{d}:{c}")')
@@ -1762,17 +2234,79 @@ CHROOT
     vcheck "[[ -x '$MNT_ROOT/usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch' && -f '$MNT_ROOT/usr/lib/cz-kali/M5CardputerZero-APPLaunch.m5' ]] && ! cmp -s '$MNT_ROOT/usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch' '$MNT_ROOT/usr/lib/cz-kali/M5CardputerZero-APPLaunch.m5'" "APPLaunch missing or sort/power patch not applied"
     vcheck "[[ -f '$MNT_ROOT/usr/lib/cz-kali/libcz_fb_lcd.so' ]]" "Missing libcz_fb_lcd.so"
     vcheck "grep -q 'LV_LINUX_FBDEV_DEVICE=/dev/fb_lcd' '$MNT_ROOT/etc/systemd/user/APPLaunch.service.d/wait-for-udev.conf' && grep -q 'stop fb_load.service' '$MNT_ROOT/etc/systemd/user/APPLaunch.service.d/wait-for-udev.conf'" "APPLaunch drop-in missing LV_LINUX_FBDEV_DEVICE or fb_load stop"
-    vcheck "[[ -x '$MNT_ROOT/usr/bin/camera_app' ]] && grep -q '$RPI_LIBCAMERA_DIR' '$MNT_ROOT/usr/bin/camera_app'" "Camera wrapper invalid"
+    vcheck "[[ -x '$MNT_ROOT/usr/bin/camera_app' ]] && grep -q '$RPI_LIBCAMERA_DIR' '$MNT_ROOT/usr/bin/camera_app' && grep -q 'CAMERA_APP_FB_DEVICE' '$MNT_ROOT/usr/bin/camera_app' && grep -q 'CAMERA_APP_KEYBOARD_GRAB' '$MNT_ROOT/usr/bin/camera_app'" "Camera wrapper missing libcamera path or fb_lcd/grab vars"
+    local cam_needed ipa_needed
+    cam_needed="$(readelf -d "$MNT_ROOT/usr/lib/cz-kali/camera_app.real" 2>/dev/null | grep -oE 'libcamera\.so\.[0-9]+\.[0-9]+' | head -n1 || true)"
+    ipa_needed="$(readelf -d "$MNT_ROOT$RPI_LIBCAMERA_DIR/usr/lib/aarch64-linux-gnu/libcamera/ipa/ipa_rpi_vc4.so" 2>/dev/null | grep -oE 'libcamera\.so\.[0-9]+\.[0-9]+' | head -n1 || true)"
+    vcheck "[[ -n '$cam_needed' && '$cam_needed' == '$ipa_needed' ]]" "Camera IPA SONAME mismatch (camera_app.real=$cam_needed vs ipa_rpi_vc4.so=$ipa_needed)"
+
+    # Cortex-A53 czctl shell, ARMv8.0 binaries (unguarded LSE gate), 12 Wayland apps & :8899 Web KVM
+    local objdump_bin="objdump"
+    [[ "$HOST_ARCH" != "aarch64" ]] && objdump_bin="aarch64-linux-gnu-objdump"
+    local verify_bins=(czctl kali-usb-deck flipctl-sysmon cz-term
+                       flipctl-recorder flipctl-radio flipctl-disk-bench flipctl-bt-hid)
+    [[ "$ROOT_FS" == "btrfs" ]] && verify_bins+=(cz-boot-menu)
+    for sb in "${verify_bins[@]}"; do
+        vcheck "[[ -x '$MNT_ROOT/usr/bin/$sb' ]]" "Missing Cortex-A53 binary: /usr/bin/$sb"
+        local bad_lse=""
+        if [[ -x "$MNT_ROOT/usr/bin/$sb" ]]; then
+            bad_lse="$("$objdump_bin" -d "$MNT_ROOT/usr/bin/$sb" | awk '
+                {
+                    if ($3 ~ /^(ldadd|ldclr|ldeor|ldset|swp|cas)[a-z]*$/ && prev !~ /cbz[[:space:]]+w16,/) {
+                        print $0
+                    }
+                    prev = $0
+                }
+            ' | head -n 3)"
+        fi
+        vcheck "[[ -z '$bad_lse' ]]" "Unguarded ARMv8.1+ LSE atomic instruction in /usr/bin/$sb"
+    done
+    vcheck "[[ -L '$MNT_ROOT/usr/bin/flipctl' && -L '$MNT_ROOT/usr/bin/cz-flipper-term' && -L '$MNT_ROOT/usr/share/flipctl' ]]" "Missing compatibility symlinks for czctl/cz-term"
+    [[ "$ROOT_FS" == "btrfs" ]] && vcheck "[[ -L '$MNT_ROOT/usr/bin/flipper-boot-menu' ]] && dpkg_installed btrfs-progs" "Missing flipper-boot-menu symlink or btrfs-progs"
+    for fap in bt-arsenal.fap.sh bt-hid-remote.fap.sh disk-benchmark.fap.sh internet-radio.fap.sh \
+               ir-arsenal.fap.sh lan-scan.fap.sh net-matrix.fap.sh pkt-sniff.fap.sh \
+               sysmon.fap.sh usb-arsenal.fap.sh voice-recorder.fap.sh wifi-recon.fap.sh; do
+        vcheck "[[ -x '$MNT_ROOT/usr/share/czctl/apps/$fap' ]]" "Missing Wayland app bundle: /usr/share/czctl/apps/$fap"
+    done
+    for asset in page.html apps.html compare.html remote.js; do
+        vcheck "[[ -f '$MNT_ROOT/usr/share/czctl/assets/remote/$asset' ]]" "Missing :8899 Web KVM asset: $asset"
+    done
+    vcheck "[[ -f '$MNT_ROOT/home/kali/ir/tv-universal.ir' && -f '$MNT_ROOT/etc/umtprd/umtprd.conf' ]]" "Missing tv-universal.ir or /etc/umtprd/umtprd.conf"
+    vcheck "[[ -f '$MNT_ROOT/etc/systemd/system/czctl.service' && -f '$MNT_ROOT/etc/udev/rules.d/72-seat-cardputer-czctl.rules' ]]" "Missing czctl.service or 72-seat-cardputer-czctl.rules"
+    vcheck "grep -qx 'uinput' '$MNT_ROOT/etc/modules-load.d/cardputerzero.conf' && grep -q 'KERNEL==\"uinput\"' '$MNT_ROOT/etc/udev/rules.d/70-cardputerzero-peripherals.rules'" "Missing uinput autoload or udev rule"
+    vcheck "dpkg_installed sway && dpkg_installed umtp-responder && dpkg_installed fuse3 && dpkg_installed iperf3 && dpkg_installed zstd" "Missing sway/umtp-responder/fuse3/iperf3/zstd"
     vcheck "dpkg_installed python3-requests && dpkg_installed kali-tweaks" "Missing python3-requests or kali-tweaks"
-    for kbin in cz-sysmon cz-term80 cz-wifiscan cz-lanscan cz-pktsniff cz-usbgadget cz-kali-menu cz-kali-pkgs cz-usb-gadget cz-hw-status cz-hdmi-hotplug monstart monstop; do
+    for kbin in cz-sysmon cz-term cz-term80 cz-wifiscan cz-lanscan cz-pktsniff cz-usbgadget cz-kali-menu cz-kali-pkgs cz-usb-gadget cz-flipper-gadget cz-badusb cz-ui-mode cz-hw-status cz-hdmi-hotplug monstart monstop; do
         vcheck "[[ -x '$MNT_ROOT/usr/local/bin/$kbin' ]]" "Missing helper binary/script: /usr/local/bin/$kbin"
     done
-    for kdt in kali-wifi.desktop kali-term80.desktop kali-zsh.desktop kali-menu.desktop kali-btop.desktop kali-lanscan.desktop kali-pktsniff.desktop kali-usbgadget.desktop kali-pkgs.desktop; do
+    for kdt in kali-wifi.desktop kali-term80.desktop kali-zsh.desktop kali-menu.desktop kali-btop.desktop kali-lanscan.desktop kali-pktsniff.desktop kali-usbgadget.desktop kali-pkgs.desktop kali-czctl.desktop; do
         vcheck "[[ -f '$MNT_ROOT/usr/share/APPLaunch/applications/$kdt' ]] && grep -q '^${kdt}	' '$MNT_ROOT/usr/share/APPLaunch/preinstalled-desktop-apps.tsv'" "Launcher app missing or not registered in preinstalled-desktop-apps.tsv: $kdt"
     done
     for enabled_key in app_desktop_kali_wifi_desktop_84940702 app_desktop_kali_term80_desktop_127bc199 app_desktop_kali_zsh_desktop_0f623300 app_desktop_kali_menu_desktop_6439a2fc app_desktop_kali_btop_desktop_1e5276de app_desktop_kali_lanscan_desktop_e2c9f473 app_desktop_kali_pktsniff_desktop_2c852172 app_desktop_kali_usbgadget_desktop_1923607b app_desktop_kali_pkgs_desktop_cce61bf0; do
         vcheck "grep -q '\"$enabled_key\": 1' '$MNT_ROOT/home/kali/.config/cardputerzero/config.json'" "App toggle missing in config.json: $enabled_key"
     done
+    vcheck "grep -qE '\"app_desktop_kali_czctl_desktop_[0-9a-f]{8}\": 1' '$MNT_ROOT/home/kali/.config/cardputerzero/config.json'" "kali-czctl.desktop toggle missing in config.json"
+
+    if [[ "$ROOT_FS" == "btrfs" ]]; then
+        local sv_list initrd_list
+        sv_list="$(btrfs subvolume list "$MNT_ROOT" | awk '{print $NF}')"
+        for req_sv in @Kali @Router @Minimal boot @home @var-log @var-cache @snapshots @swap \
+                      "@stock-snapshots/@Kali_${BUILD_ID}_stock" \
+                      "@stock-snapshots/@Router_${BUILD_ID}_stock" \
+                      "@stock-snapshots/@Minimal_${BUILD_ID}_stock"; do
+            vcheck "grep -qxF '$req_sv' <<< '$sv_list'" "Missing Btrfs subvolume: $req_sv"
+        done
+        local bls_count=0
+        for bls_f in "$MNT_ROOT/boot/loader/entries/"*-flipperos-*.conf; do
+            [[ -f "$bls_f" ]] || continue
+            bls_count=$((bls_count + 1))
+            vcheck "grep -qw 'fbcon=map:99' '$bls_f' && ! grep -qE 'console=(serial0|ttyS0)' '$bls_f'" "BLS entry $bls_f missing fbcon=map:99 or claims serial0/ttyS0"
+        done
+        vcheck "(( bls_count >= 3 ))" "Expected >= 3 BLS entries in /boot/loader/entries, found $bls_count"
+        initrd_list="$(lsinitramfs "$MNT_BOOT/initramfs8" 2>/dev/null || true)"
+        vcheck "grep -qE '(^|/)usr/bin/cz-boot-menu$' <<< '$initrd_list' && grep -qE '(^|/)usr/bin/flipper-boot-menu$' <<< '$initrd_list'" "initramfs8 missing cz-boot-menu / flipper-boot-menu"
+        vcheck "grep -q 'btrfs\.ko' <<< '$initrd_list' && grep -q 'scripts/local-top/flipper-boot-menu' <<< '$initrd_list'" "initramfs8 missing btrfs.ko or local-top/flipper-boot-menu"
+    fi
     vcheck "[[ \"\$(stat -c '%u:%g' '$MNT_ROOT/home/kali/.config/cardputerzero/config.json')\" == '1000:1000' ]]" "config.json not owned by 1000:1000 (kali:kali)"
     vcheck "! dpkg_installed m5cardputerzero-piano && ! dpkg_installed m5cardputerzero-music && ! dpkg_installed m5cardputerzero-keyboard-guide" "Excluded demo packages still installed"
     for removed_dt in zclaw.desktop piano.desktop music.desktop keyboard-guide.desktop; do
@@ -1830,21 +2364,25 @@ EOF
     echo "nameserver 1.1.1.1" > "$MNT_ROOT/etc/resolv.conf"
     echo "uninitialized" > "$MNT_ROOT/etc/machine-id"
 
-    # Zero free blocks inside mounted filesystems for optimal xz compression
+    # Zero free blocks inside FAT32 boot filesystem for optimal xz compression
     dd if=/dev/zero of="$MNT_BOOT/.zero" bs=1M 2>/dev/null || true
     rm -f "$MNT_BOOT/.zero"
 
     sync
     local root_part="${LOOP_DEV}p2"
-    umount "$MNT_BOOT"
-    umount "$MNT_ROOT"
-
-    e2fsck -f -y "$root_part" || true
-    if command -v zerofree >/dev/null 2>&1; then
-        zerofree "$root_part" || true
+    if [[ "$ROOT_FS" == "btrfs" ]]; then
+        btrfs filesystem sync "$MNT_ROOT"
+        unmount_image
+    else
+        umount "$MNT_BOOT"
+        umount "$MNT_ROOT"
+        e2fsck -f -y "$root_part" || true
+        if command -v zerofree >/dev/null 2>&1; then
+            zerofree "$root_part" || true
+        fi
+        unmount_image
     fi
-    unmount_image
-    ok "Image finalized & cleanly unmounted: $OUT_IMG"
+    ok "Image finalized ($ROOT_FS) & cleanly unmounted: $OUT_IMG"
 }
 
 stage_compress() {
@@ -1893,9 +2431,15 @@ stage_deploy_ssh() {
     [[ -b "$p2" ]] || p2="${dev}p2"
     local mnt
     mnt="$(mktemp -d)"
-    mount "$p2" "$mnt"
-    install -d -m 700 -o 1000 -g 1000 "$mnt/home/kali/.ssh"
-    install -m 600 -o 1000 -g 1000 "$pub" "$mnt/home/kali/.ssh/authorized_keys"
+    if [[ "$(blkid -s TYPE -o value "$p2" 2>/dev/null || true)" == "btrfs" ]]; then
+        mount -t btrfs -o subvol=@home "$p2" "$mnt"
+        install -d -m 700 -o 1000 -g 1000 "$mnt/kali/.ssh"
+        install -m 600 -o 1000 -g 1000 "$pub" "$mnt/kali/.ssh/authorized_keys"
+    else
+        mount "$p2" "$mnt"
+        install -d -m 700 -o 1000 -g 1000 "$mnt/home/kali/.ssh"
+        install -m 600 -o 1000 -g 1000 "$pub" "$mnt/home/kali/.ssh/authorized_keys"
+    fi
     sync
     umount "$mnt"
     rmdir "$mnt"

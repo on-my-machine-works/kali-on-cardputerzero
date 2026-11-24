@@ -68,12 +68,14 @@ jobs:
         run: |
           sudo apt-get update -qq
           pkgs=(
-            parted dosfstools e2fsprogs util-linux rsync xz-utils zstd binutils
+            parted dosfstools e2fsprogs btrfs-progs util-linux rsync xz-utils zstd binutils
             dpkg curl git gnupg kmod ca-certificates device-tree-compiler python3
-            mmdebstrap debootstrap zerofree
+            mmdebstrap debootstrap zerofree build-essential pkg-config
+            libudev-dev libdrm-dev libgbm-dev libwayland-dev libxkbcommon-dev
+            libfontconfig1-dev libpulse-dev libmp3lame-dev libogg-dev libvorbis-dev
           )
           if [[ "$(uname -m)" != "aarch64" ]]; then
-            pkgs+=(qemu-user-static binfmt-support arch-test)
+            pkgs+=(qemu-user-static binfmt-support arch-test gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu)
           fi
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${pkgs[@]}"
           sudo modprobe loop || true
@@ -81,6 +83,20 @@ jobs:
             sudo systemctl restart systemd-binfmt || sudo update-binfmts --enable qemu-aarch64 || true
             arch-test arm64
           fi
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add aarch64 Rust target when cross-compiling
+        if: runner.arch != 'ARM64'
+        run: rustup target add aarch64-unknown-linux-gnu
+
+      - name: Verify UI token guardrails, Rust workspace tests & Cortex-A53 shell build
+        run: |
+          sh shell/ci/no-raw-colours.sh
+          CARGO_PROFILE_TEST_DEBUG=0 cargo test --manifest-path shell/Cargo.toml --workspace
+          ./scripts/build-cz-shell.sh
+          rm -rf shell/target
 
       - name: Build, verify, finalize and compress image
         env:
@@ -131,9 +147,9 @@ jobs:
           done
 
           if [[ "$tag" == weekly-* ]]; then
-            rel_title="Kali CardputerZero (${date_slug})"
+            rel_title="Kali Cyberdeck CardputerZero (${date_slug})"
           else
-            rel_title="Kali CardputerZero ${tag}"
+            rel_title="Kali Cyberdeck CardputerZero ${tag}"
           fi
 
           kver="$(python3 -c 'import json; print(json.load(open("upstream.lock.json"))["kernel"]["kver"])')"
@@ -142,13 +158,18 @@ jobs:
           xz_size="$(du -h output/kali-cardputerzero-arm64.img.xz | awk '{print $1}')"
 
           {
-            echo "## Kali Linux (\`arm64\`) for M5Stack CardputerZero (\`${tag}\`)"
+            echo "## Kali Linux Cyberdeck Edition (\`arm64\`) for M5Stack CardputerZero (\`${tag}\`)"
             echo ""
-            echo "Kali Rolling (\`arm64\`) microSD image for M5Stack CardputerZero (\`v5\` / CM0) with Linux \`${kver}\`, M5Stack hardware drivers and overlays, \`APPLaunch\` integration, and \`320x170\` LCD utilities."
+            echo "Kali Rolling (\`arm64\`) microSD image (\`ext4\`) for M5Stack CardputerZero (\`v5\` / CM0) with Linux \`${kver}\`, native \`320x170\` Kali Cyberdeck Shell (\`czctl\`), \`:8899\` Web Remote (KVM), 12 handheld apps, composite USB-C OTG Arsenal, and full M5Stack hardware & \`APPLaunch\` support."
             if [[ -n "${RELEASE_SUMMARY}" ]]; then
               echo ""
-              echo "### Changes"
-              echo "- ${RELEASE_SUMMARY}"
+              summary_expanded="${RELEASE_SUMMARY//\\n/$'\n'}"
+              if [[ "$summary_expanded" == "#"* || "$summary_expanded" == "- "* ]]; then
+                printf '%s\n' "$summary_expanded"
+              else
+                echo "### Changes"
+                echo "- ${summary_expanded}"
+              fi
             fi
             echo ""
             echo "### Checksums (\`SHA-256\`)"
@@ -162,7 +183,7 @@ jobs:
             echo "sha256sum -c kali-cardputerzero-arm64.img.xz.sha256"
             echo "xzcat kali-cardputerzero-arm64.img.xz | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync"
             echo '```'
-            echo "*(Default login: \`kali\` / \`kali\`, see \`README.md\` for LCD, HDMI desktop, USB OTG gadget, and external Wi-Fi usage.)*"
+            echo "*(Default login: \`kali\` / \`kali\`, Web KVM on \`:8899\`; see \`README.md\` for \`czctl\`, USB OTG Arsenal, HDMI desktop, and external Wi-Fi usage.)*"
           } > /tmp/release-notes.md
 
           if [[ -s work/m5-warnings.md ]]; then
