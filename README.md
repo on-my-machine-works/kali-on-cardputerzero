@@ -4,17 +4,19 @@
 [![Image Release](https://github.com/on-my-machine-works/kali-on-cardputerzero/actions/workflows/build.yml/badge.svg)](https://github.com/on-my-machine-works/kali-on-cardputerzero/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Cyberdeck Edition brings together the best of three worlds—**[Kali Linux](https://www.kali.org/)**'s full `arm64` security toolset, the handheld Linux UI foundation pioneered by the **[Flipper One](https://docs.flipper.net/one)** project ([`flipctl-slint`](https://github.com/flipperdevices/flipctl-slint)), and **[M5Stack CardputerZero](https://docs.m5stack.com/en/core/Cardputer-Zero)**'s pocketable hardware (Cardputer Zero, Raspberry Pi Compute Module Zero Lite / `RP3A0`, 512 MB LPDDR2, hardware rev `v5`).
+Cyberdeck Edition brings together the best of three worlds: **[Kali Linux](https://www.kali.org/)**'s full `arm64` security toolset, the handheld Linux UI foundation from **[Flipper One](https://docs.flipper.net/one)** ([`flipctl-slint`](https://github.com/flipperdevices/flipctl-slint)), and **[M5Stack CardputerZero](https://docs.m5stack.com/en/core/Cardputer-Zero)**'s pocketable hardware (Cardputer Zero, Raspberry Pi Compute Module Zero Lite / `RP3A0`, 512 MB LPDDR2, hardware rev `v5`).
 
-Rather than treating the 1.9" SPI screen as a secondary status display, the image boots into a native **`320×170` RGB565 DRM/KMS shell (`czctl`)** built with [Slint](https://github.com/slint-ui/slint), paired with a built-in **`:8899` Browser Web KVM**, **12 hosted Wayland offensive & hardware apps**, a **[ProFont](https://tobiasjung.name/profont/) multi-zoom terminal (`cz-term`)**, and a **composite USB-C OTG Arsenal**—while keeping full M5Stack hardware/Cap support, optional [`APPLaunch`](https://github.com/CardputerZero/launcher) switching, and an on-demand HDMI LXDE desktop within ~118 MiB idle RAM.
+**Why this exists:** While looking forward to Flipper One, pairing its handheld UI ideas with full Kali Linux on the CardputerZero hardware I already carry turned out to be a magical combination, turning three separate ecosystems into one pocket cyberdeck.
+
+Instead of treating the 1.9" SPI screen as a secondary status display, the image boots straight into a native **`320x170` RGB565 DRM/KMS shell (`czctl`)** built with [Slint](https://github.com/slint-ui/slint). It pairs `czctl` with a built-in **`:8899` Browser Web KVM**, **12 hosted Wayland offensive and hardware apps**, a **[ProFont](https://tobiasjung.name/profont/) multi-zoom terminal (`cz-term`)**, and a **composite USB-C OTG Arsenal**, while keeping full M5Stack hardware and Cap support, optional [`APPLaunch`](https://github.com/CardputerZero/launcher) switching, and an on-demand HDMI LXDE desktop within ~118 MiB idle RAM.
 
 ## What Defines Cyberdeck Edition
 
-- **`czctl` `320×170` DRM/KMS Shell**: zero-tearing RGB565 interface in a Kali Dark palette (with runtime theme switching), live battery/thermal/power/IP idle dashboard, `1:1` bezel-aligned softkeys over physical keys `4`–`8`, visual `Tab` App Switcher, `Hold Tab` screen lock (`0 mA` backlight off), and `Hold Esc` hardware rescue.
-- **`:8899` Browser Web KVM**: point any browser at `http://kali-cardputerzero.local:8899/` (or `http://10.55.0.1:8899/` over a single USB-C cable) for a live pixel-exact screen stream, mouse-clickable softkeys, full QWERTY `/dev/uinput` keyboard forwarding, and `/apps` bundle management.
+- **`czctl` `320x170` DRM/KMS Shell**: zero-tearing RGB565 interface in a Kali Dark palette (with runtime theme switching), live battery/thermal/power/IP idle dashboard, `1:1` bezel-aligned softkeys over physical keys `4`-`8`, visual `Tab` App Switcher, `Hold Tab` screen lock (`0 mA` backlight off), and `Hold Esc` hardware rescue.
+- **`:8899` Browser Web KVM**: open `http://kali-cardputerzero.local:8899/` (or `http://10.55.0.1:8899/` over a single USB-C cable) in any browser for a live pixel-exact screen stream, mouse-clickable softkeys, full QWERTY `/dev/uinput` keyboard forwarding, and `/apps` bundle management.
 - **12 Hosted Wayland Apps + `~/Apps` Extensibility**: isolated headless [`sway`](https://github.com/swaywm/sway) micro-compositor hosting `USB Arsenal`, `Wi-Fi Recon`, `Bluetooth & BLE`, `IR Arsenal`, `Net Matrix`, `LAN Recon`, `Packet Capture`, `System Monitor`, `Voice Recorder`, `Internet Radio`, `Disk Benchmark`, and `BT/USB HID Pad`.
-- **Composite USB-C OTG Arsenal**: run non-routing `usb0` Ethernet (`10.55.0.1/24` — never hijacks your laptop's Wi-Fi internet) *simultaneously* alongside DuckyScript BadUSB HID injection (`cz-badusb`), [`uMTP-Responder`](https://github.com/Viveris/uMTP-Responder) (`umtprd`) `/home/kali` file sharing, read-only bootable `.iso` drives, or read-write FAT32 loot `.img` drives.
-- **Full CardputerZero Hardware & Dual-UI Coexistence**: `IMX219` CSI camera (Raspberry Pi [`libcamera`](https://github.com/raspberrypi/libcamera) `0.7` ISP), `ES8389` [PipeWire](https://pipewire.org/) audio, `GPIO12/13` IR TX/RX, `BQ27220` fuel gauge, `RX8130CE` RTC, `BMI270`+`BMM150` IMU, `M5IOE1` 5V Grove/EXT rails, 14-pin `SX1262` LoRa/GNSS & `CC1101`/NFC Caps, plus one-command switching (`cz-ui-mode`) to M5's stock `APPLaunch` carousel or hotplug HDMI LXDE.
+- **Composite USB-C OTG Arsenal**: run non-routing `usb0` Ethernet (`10.55.0.1/24`, keeping your laptop's Wi-Fi internet intact) *simultaneously* alongside DuckyScript BadUSB HID injection (`cz-badusb`), [`uMTP-Responder`](https://github.com/Viveris/uMTP-Responder) (`umtprd`) `/home/kali` file sharing, read-only bootable `.iso` drives, or read-write FAT32 loot `.img` drives.
+- **Full CardputerZero Hardware & Dual-UI Coexistence**: `IMX219` CSI camera (Raspberry Pi [`libcamera`](https://github.com/raspberrypi/libcamera) `0.7` ISP), `ES8389` [PipeWire](https://pipewire.org/) audio, `GPIO12/13` IR TX/RX, `BQ27220` fuel gauge, `RX8130CE` RTC, `BMI270`+`BMM150` IMU, `M5IOE1` 5V Grove/EXT rails, 14-pin `SX1262` LoRa/GNSS and `CC1101`/NFC Caps, plus one-command switching (`cz-ui-mode`) to M5's stock `APPLaunch` carousel or hotplug HDMI LXDE.
 
 ---
 
@@ -31,7 +33,7 @@ Rather than treating the 1.9" SPI screen as a secondary status display, the imag
      xzcat kali-cardputerzero-arm64.img.xz | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync
      sync
      ```
-3. Boot the CardputerZero. On first boot, `cz-firstboot-resize` expands the `ext4` root filesystem online to fill the card and `czctl` starts on the `320×170` LCD and `:8899` Web KVM.
+3. Boot the CardputerZero. On first boot, `cz-firstboot-resize` expands the `ext4` root filesystem online to fill the card and `czctl` starts on the `320x170` LCD and `:8899` Web KVM.
 
 ### Default Access
 
@@ -50,19 +52,19 @@ Rather than treating the 1.9" SPI screen as a secondary status display, the imag
 
 | Keys / Gesture | In `czctl` & Hosted Apps | In Text Inputs & Terminals |
 | :--- | :--- | :--- |
-| **`4` `5` `6` `7` `8`** | **1:1 bezel-aligned softkeys** (`WiFi`, `Menu`, `Term`, `SysMon`, `Kali` on Idle) | Digits `'4'`–`'8'` |
+| **`4` `5` `6` `7` `8`** | **1:1 bezel-aligned softkeys** (`WiFi`, `Menu`, `Term`, `SysMon`, `Kali` on Idle) | Digits `'4'`-`'8'` |
 | **`F` / `Z` / `X` / `C`** *(or `,`/`/`/`;`/`.`)* | **Thumb D-Pad** (`Up` / `Left` / `Down` / `Right`) with hold repeat | Literal characters |
 | **`Enter` / `` ` `` (`Esc`)** | Confirm (`OK`) / Back | `Enter` / `Escape` |
 | **`Shift` / `Sym` / `Fn`** | Full 46-key + 32-symbol `TCA8418` hardware layers | Full punctuation & symbols |
 | **Tap `Tab`** | Open live **App Switcher** across running Wayland apps | `Tab` completion |
-| **Hold `Tab` (`1.2s`)** | **Lock Screen** (locks keypad + turns off LCD PWM backlight) | — |
+| **Hold `Tab` (`1.2s`)** | **Lock Screen** (locks keypad + turns off LCD PWM backlight) | N/A |
 | **Hold `Esc` (`2.8s`)** | **Hardware Rescue** (force-closes hung foreground app & reclaims LCD) | Hold `Esc` `1.2s` or `Ctrl+Alt+Q` exits `cz-term` / `cz-term80` |
 
 ### Built-In Menus, Terminals & Apps
 
 - **Kali Arsenal (`[8]` from Idle)**:
   - **Hosted Wayland Deck**: `USB Arsenal`, `Wi-Fi Recon`, `Bluetooth & BLE`, `IR Arsenal` (`/dev/lirc0` TX + `/dev/lirc1` RX + `~/ir/*.ir` IR parser), `Net Matrix`, `LAN Recon`, `Packet Capture`, `System Monitor`.
-  - **Terminals & TUIs**: `Terminal (Zsh)` (`cz-term` ProFont `53×14` / `45×11` / `53×15` / `80×24` from [`u8g2`](https://github.com/olikraus/u8g2) BDF glyphs with live `Ctrl+Alt+F` font zoom), `Term 80x24 (Dense)`, `Kali QuickMenu` (`cz-kali-menu`), `BadUSB & ISOs` (`cz-badusb --menu`), and `Kali Packages` (`cz-kali-pkgs`).
+  - **Terminals & TUIs**: `Terminal (Zsh)` (`cz-term` ProFont `53x14` / `45x11` / `53x15` / `80x24` from [`u8g2`](https://github.com/olikraus/u8g2) BDF glyphs with live `Ctrl+Alt+F` font zoom), `Term 80x24 (Dense)`, `Kali QuickMenu` (`cz-kali-menu`), `BadUSB & ISOs` (`cz-badusb --menu`), and `Kali Packages` (`cz-kali-pkgs`).
 - **Cardputer HW**:
   - Live controls for `Audio Volume`, `LCD Backlight`, `LCD Timeout` (synced with `~/.config/cardputerzero/config.json`), `USB OTG Gadget`, `HDMI Desktop`, `EXT 5V Rail`, `Grove 5V Out`, `Grove Pin Mode`, and `USB-C OTG Mux`.
   - Direct launchers for `Voice Recorder`, `BT/USB HID Pad` (BLE GATT + USB HID touchpad/keyboard), and official [CardputerZero](https://github.com/CardputerZero) hardware apps (`Camera`, `Compass`, `IR Remote`, `IR Chat`, `LoRa SX1262`, `GPS`, `NFC`, `SubG Chat`, and `M5 Files`).
@@ -112,7 +114,7 @@ cz-badusb --menu
 
 ### On-Demand HDMI LXDE Desktop (`cz-hdmi-hotplug`)
 
-The 1.9" SPI LCD and Mini-HDMI run independently: `czctl` keeps the internal `TCA8418` keypad isolated on `seat1` while HDMI runs a full Kali LXDE session. When Mini-HDMI is unplugged, `lightdm` stays stopped (saving ~75–90 MiB RAM) and starts automatically on hotplug (`cz-hdmi-hotplug status|auto|always|off`).
+The 1.9" SPI LCD and Mini-HDMI run independently: `czctl` keeps the internal `TCA8418` keypad isolated on `seat1` while HDMI runs a full Kali LXDE session. When Mini-HDMI is unplugged, `lightdm` stays stopped (saving ~75-90 MiB RAM) and starts automatically on hotplug (`cz-hdmi-hotplug status|auto|always|off`).
 
 ---
 
@@ -123,8 +125,8 @@ Board support combines [Raspberry Pi Linux](https://github.com/raspberrypi/linux
 | Subsystem | Hardware / Bus | Kernel Driver(s) & Firmware | User-Space |
 | :--- | :--- | :--- | :--- |
 | **SoC & Boot** | Raspberry Pi CM0 Lite (`RP3A0` / `BCM2837`, Cortex-A53 `arm64`, 512 MB LPDDR2) | `bcm2710-rpi-cm0.dtb`, `raspi-firmware`, Linux `6.18.39+rpt-rpi-v8` (`apt-mark hold`), `zstd` ZRAM (75%) | `ext4` (`noatime`), `cz-firstboot-resize`, SSH host keygen, strict ARMv8.0 LSE gate |
-| **1.9" IPS LCD** | `ST7789v3` `320×170` RGB565 on SPI0 CS0 (`GPIO25` DC) + `M5IOE1` PWM3 backlight | `panel-mipi-dbi-m.ko`, `st7789v_m5stack.ko`, `pwm_bl_m5stack.ko`, `cardputerzero,st7789v_lcd.bin`, `fb_load.service` | `czctl` DRM/KMS shell + headless `sway` Wayland host + `/dev/fb_lcd` (`cz-term`, `APPLaunch`), `fbcon=map:99` |
-| **HDMI Output** | VideoCore IV KMS (`vc4-kms-v3d,cma-64`) | `vc4`, `98-vc4-no-glamor.conf`, `zz-cardputerzero-hdmi-display.rules`, `91-cz-hdmi-hotplug.rules` | On-demand LightDM + LXDE (`cz-hdmi-hotplug`), `fb-mirror.py` LCD mirror, `VT2`–`VT6` consoles |
+| **1.9" IPS LCD** | `ST7789v3` `320x170` RGB565 on SPI0 CS0 (`GPIO25` DC) + `M5IOE1` PWM3 backlight | `panel-mipi-dbi-m.ko`, `st7789v_m5stack.ko`, `pwm_bl_m5stack.ko`, `cardputerzero,st7789v_lcd.bin`, `fb_load.service` | `czctl` DRM/KMS shell + headless `sway` Wayland host + `/dev/fb_lcd` (`cz-term`, `APPLaunch`), `fbcon=map:99` |
+| **HDMI Output** | VideoCore IV KMS (`vc4-kms-v3d,cma-64`) | `vc4`, `98-vc4-no-glamor.conf`, `zz-cardputerzero-hdmi-display.rules`, `91-cz-hdmi-hotplug.rules` | On-demand LightDM + LXDE (`cz-hdmi-hotplug`), `fb-mirror.py` LCD mirror, `VT2`-`VT6` consoles |
 | **46-Key Keypad + LEDs** | `TCA8418` (`0x34` I2C1, IRQ `GPIO27`) + Caps/Fn/Tab LEDs on `M5IOE1` | `tca8418_keypad_m5stack.ko` (`cardputerzero-v5-overlay.dtbo`) | Isolated on `seat1` (`72-seat-cardputer-czctl.rules`, Xorg `Ignore`), `tty1` masked, `/dev/uinput` Web KVM |
 | **Audio** | Everest `ES8389` (`0x10` I2C1 + I2S), 1W speaker (`GPIO24`), mic, 3.5mm jack detect (`GPIO17`) | `es8389_m5stack.ko`, `simple-amplifier.ko`, `cardputerzero-audio.ko` | PipeWire + WirePlumber + RTKit (`Voice Recorder`, `Internet Radio`, ES8389 prioritized over HDMI) |
 | **Onboard Wi-Fi** | `BCM43439` / `CYW4343A2` SDIO (`wlan0`, 2.4 GHz) | `brcmfmac` + CM0 `cyfmac43439-sdio.txt` (`boardflags3=0x04000000`, `nexmon` excluded) | `NetworkManager`, `czctl` Wi-Fi UI, `Wi-Fi Recon`, `WiFiScan` |
@@ -191,12 +193,12 @@ make -C src && make -C src check
 - [`build-kali-cardputerzero.sh`](build-kali-cardputerzero.sh): stage-resumable ARM64 image builder (`ROOT_FS=ext4|btrfs`, `DEFAULT_UI=czctl|applaunch`), 247-check hardware/ABI/LSE verifier, SD flasher, and SSH key installer.
 - [`shell/`](shell/): Rust/Slint workspace for `czctl`, `:8899` Web KVM, headless `sway` Wayland host, `kali-usb-deck`, `cz-boot-menu`, and 5 native Wayland apps (`sysmon`, `recorder`, `radio`, `disk-benchmark`, `usb-keyboard-touchpad`).
 - [`overlays/`](overlays/): Wayland `.fap.sh` app launchers (`apps/`), BadUSB `.duck` & IR `.ir` payloads (`payloads/`), `umtprd.conf` (`etc/umtprd/`), `czctl.service` & `seat1` udev rules (`systemd/`), and optional Btrfs/router overlays.
-- [`src/`](src/): `320×170` C utilities (`cz-term.c` ProFont terminal, `cz-wifiscan.c`, `cz-term80.c`, `cz-sysmon.c`, `cz-lanscan.c`, `cz-pktsniff.c`, `cz-usbgadget.c`) and `libcz_fb_lcd.c` framebuffer shim.
+- [`src/`](src/): `320x170` C utilities (`cz-term.c` ProFont terminal, `cz-wifiscan.c`, `cz-term80.c`, `cz-sysmon.c`, `cz-lanscan.c`, `cz-pktsniff.c`, `cz-usbgadget.c`) and `libcz_fb_lcd.c` framebuffer shim.
 - [`scripts/`](scripts/): Cortex-A53 shell builder (`build-cz-shell.sh`), upstream lockfile resolver (`resolve-upstream.py` + `upstream.lock.json`), launcher patcher (`configure-kali-launcher.py`), splash generator (`gen-kali-splash.py`), live SSH deployer (`deploy-live.sh`), and on-device tools (`cz-ui-mode`, `cz-usb-gadget`, `cz-flipper-gadget`, `cz-badusb`, `cz-kali-menu`, `cz-kali-pkgs`, `cz-hdmi-hotplug`, `cz-hw-status`).
 
 ## Shout-Out
 
-Big shout-out to the **Flipper One** project at Flipper Devices for establishing a clean, well-engineered handheld Linux foundation (`flipctl-slint`, `flipperone-linux-build-scripts`, and `flipperos-btrfs-tools`)—whose token-driven panel UI, `:8899` browser KVM design, Wayland app hosting model, and pixel fonts made `czctl` on the CardputerZero possible—alongside the M5Stack / CardputerZero, Kali Linux, and Raspberry Pi communities.
+Big shout-out to the **Flipper One** project at Flipper Devices for establishing a clean, well-engineered handheld Linux foundation (`flipctl-slint`, `flipperone-linux-build-scripts`, and `flipperos-btrfs-tools`). Its token-driven panel UI, `:8899` browser KVM design, Wayland app hosting model, and pixel fonts made `czctl` on the CardputerZero possible, alongside the work of the M5Stack / CardputerZero, Kali Linux, and Raspberry Pi communities.
 
 ## License & Attribution
 
