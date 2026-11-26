@@ -124,9 +124,27 @@ cp -a "$PREBUILT_DIR/bin/"* "$TMP_BUNDLE/usr/bin/"
 cp -a "$PREBUILT_DIR/share/czctl/assets/remote" "$TMP_BUNDLE/usr/share/czctl/assets/remote"
 cp -a "$REPO_ROOT/overlays/apps/"*.fap.sh "$TMP_BUNDLE/usr/share/czctl/apps/"
 cp -a "$REPO_ROOT/overlays/payloads/"* "$TMP_BUNDLE/usr/share/czctl/payloads/"
+cp -a "$REPO_ROOT/overlays/ota/ota-pub.pem" "$TMP_BUNDLE/usr/share/czctl/ota-pub.pem"
+mkdir -p "$TMP_BUNDLE/usr/share/czctl/ota-tools" "$TMP_BUNDLE/etc"
+cp -a "$REPO_ROOT/scripts/configure-kali-launcher.py" "$TMP_BUNDLE/usr/share/czctl/ota-tools/"
+cp -a "$REPO_ROOT/scripts/gen-kali-splash.py" "$TMP_BUNDLE/usr/share/czctl/ota-tools/"
 cp -a "$REPO_ROOT/overlays/etc/umtprd/umtprd.conf" "$TMP_BUNDLE/etc/umtprd/umtprd.conf"
 
-for s in cz-kali-menu cz-kali-pkgs cz-usb-gadget cz-flipper-gadget cz-badusb cz-ui-mode cz-hw-status cz-hdmi-hotplug cz-stealth; do
+DEPLOY_GIT_REV="$(git -C "$REPO_ROOT" rev-parse --short=7 HEAD 2>/dev/null || echo unknown)"
+DEPLOY_BUILD_NUM="${CZ_BUILD_NUM:-$(date -u +%s)}"
+DEPLOY_VERSION="${CZ_VERSION:-v$(date -u +%Y.%m.%d)}"
+DEPLOY_KABI="$(python3 -c 'import json; print(json.load(open("'"$REPO_ROOT/upstream.lock.json"'"))["kernel"]["kver"])' 2>/dev/null || echo 6.18.39+rpt-rpi-v8)"
+cat > "$TMP_BUNDLE/etc/cz-release" <<CZREL
+CZ_VERSION="${DEPLOY_VERSION}"
+CZ_BUILD_NUM="${DEPLOY_BUILD_NUM}"
+CZ_COMMIT="${DEPLOY_GIT_REV}"
+CZ_CHANNEL="release"
+CZ_BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+CZ_IMAGE_EPOCH="1"
+CZ_KERNEL_ABI="${DEPLOY_KABI}"
+CZREL
+
+for s in cz-kali-menu cz-kali-pkgs cz-usb-gadget cz-flipper-gadget cz-badusb cz-ui-mode cz-hw-status cz-hdmi-hotplug cz-stealth cz-ota; do
     cp -a "$REPO_ROOT/scripts/$s" "$TMP_BUNDLE/usr/local/bin/$s"
 done
 
@@ -272,12 +290,15 @@ fi
 
 # 5. Install /usr/share/czctl (+ /usr/share/flipctl symlink), umtprd.conf, systemd & udev rules
 rm -rf /usr/share/flipctl /usr/share/czctl/assets/remote
-install -d -m 755 /usr/share/czctl/assets /usr/share/czctl/apps /usr/share/czctl/payloads /etc/umtprd
+install -d -m 755 /usr/share/czctl/assets /usr/share/czctl/apps /usr/share/czctl/payloads /usr/share/czctl/ota-tools /etc/umtprd
 cp -a usr/share/czctl/assets/remote /usr/share/czctl/assets/remote
 install -m 755 usr/share/czctl/apps/* /usr/share/czctl/apps/
 install -m 644 usr/share/czctl/payloads/* /usr/share/czctl/payloads/
+install -m 644 usr/share/czctl/ota-pub.pem /usr/share/czctl/ota-pub.pem
+install -m 755 usr/share/czctl/ota-tools/* /usr/share/czctl/ota-tools/
 ln -sfn czctl /usr/share/flipctl
 install -m 644 etc/umtprd/umtprd.conf /etc/umtprd/umtprd.conf
+install -m 644 etc/cz-release /etc/cz-release
 
 rm -f /etc/systemd/system/flipctl.service \
       /etc/systemd/system/multi-user.target.wants/flipctl.service \

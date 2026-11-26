@@ -1,0 +1,120 @@
+name: OTA Bundle Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'OTA release tag (empty = vYYYY.MM.DD, or weekly-YYYY.MM.DD)'
+        required: false
+        default: ''
+        type: string
+      release_summary:
+        description: 'Short release notes (shown on CardputerZero screen)'
+        required: false
+        default: ''
+        type: string
+      channel:
+        description: 'OTA channel'
+        required: false
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - nightly
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kali-cardputerzero-ota-release
+  cancel-in-progress: false
+
+jobs:
+  build-ota:
+    name: Build and Publish OTA Bundle
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 10
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential pkg-config binutils curl git xz-utils python3 openssl ca-certificates \
+            libudev-dev libdrm-dev libgbm-dev libwayland-dev libxkbcommon-dev \
+            libfontconfig1-dev libpulse-dev libmp3lame-dev libogg-dev libvorbis-dev
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run UI guardrails, Rust tests & build signed OTA bundle
+        env:
+          CUSTOM_TAG: ${{ inputs.release_tag || '' }}
+          OTA_CHANNEL: ${{ inputs.channel || 'release' }}
+          OTA_NOTES: ${{ inputs.release_summary || '' }}
+          OTA_SIGNING_KEY: ${{ secrets.OTA_SIGNING_PRIVATE_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sh shell/ci/no-raw-colours.sh
+          CARGO_PROFILE_TEST_DEBUG=0 cargo test --manifest-path shell/Cargo.toml --workspace
+          CARGO_PROFILE_TEST_DEBUG=0 cargo test --manifest-path shell/Cargo.toml -p flipper-ui --features remote --test remote
+          rm -rf shell/target
+
+          date_slug="$(date -u +%Y.%m.%d)"
+          if [[ -n "$CUSTOM_TAG" ]]; then
+            base_tag="$CUSTOM_TAG"
+          elif [[ "$OTA_CHANNEL" == "nightly" ]]; then
+            base_tag="weekly-${date_slug}"
+          else
+            base_tag="v${date_slug}"
+          fi
+          tag="$base_tag"
+          suffix=2
+          while gh release view "$tag" >/dev/null 2>&1; do
+            tag="${base_tag}-${suffix}"
+            suffix=$((suffix + 1))
+          done
+
+          OTA_VERSION="$tag" ./scripts/build-ota-bundle.sh --rebuild
+          rm -rf shell/target
+          echo "ota_tag=$tag" >> "$GITHUB_OUTPUT"
+        id: ota
+
+      - name: Publish GitHub Release with OTA assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ota.outputs.ota_tag }}
+          OTA_CHANNEL: ${{ inputs.channel || 'release' }}
+        run: |
+          archive="output/ota/kali-cz-ota-${TAG}-arm64.tar.xz"
+          sha_file="${archive}.sha256"
+          sha_val="$(awk '{print $1}' "$sha_file")"
+          size_h="$(du -h "$archive" | awk '{print $1}')"
+
+          {
+            echo "## Kali Cyberdeck OTA Update (\`${TAG}\`)"
+            echo ""
+            echo "Signed on-device OTA bundle for M5Stack CardputerZero. Install directly from **\`Menu -> Settings -> Update Kali CZ\`** or run \`sudo cz-ota update\` on the device."
+            echo ""
+            echo "| File | Size | SHA-256 |"
+            echo "| :--- | :---: | :--- |"
+            echo "| \`$(basename "$archive")\` | \`${size_h}\` | \`${sha_val}\` |"
+          } > /tmp/ota-notes.md
+
+          assets=("$archive" "$sha_file" "output/ota/ota-manifest.json")
+          if [[ -f output/ota/ota-manifest.json.sig ]]; then
+            assets+=("output/ota/ota-manifest.json.sig")
+          fi
+
+          rel_flags=(--title "Kali Cyberdeck OTA ${TAG}" --notes-file /tmp/ota-notes.md)
+          if [[ "$OTA_CHANNEL" == "nightly" ]]; then
+            rel_flags+=(--prerelease)
+          else
+            rel_flags+=(--latest)
+          fi
+
+          gh release create "$TAG" "${assets[@]}" "${rel_flags[@]}"

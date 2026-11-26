@@ -8,7 +8,9 @@
 __pycache__/
 *.py[cod]
 
-# Local C build artifacts & OS metadata
+# Local C build artifacts, signing keys & OS metadata
+*.private.pem
+ota-signing*.pem
 *.o
 *.so
 /src/cz-sysmon

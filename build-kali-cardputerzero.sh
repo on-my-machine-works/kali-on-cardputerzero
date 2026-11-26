@@ -1242,6 +1242,7 @@ stage_launcher() {
     install -m 755 "$SCRIPT_DIR/scripts/cz-hw-status"      "$MNT_ROOT/usr/local/bin/cz-hw-status"
     install -m 755 "$SCRIPT_DIR/scripts/cz-hdmi-hotplug"   "$MNT_ROOT/usr/local/bin/cz-hdmi-hotplug"
     install -m 755 "$SCRIPT_DIR/scripts/cz-stealth"        "$MNT_ROOT/usr/local/bin/cz-stealth"
+    install -m 755 "$SCRIPT_DIR/scripts/cz-ota"            "$MNT_ROOT/usr/local/bin/cz-ota"
     install -m 755 "$SCRIPT_DIR/scripts/cz-kali-menu"      "$MNT_ROOT/usr/local/bin/cz-kali-menu"
     install -m 755 "$SCRIPT_DIR/scripts/cz-kali-pkgs"      "$MNT_ROOT/usr/local/bin/cz-kali-pkgs"
 
@@ -1279,6 +1280,10 @@ CHROOT
     cp -a "$PREBUILT_SHELL_DIR/share/czctl/assets/remote" "$MNT_ROOT/usr/share/czctl/assets/remote"
     install -m 755 "$SCRIPT_DIR/overlays/apps/"*.fap.sh "$MNT_ROOT/usr/share/czctl/apps/"
     install -m 644 "$SCRIPT_DIR/overlays/payloads/"* "$MNT_ROOT/usr/share/czctl/payloads/"
+    install -m 644 "$SCRIPT_DIR/overlays/ota/ota-pub.pem" "$MNT_ROOT/usr/share/czctl/ota-pub.pem"
+    install -d -m 755 "$MNT_ROOT/usr/share/czctl/ota-tools"
+    install -m 755 "$SCRIPT_DIR/scripts/configure-kali-launcher.py" "$MNT_ROOT/usr/share/czctl/ota-tools/configure-kali-launcher.py"
+    install -m 755 "$SCRIPT_DIR/scripts/gen-kali-splash.py" "$MNT_ROOT/usr/share/czctl/ota-tools/gen-kali-splash.py"
     ln -sfn czctl "$MNT_ROOT/usr/share/flipctl"
     install -m 644 "$SCRIPT_DIR/overlays/etc/umtprd/umtprd.conf" "$MNT_ROOT/etc/umtprd/umtprd.conf"
 
@@ -1334,6 +1339,18 @@ DOCEOF
     cat > "$MNT_ROOT/etc/default/cz-stealth" <<'EOF'
 # CardputerZero Hostile-Network Stealth Mode: on | off
 STEALTH_MODE=off
+EOF
+    local git_rev build_num
+    git_rev="$(git -C "$SCRIPT_DIR" rev-parse --short=7 HEAD 2>/dev/null || echo unknown)"
+    build_num="$(date -u +%s)"
+    cat > "$MNT_ROOT/etc/cz-release" <<EOF
+CZ_VERSION="v$(date -u +%Y.%m.%d)"
+CZ_BUILD_NUM="${build_num}"
+CZ_COMMIT="${git_rev}"
+CZ_CHANNEL="release"
+CZ_BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+CZ_IMAGE_EPOCH="1"
+CZ_KERNEL_ABI="${LOCKED_KVER:-6.18.39+rpt-rpi-v8}"
 EOF
     if [[ "$DEFAULT_UI" == "czctl" ]]; then
         rm -f "$MNT_ROOT/home/kali/.config/systemd/user/default.target.wants/APPLaunch.service" \
@@ -2330,10 +2347,11 @@ CHROOT
     vcheck "[[ -f '$MNT_ROOT/home/kali/ir/tv-universal.ir' && -f '$MNT_ROOT/etc/umtprd/umtprd.conf' ]]" "Missing tv-universal.ir or /etc/umtprd/umtprd.conf"
     vcheck "[[ -f '$MNT_ROOT/etc/systemd/system/czctl.service' && -f '$MNT_ROOT/etc/udev/rules.d/72-seat-cardputer-czctl.rules' ]] && ! grep -q -- '--remote' '$MNT_ROOT/etc/systemd/system/czctl.service'" "Missing czctl.service / seat rule, or czctl.service exposes unauthenticated --remote at boot"
     vcheck "[[ -f '$MNT_ROOT/etc/systemd/system/cz-stealth.service' && -f '$MNT_ROOT/etc/default/cz-stealth' && -f '$MNT_ROOT/etc/NetworkManager/conf.d/25-cz-privacy.conf' ]]" "Missing cz-stealth.service, /etc/default/cz-stealth, or 25-cz-privacy.conf"
+    vcheck "[[ -f '$MNT_ROOT/etc/cz-release' && -f '$MNT_ROOT/usr/share/czctl/ota-pub.pem' ]]" "Missing /etc/cz-release or /usr/share/czctl/ota-pub.pem"
     vcheck "grep -qx 'uinput' '$MNT_ROOT/etc/modules-load.d/cardputerzero.conf' && grep -q 'KERNEL==\"uinput\"' '$MNT_ROOT/etc/udev/rules.d/70-cardputerzero-peripherals.rules'" "Missing uinput autoload or udev rule"
     vcheck "dpkg_installed sway && dpkg_installed umtp-responder && dpkg_installed fuse3 && dpkg_installed iperf3 && dpkg_installed zstd" "Missing sway/umtp-responder/fuse3/iperf3/zstd"
     vcheck "dpkg_installed python3-requests && dpkg_installed kali-tweaks" "Missing python3-requests or kali-tweaks"
-    for kbin in cz-sysmon cz-term cz-term80 cz-wifiscan cz-lanscan cz-pktsniff cz-usbgadget cz-kali-menu cz-kali-pkgs cz-usb-gadget cz-flipper-gadget cz-badusb cz-ui-mode cz-hw-status cz-hdmi-hotplug cz-stealth monstart monstop; do
+    for kbin in cz-sysmon cz-term cz-term80 cz-wifiscan cz-lanscan cz-pktsniff cz-usbgadget cz-kali-menu cz-kali-pkgs cz-usb-gadget cz-flipper-gadget cz-badusb cz-ui-mode cz-hw-status cz-hdmi-hotplug cz-stealth cz-ota monstart monstop; do
         vcheck "[[ -x '$MNT_ROOT/usr/local/bin/$kbin' ]]" "Missing helper binary/script: /usr/local/bin/$kbin"
     done
     for kdt in kali-wifi.desktop kali-term80.desktop kali-zsh.desktop kali-menu.desktop kali-btop.desktop kali-lanscan.desktop kali-pktsniff.desktop kali-usbgadget.desktop kali-pkgs.desktop kali-czctl.desktop; do

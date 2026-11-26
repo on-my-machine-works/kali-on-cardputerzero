@@ -130,6 +130,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CUSTOM_TAG: ${{ inputs.release_tag || '' }}
           RELEASE_SUMMARY: ${{ inputs.release_summary || '' }}
+          OTA_SIGNING_KEY: ${{ secrets.OTA_SIGNING_PRIVATE_KEY }}
         run: |
           date_slug="$(date -u +%Y.%m.%d)"
           if [[ -n "${CUSTOM_TAG}" ]]; then
@@ -194,9 +195,20 @@ jobs:
             } >> /tmp/release-notes.md
           fi
 
+          OTA_VERSION="$tag" OTA_NOTES="${RELEASE_SUMMARY}" ./scripts/build-ota-bundle.sh
+          ota_assets=(
+            "output/ota/kali-cz-ota-${tag}-arm64.tar.xz"
+            "output/ota/kali-cz-ota-${tag}-arm64.tar.xz.sha256"
+            "output/ota/ota-manifest.json"
+          )
+          if [[ -f output/ota/ota-manifest.json.sig ]]; then
+            ota_assets+=("output/ota/ota-manifest.json.sig")
+          fi
+
           gh release create "$tag" \
             output/kali-cardputerzero-arm64.img.xz \
             output/kali-cardputerzero-arm64.img.xz.sha256 \
+            "${ota_assets[@]}" \
             --target "${{ steps.lockfile.outputs.target_sha }}" \
             --title "${rel_title}" \
             --notes-file /tmp/release-notes.md \

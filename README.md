@@ -62,6 +62,20 @@ Because a cyberdeck is often plugged into unknown or hostile Wi-Fi and Ethernet 
   - Open `Menu -> Network -> Web KVM (:8899)` and press Left/Right to pick **`USB`** (reachable only over `10.55.0.1` USB-C and `127.0.0.1`) or **`LAN`** (reachable on Wi-Fi/Ethernet when Stealth Mode is off).
   - Read the **6-digit PIN** shown right on that menu line (for example, `USB: 482910`), open `http://10.55.0.1:8899/` in your browser, and enter the PIN to unlock. Switch it back to **`Off`** when you are done, and port `8899` closes right away.
 
+### Over-The-Air (OTA) & Offline Updates (`cz-ota`)
+
+You do not need to clone this repository or re-flash your microSD card to update the Cyberdeck shell, apps, or scripts:
+
+- **Update from the screen**: open **`Menu -> Settings -> Update Kali CZ`** and press **`Update`**. It checks GitHub Releases for a newer Ed25519-signed bundle (~20 MB), verifies its signature and SHA-256 checksum, saves a rollback copy of your previous build, updates `czctl` and all built-in apps/scripts in place without touching `/home/kali` or your `apt` packages, and restarts the shell automatically (with an 8-second health check that auto-rolls back if the new UI fails to start).
+- **Update or roll back from a terminal**:
+  ```bash
+  cz-ota status                                       # Show installed version and rollback backup
+  cz-ota check                                        # Check GitHub Releases for signed updates
+  sudo cz-ota update                                  # Download, verify, back up, and install
+  sudo cz-ota rollback                                # Revert to the previous backed-up version
+  sudo cz-ota install ~/kali-cz-ota-v*.tar.xz         # Offline install (with ota-manifest.json + .sig)
+  ```
+
 ---
 
 ## Controls, Shell & App Deck
@@ -210,9 +224,9 @@ make -C src && make -C src check
 
 - [`build-kali-cardputerzero.sh`](build-kali-cardputerzero.sh): stage-resumable ARM64 image builder (`ROOT_FS=ext4|btrfs`, `DEFAULT_UI=czctl|applaunch`), 247-check hardware/ABI/LSE verifier, SD flasher, and SSH key installer.
 - [`shell/`](shell/): Rust/Slint workspace for `czctl`, `:8899` Web KVM, headless `sway` Wayland host, `kali-usb-deck`, `cz-boot-menu`, and 5 native Wayland apps (`sysmon`, `recorder`, `radio`, `disk-benchmark`, `usb-keyboard-touchpad`).
-- [`overlays/`](overlays/): Wayland `.fap.sh` app launchers (`apps/`), BadUSB `.duck` & IR `.ir` payloads (`payloads/`), `umtprd.conf` (`etc/umtprd/`), `czctl.service`, `cz-stealth.service` & `seat1` udev rules (`systemd/`), and optional Btrfs/router overlays.
+- [`overlays/`](overlays/): Wayland `.fap.sh` app launchers (`apps/`), BadUSB `.duck` & IR `.ir` payloads (`payloads/`), Ed25519 OTA public key (`ota/ota-pub.pem`), `umtprd.conf` (`etc/umtprd/`), `czctl.service`, `cz-stealth.service` & `seat1` udev rules (`systemd/`), and optional Btrfs/router overlays.
 - [`src/`](src/): `320x170` C utilities (`cz-term.c` ProFont terminal, `cz-wifiscan.c`, `cz-term80.c`, `cz-sysmon.c`, `cz-lanscan.c`, `cz-pktsniff.c`, `cz-usbgadget.c`) and `libcz_fb_lcd.c` framebuffer shim.
-- [`scripts/`](scripts/): Cortex-A53 shell builder (`build-cz-shell.sh`), upstream lockfile resolver (`resolve-upstream.py` + `upstream.lock.json`), launcher patcher (`configure-kali-launcher.py`), splash generator (`gen-kali-splash.py`), live SSH deployer (`deploy-live.sh`), and on-device tools (`cz-stealth`, `cz-ui-mode`, `cz-usb-gadget`, `cz-flipper-gadget`, `cz-badusb`, `cz-kali-menu`, `cz-kali-pkgs`, `cz-hdmi-hotplug`, `cz-hw-status`).
+- [`scripts/`](scripts/): Cortex-A53 shell builder (`build-cz-shell.sh`), signed OTA bundle builder (`build-ota-bundle.sh`), upstream lockfile resolver (`resolve-upstream.py` + `upstream.lock.json`), launcher patcher (`configure-kali-launcher.py`), splash generator (`gen-kali-splash.py`), live SSH deployer (`deploy-live.sh`), and on-device tools (`cz-ota`, `cz-stealth`, `cz-ui-mode`, `cz-usb-gadget`, `cz-flipper-gadget`, `cz-badusb`, `cz-kali-menu`, `cz-kali-pkgs`, `cz-hdmi-hotplug`, `cz-hw-status`).
 
 ## Shout-Out
 
