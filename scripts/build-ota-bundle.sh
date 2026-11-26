@@ -86,6 +86,7 @@ mkdir -p "$PAYLOAD/usr/bin" \
          "$PAYLOAD/etc/systemd/system" \
          "$PAYLOAD/etc/udev/rules.d" \
          "$PAYLOAD/etc/NetworkManager/conf.d" \
+         "$PAYLOAD/etc/sysctl.d" \
          "$CSRC"
 
 echo "[1/4] Compiling ARMv8.0 Cortex-A53 C framebuffer utilities & shim ..."
@@ -171,6 +172,10 @@ modprobe uinput 2>/dev/null || true
 ln -sfn /etc/systemd/system/czctl.service /etc/systemd/system/flipctl.service
 [[ -f /etc/systemd/system/cz-stealth.service ]] && \
     ln -sfn /etc/systemd/system/cz-stealth.service /etc/systemd/system/multi-user.target.wants/cz-stealth.service
+sysctl --system >/dev/null 2>&1 || sysctl -qw "net.ipv4.ping_group_range=0 2147483647" 2>/dev/null || true
+if [[ -x /usr/bin/ping ]] && command -v setcap >/dev/null 2>&1; then
+    setcap cap_net_raw+ep /usr/bin/ping 2>/dev/null || true
+fi
 POSTEOF
 chmod 755 "$PAYLOAD/usr/share/czctl/ota-tools/postinstall.sh"
 
@@ -210,6 +215,19 @@ wifi.scan-rand-mac-address=yes
 [connection]
 ipv4.dhcp-send-hostname=0
 ipv6.dhcp-send-hostname=0
+EOF
+
+cat > "$PAYLOAD/etc/sysctl.d/50-cz-network.conf" <<'EOF'
+# Standard Debian/Kali sysctl defaults (unprivileged ping, fq_codel, fs link guards)
+-net.ipv4.ping_group_range = 0 2147483647
+-net.core.default_qdisc = fq_codel
+net.ipv4.conf.default.rp_filter = 2
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.conf.default.promote_secondaries = 1
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+fs.protected_regular = 2
+fs.protected_fifos = 1
 EOF
 
 cat > "$PAYLOAD/etc/cz-release" <<EOF

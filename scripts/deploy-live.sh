@@ -422,7 +422,21 @@ rm -f /etc/systemd/system/multi-user.target.wants/ModemManager.service \
       /etc/systemd/system/dbus-org.freedesktop.ModemManager1.service
 
 # Volatile bounded journald (eliminates background ext4 jbd2 / microSD writes)
-install -d -m 755 /etc/systemd/journald.conf.d /etc/NetworkManager/conf.d
+install -d -m 755 /etc/systemd/journald.conf.d /etc/NetworkManager/conf.d /etc/sysctl.d
+cat > /etc/sysctl.d/50-cz-network.conf <<'EOF'
+# Standard Debian/Kali sysctl defaults (unprivileged ping, fq_codel, fs link guards)
+-net.ipv4.ping_group_range = 0 2147483647
+-net.core.default_qdisc = fq_codel
+net.ipv4.conf.default.rp_filter = 2
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.conf.default.promote_secondaries = 1
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+fs.protected_regular = 2
+fs.protected_fifos = 1
+EOF
+sysctl --system >/dev/null 2>&1 || sysctl -qw "net.ipv4.ping_group_range=0 2147483647" 2>/dev/null || true
+[[ -x /usr/bin/ping ]] && command -v setcap >/dev/null 2>&1 && setcap cap_net_raw+ep /usr/bin/ping 2>/dev/null || true
 rm -f /etc/systemd/journald.conf.d/persist.conf
 cat > /etc/systemd/journald.conf.d/volatile.conf <<'EOF'
 [Journal]

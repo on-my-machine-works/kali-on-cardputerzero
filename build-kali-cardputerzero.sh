@@ -311,7 +311,7 @@ stage_rootfs() {
     mkdir -p "$ROOTFS_STAGE_DIR"
 
     local keyring="$CACHE_DIR/keyring/kali-archive-keyring.gpg"
-    local base_pkgs="kali-archive-keyring,ca-certificates,apt-transport-https,systemd,systemd-sysv,udev,dbus,locales,sudo,bash,zsh,eatmydata,initramfs-tools,kmod,iproute2,iputils-ping,procps,parted,e2fsprogs,dosfstools,rsync,curl,gnupg"
+    local base_pkgs="kali-archive-keyring,ca-certificates,apt-transport-https,systemd,systemd-sysv,linux-sysctl-defaults,udev,dbus,locales,sudo,bash,zsh,eatmydata,initramfs-tools,kmod,iproute2,iputils-ping,libcap2-bin,procps,parted,e2fsprogs,dosfstools,rsync,curl,gnupg"
 
     if command -v mmdebstrap >/dev/null 2>&1; then
         mmdebstrap \
@@ -408,7 +408,7 @@ stage_image() {
         mount_btrfs_layout "${LOOP_DEV}p2" "${LOOP_DEV}p1"
 
         log "Copying Kali rootfs into zstd-compressed Btrfs subvolumes via rsync"
-        rsync -HPavz -q --exclude='.bootstrapped' --exclude='/boot/firmware/*' \
+        rsync -HPaAXvz -q --exclude='.bootstrapped' --exclude='/boot/firmware/*' \
             "$ROOTFS_STAGE_DIR/" "$MNT_ROOT/"
         mkdir -p "$MNT_ROOT/var/log/journal" "$MNT_ROOT/var/swap"
         chattr +C "$MNT_ROOT/var/log/journal" 2>/dev/null || true
@@ -431,7 +431,7 @@ EOF
         mount "${LOOP_DEV}p1" "$MNT_BOOT"
 
         log "Copying Kali rootfs into mounted ext4 image via rsync"
-        rsync -HPavz -q --exclude='.bootstrapped' --exclude='/boot/firmware/*' \
+        rsync -HPaAXvz -q --exclude='.bootstrapped' --exclude='/boot/firmware/*' \
             "$ROOTFS_STAGE_DIR/" "$MNT_ROOT/"
 
         cat > "$MNT_ROOT/etc/fstab" <<EOF
@@ -1937,6 +1937,25 @@ wifi.scan-rand-mac-address=yes
 ipv4.dhcp-send-hostname=0
 ipv6.dhcp-send-hostname=0
 EOF
+    install -d -m 755 "$MNT_ROOT/etc/sysctl.d"
+    cat > "$MNT_ROOT/etc/sysctl.d/50-cz-network.conf" <<'EOF'
+# Standard Debian/Kali sysctl defaults (unprivileged ping, fq_codel, fs link guards)
+-net.ipv4.ping_group_range = 0 2147483647
+-net.core.default_qdisc = fq_codel
+net.ipv4.conf.default.rp_filter = 2
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.conf.default.promote_secondaries = 1
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+fs.protected_regular = 2
+fs.protected_fifos = 1
+EOF
+    run_chroot <<'CHROOT'
+set -e
+if [ -x /usr/bin/ping ] && command -v setcap >/dev/null 2>&1; then
+    setcap cap_net_raw+ep /usr/bin/ping || true
+fi
+CHROOT
     ln -sfn /dev/null "$MNT_ROOT/etc/systemd/system/networking.service"
 
     # Hostname & /etc/hosts
@@ -2361,6 +2380,7 @@ CHROOT
     vcheck "[[ -f '$MNT_ROOT/etc/systemd/system/czctl.service' && -f '$MNT_ROOT/etc/udev/rules.d/72-seat-cardputer-czctl.rules' ]] && ! grep -q -- '--remote' '$MNT_ROOT/etc/systemd/system/czctl.service'" "Missing czctl.service / seat rule, or czctl.service exposes unauthenticated --remote at boot"
     vcheck "[[ -f '$MNT_ROOT/etc/systemd/system/cz-stealth.service' && -f '$MNT_ROOT/etc/default/cz-stealth' && -f '$MNT_ROOT/etc/NetworkManager/conf.d/25-cz-privacy.conf' ]]" "Missing cz-stealth.service, /etc/default/cz-stealth, or 25-cz-privacy.conf"
     vcheck "[[ -f '$MNT_ROOT/etc/cz-release' && -f '$MNT_ROOT/usr/share/czctl/ota-pub.pem' ]]" "Missing /etc/cz-release or /usr/share/czctl/ota-pub.pem"
+    vcheck "[[ -f '$MNT_ROOT/etc/sysctl.d/50-cz-network.conf' ]] && getcap '$MNT_ROOT/usr/bin/ping' | grep -q 'cap_net_raw'" "Missing 50-cz-network.conf ping_group_range or cap_net_raw on /usr/bin/ping"
     vcheck "grep -qx 'uinput' '$MNT_ROOT/etc/modules-load.d/cardputerzero.conf' && grep -q 'KERNEL==\"uinput\"' '$MNT_ROOT/etc/udev/rules.d/70-cardputerzero-peripherals.rules'" "Missing uinput autoload or udev rule"
     vcheck "dpkg_installed sway && dpkg_installed umtp-responder && dpkg_installed fuse3 && dpkg_installed iperf3 && dpkg_installed zstd" "Missing sway/umtp-responder/fuse3/iperf3/zstd"
     vcheck "dpkg_installed python3-requests && dpkg_installed kali-tweaks" "Missing python3-requests or kali-tweaks"
