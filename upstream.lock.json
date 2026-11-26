@@ -176,10 +176,10 @@
       ],
       "asset_regex": "^[Cc]ap-[Cc][Cc]1101-[Ss]ub[Gg]-[Cc]hat.*_m5stack1_arm64\\.deb$|^m5cardputerzero-cap-cc1101-subg-chat_[^/]+_m5stack1_arm64\\.deb$",
       "locked": {
-        "tag": "v1.0.2",
-        "filename": "m5cardputerzero-cap-cc1101-subg-chat_1.0.2_m5stack1_arm64.deb",
-        "url": "https://github.com/CardputerZero/Cap-CC1101-SubG-Chat/releases/download/v1.0.2/m5cardputerzero-cap-cc1101-subg-chat_1.0.2_m5stack1_arm64.deb",
-        "sha256": "c8ca85e63e0721790bd1dc65764046e78e68f5be1abe26a948c5fcdf23937b91"
+        "tag": "v1.0.3",
+        "filename": "m5cardputerzero-cap-cc1101-subg-chat_1.0.3_m5stack1_arm64.deb",
+        "url": "https://github.com/CardputerZero/Cap-CC1101-SubG-Chat/releases/download/v1.0.3/m5cardputerzero-cap-cc1101-subg-chat_1.0.3_m5stack1_arm64.deb",
+        "sha256": "3415df84e55f8a8dd2547244c57db987da71bf9c93ed587eda063deb2753fa63"
       }
     },
     {
