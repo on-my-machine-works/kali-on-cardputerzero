@@ -1,0 +1,14 @@
+[Unit]
+Description=CardputerZero Hostile-Network Stealth Firewall & MAC Privacy
+DefaultDependencies=no
+After=systemd-sysctl.service
+Before=network-pre.target NetworkManager.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/cz-stealth apply
+
+[Install]
+WantedBy=multi-user.target

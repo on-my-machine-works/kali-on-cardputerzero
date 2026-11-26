@@ -13,7 +13,8 @@ Instead of treating the 1.9" SPI screen as a secondary status display, the image
 ## What Defines Cyberdeck Edition
 
 - **`czctl` `320x170` DRM/KMS Shell**: zero-tearing RGB565 interface in a Kali Dark palette (with runtime theme switching), live battery/thermal/power/IP idle dashboard, `1:1` bezel-aligned softkeys over physical keys `4`-`8`, visual `Tab` App Switcher, `Hold Tab` screen lock (`0 mA` backlight off), and `Hold Esc` hardware rescue.
-- **`:8899` Browser Web KVM**: open `http://kali-cardputerzero.local:8899/` (or `http://10.55.0.1:8899/` over a single USB-C cable) in any browser for a live pixel-exact screen stream, mouse-clickable softkeys, full QWERTY `/dev/uinput` keyboard forwarding, and `/apps` bundle management.
+- **`:8899` Browser Web KVM (PIN-Protected, Off by Default)**: turn it on from `Network -> Web KVM (:8899)` (`USB` for cable-only or `LAN` for Wi-Fi/Ethernet), then open `http://10.55.0.1:8899/` (or your LAN IP) and enter the 6-digit PIN shown on screen for a live pixel-exact display stream, mouse-clickable softkeys, full QWERTY `/dev/uinput` keyboard forwarding, and `/apps` bundle management.
+- **Hostile-Network Stealth Mode (`cz-stealth`)**: one toggle in `Network -> Stealth mode` (or `sudo cz-stealth on`) silently drops incoming traffic and pings on Wi-Fi and Ethernet while keeping outgoing recon tools and the USB-C `10.55.0.1` management link working, randomizes your MAC address per connection, and never leaks your device hostname over DHCP.
 - **12 Hosted Wayland Apps + `~/Apps` Extensibility**: isolated headless [`sway`](https://github.com/swaywm/sway) micro-compositor hosting `USB Arsenal`, `Wi-Fi Recon`, `Bluetooth & BLE`, `IR Arsenal`, `Net Matrix`, `LAN Recon`, `Packet Capture`, `System Monitor`, `Voice Recorder`, `Internet Radio`, `Disk Benchmark`, and `BT/USB HID Pad`.
 - **Composite USB-C OTG Arsenal**: run non-routing `usb0` Ethernet (`10.55.0.1/24`, keeping your laptop's Wi-Fi internet intact) *simultaneously* alongside DuckyScript BadUSB HID injection (`cz-badusb`), [`uMTP-Responder`](https://github.com/Viveris/uMTP-Responder) (`umtprd`) `/home/kali` file sharing, read-only bootable `.iso` drives, or read-write FAT32 loot `.img` drives.
 - **Full CardputerZero Hardware & Dual-UI Coexistence**: `IMX219` CSI camera (Raspberry Pi [`libcamera`](https://github.com/raspberrypi/libcamera) `0.7` ISP), `ES8389` [PipeWire](https://pipewire.org/) audio, `GPIO12/13` IR TX/RX, `BQ27220` fuel gauge, `RX8130CE` RTC, `BMI270`+`BMM150` IMU, `M5IOE1` 5V Grove/EXT rails, 14-pin `SX1262` LoRa/GNSS and `CC1101`/NFC Caps, plus one-command switching (`cz-ui-mode`) to M5's stock `APPLaunch` carousel or hotplug HDMI LXDE.
@@ -33,16 +34,33 @@ Instead of treating the 1.9" SPI screen as a secondary status display, the image
      xzcat kali-cardputerzero-arm64.img.xz | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync
      sync
      ```
-3. Boot the CardputerZero. On first boot, `cz-firstboot-resize` expands the `ext4` root filesystem online to fill the card and `czctl` starts on the `320x170` LCD and `:8899` Web KVM.
+3. Boot the CardputerZero. On first boot, `cz-firstboot-resize` expands the `ext4` root filesystem online to fill the card and `czctl` starts on the `320x170` LCD.
 
 ### Default Access
 
 - **Login**: `kali` / `kali` (passwordless `sudo` enabled)
-- **SSH**: `ssh kali@kali-cardputerzero.local` (or `ssh kali@10.55.0.1` over USB-C OTG)
-- **Web KVM**: `http://kali-cardputerzero.local:8899/` (or `http://10.55.0.1:8899/` over USB-C OTG)
+- **SSH**: `ssh kali@<cardputer-ip>` (or `ssh kali@10.55.0.1` over USB-C OTG)
+- **Web KVM (`:8899`)**: **Off by default**. Enable `USB` or `LAN` in `Network -> Web KVM (:8899)` on the device and unlock in your browser with the 6-digit PIN shown on that menu line.
 
 > [!IMPORTANT]
-> Like upstream Kali ARM images, SSH, `:8899` Web KVM, and passwordless `sudo` are enabled by default with `kali` / `kali`. Run `passwd` on first login (and restrict SSH / port `8899` if needed) before joining untrusted networks.
+> Like upstream Kali ARM images, SSH and passwordless `sudo` ship with `kali` / `kali`. Run `passwd` on first login to set your own password, and turn on **Stealth Mode** before connecting to untrusted networks.
+
+### Stealth Mode & Web KVM Security
+
+Because a cyberdeck is often plugged into unknown or hostile Wi-Fi and Ethernet networks, you can lock down incoming access in seconds:
+
+- **Turn on Stealth Mode**:
+  - **On the screen**: open `Menu -> Network -> Stealth mode` (or `Settings -> Stealth mode`) and switch it to **`ON`**. The home screen will show **`[STEALTH]`** at the top.
+  - **In a terminal**: run `sudo cz-stealth on` (use `sudo cz-stealth off` to turn it off, or `cz-stealth status` to check).
+- **What Stealth Mode does**:
+  - **Blocks incoming connections on Wi-Fi and Ethernet**: other people on the network cannot scan your open ports, connect to SSH, or ping your device.
+  - **Keeps your own tools working**: all outgoing scans, web requests, and recon tools still work normally, and your USB-C cable (`10.55.0.1`) stays open so you never lock yourself out.
+  - **Hides your identity**: uses a new random MAC address each time you join a Wi-Fi or Ethernet network, randomizes Wi-Fi scan probes, and never sends the `kali-cardputerzero` device name to DHCP routers.
+  - **Turns off LAN Web KVM**: if Web KVM was set to `LAN`, Stealth Mode shuts it off automatically until Stealth Mode is turned back off (`USB` Web KVM over the cable still works).
+- **Using Web KVM (`:8899`) safely**:
+  - Web KVM is **off by default** so nothing listens on port `8899` until you ask for it.
+  - Open `Menu -> Network -> Web KVM (:8899)` and press Left/Right to pick **`USB`** (reachable only over `10.55.0.1` USB-C and `127.0.0.1`) or **`LAN`** (reachable on Wi-Fi/Ethernet when Stealth Mode is off).
+  - Read the **6-digit PIN** shown right on that menu line (for example, `USB: 482910`), open `http://10.55.0.1:8899/` in your browser, and enter the PIN to unlock. Switch it back to **`Off`** when you are done, and port `8899` closes right away.
 
 ---
 
@@ -70,9 +88,9 @@ Instead of treating the 1.9" SPI screen as a secondary status display, the image
   - Direct launchers for `Voice Recorder`, `BT/USB HID Pad` (BLE GATT + USB HID touchpad/keyboard), and official [CardputerZero](https://github.com/CardputerZero) hardware apps (`Camera`, `Compass`, `IR Remote`, `IR Chat`, `LoRa SX1262`, `GPS`, `NFC`, `SubG Chat`, and `M5 Files`).
 - **Switch Between `czctl` and Stock `APPLaunch` (`cz-ui-mode`)**:
   ```bash
-  sudo cz-ui-mode czctl       # Primary Kali Cyberdeck Shell + :8899 Web KVM (default)
+  sudo cz-ui-mode czctl       # Primary Kali Cyberdeck Shell (default)
   sudo cz-ui-mode applaunch   # Stock M5Stack APPLaunch carousel (includes "Kali Deck" card to return)
-  cz-ui-mode status           # Show active LCD owner and Web KVM URL
+  cz-ui-mode status           # Show active LCD owner, Stealth Mode, and Web KVM state
   ```
 
 ---
@@ -192,9 +210,9 @@ make -C src && make -C src check
 
 - [`build-kali-cardputerzero.sh`](build-kali-cardputerzero.sh): stage-resumable ARM64 image builder (`ROOT_FS=ext4|btrfs`, `DEFAULT_UI=czctl|applaunch`), 247-check hardware/ABI/LSE verifier, SD flasher, and SSH key installer.
 - [`shell/`](shell/): Rust/Slint workspace for `czctl`, `:8899` Web KVM, headless `sway` Wayland host, `kali-usb-deck`, `cz-boot-menu`, and 5 native Wayland apps (`sysmon`, `recorder`, `radio`, `disk-benchmark`, `usb-keyboard-touchpad`).
-- [`overlays/`](overlays/): Wayland `.fap.sh` app launchers (`apps/`), BadUSB `.duck` & IR `.ir` payloads (`payloads/`), `umtprd.conf` (`etc/umtprd/`), `czctl.service` & `seat1` udev rules (`systemd/`), and optional Btrfs/router overlays.
+- [`overlays/`](overlays/): Wayland `.fap.sh` app launchers (`apps/`), BadUSB `.duck` & IR `.ir` payloads (`payloads/`), `umtprd.conf` (`etc/umtprd/`), `czctl.service`, `cz-stealth.service` & `seat1` udev rules (`systemd/`), and optional Btrfs/router overlays.
 - [`src/`](src/): `320x170` C utilities (`cz-term.c` ProFont terminal, `cz-wifiscan.c`, `cz-term80.c`, `cz-sysmon.c`, `cz-lanscan.c`, `cz-pktsniff.c`, `cz-usbgadget.c`) and `libcz_fb_lcd.c` framebuffer shim.
-- [`scripts/`](scripts/): Cortex-A53 shell builder (`build-cz-shell.sh`), upstream lockfile resolver (`resolve-upstream.py` + `upstream.lock.json`), launcher patcher (`configure-kali-launcher.py`), splash generator (`gen-kali-splash.py`), live SSH deployer (`deploy-live.sh`), and on-device tools (`cz-ui-mode`, `cz-usb-gadget`, `cz-flipper-gadget`, `cz-badusb`, `cz-kali-menu`, `cz-kali-pkgs`, `cz-hdmi-hotplug`, `cz-hw-status`).
+- [`scripts/`](scripts/): Cortex-A53 shell builder (`build-cz-shell.sh`), upstream lockfile resolver (`resolve-upstream.py` + `upstream.lock.json`), launcher patcher (`configure-kali-launcher.py`), splash generator (`gen-kali-splash.py`), live SSH deployer (`deploy-live.sh`), and on-device tools (`cz-stealth`, `cz-ui-mode`, `cz-usb-gadget`, `cz-flipper-gadget`, `cz-badusb`, `cz-kali-menu`, `cz-kali-pkgs`, `cz-hdmi-hotplug`, `cz-hw-status`).
 
 ## Shout-Out
 

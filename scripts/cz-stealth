@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# cz-stealth - Hostile-network Stealth Mode & MAC/DHCP privacy guard for CardputerZero
+#
+# Usage:
+#   sudo cz-stealth on       # Drop unsolicited inbound traffic on Wi-Fi/RJ45, hide ping, randomize MAC
+#   sudo cz-stealth off      # Restore normal inbound LAN/Wi-Fi reachability (e.g. home lab SSH)
+#   sudo cz-stealth toggle   # Flip between on and off
+#   sudo cz-stealth apply    # Re-apply saved state from /etc/default/cz-stealth (boot hook)
+#   cz-stealth status        # Show current Stealth Mode, firewall, ping, and MAC/DHCP privacy state
+
+set -euo pipefail
+
+CONF_FILE="/etc/default/cz-stealth"
+NM_PRIVACY="/etc/NetworkManager/conf.d/25-cz-privacy.conf"
+NM_STEALTH="/etc/NetworkManager/conf.d/90-cz-stealth.conf"
+CHAIN="CZ_STEALTH"
+
+read_mode() {
+    if [[ -f "$CONF_FILE" ]]; then
+        local m
+        m="$(awk -F= '/^STEALTH_MODE=/{gsub(/"/, "", $2); print $2}' "$CONF_FILE" | tail -n1)"
+        if [[ "$m" == "on" ]]; then
+            echo "on"
+            return
+        fi
+    fi
+    echo "off"
+}
+
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        exec sudo "$0" "$@"
+    fi
+}
+
+ensure_base_privacy() {
+    install -d -m 755 /etc/default /etc/NetworkManager/conf.d
+    local tmp
+    tmp="$(mktemp)"
+    cat > "$tmp" <<'EOF'
+[device]
+wifi.scan-rand-mac-address=yes
+
+[connection]
+ipv4.dhcp-send-hostname=0
+ipv6.dhcp-send-hostname=0
+EOF
+    if [[ ! -f "$NM_PRIVACY" ]] || ! cmp -s "$tmp" "$NM_PRIVACY"; then
+        install -m 644 "$tmp" "$NM_PRIVACY"
+    fi
+    rm -f "$tmp"
+}
+
+flush_firewall() {
+    local ipt
+    for ipt in iptables ip6tables; do
+        command -v "$ipt" >/dev/null 2>&1 || continue
+        while "$ipt" -C INPUT -j "$CHAIN" 2>/dev/null; do
+            "$ipt" -D INPUT -j "$CHAIN" 2>/dev/null || break
+        done
+        "$ipt" -F "$CHAIN" 2>/dev/null || true
+        "$ipt" -X "$CHAIN" 2>/dev/null || true
+    done
+}
+
+apply_firewall() {
+    flush_firewall
+
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -N "$CHAIN"
+        iptables -A "$CHAIN" -i lo -j ACCEPT
+        iptables -A "$CHAIN" -i usb+ -j ACCEPT
+        iptables -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+        iptables -A "$CHAIN" -p udp --sport 67 --dport 68 -j ACCEPT
+        iptables -A "$CHAIN" -i wlan+ -j DROP
+        iptables -A "$CHAIN" -i wlx+ -j DROP
+        iptables -A "$CHAIN" -i eth+ -j DROP
+        iptables -A "$CHAIN" -i enx+ -j DROP
+        iptables -A "$CHAIN" -j RETURN
+        iptables -I INPUT 1 -j "$CHAIN"
+    fi
+
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -N "$CHAIN"
+        ip6tables -A "$CHAIN" -i lo -j ACCEPT
+        ip6tables -A "$CHAIN" -i usb+ -j ACCEPT
+        ip6tables -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+        ip6tables -A "$CHAIN" -p udp --sport 547 --dport 546 -j ACCEPT
+        ip6tables -A "$CHAIN" -p ipv6-icmp --icmpv6-type router-advertisement -j ACCEPT
+        ip6tables -A "$CHAIN" -p ipv6-icmp --icmpv6-type neighbor-solicitation -j ACCEPT
+        ip6tables -A "$CHAIN" -p ipv6-icmp --icmpv6-type neighbor-advertisement -j ACCEPT
+        ip6tables -A "$CHAIN" -i wlan+ -j DROP
+        ip6tables -A "$CHAIN" -i wlx+ -j DROP
+        ip6tables -A "$CHAIN" -i eth+ -j DROP
+        ip6tables -A "$CHAIN" -i enx+ -j DROP
+        ip6tables -A "$CHAIN" -j RETURN
+        ip6tables -I INPUT 1 -j "$CHAIN"
+    fi
+}
+
+enable_stealth() {
+    ensure_base_privacy
+    cat > "$CONF_FILE" <<'EOF'
+# CardputerZero Hostile-Network Stealth Mode: on | off
+STEALTH_MODE=on
+EOF
+    cat > "$NM_STEALTH" <<'EOF'
+[connection-stealth]
+wifi.cloned-mac-address=random
+ethernet.cloned-mac-address=random
+ipv6.ip6-privacy=2
+EOF
+    sysctl -qw net.ipv4.icmp_echo_ignore_all=1 2>/dev/null || true
+    sysctl -qw net.ipv6.conf.all.use_tempaddr=2 2>/dev/null || true
+    sysctl -qw net.ipv6.conf.default.use_tempaddr=2 2>/dev/null || true
+    apply_firewall
+    nmcli general reload 2>/dev/null || true
+    echo "Stealth Mode: ON (inbound Wi-Fi/Ethernet dropped, ping silent, random association MAC armed)"
+}
+
+disable_stealth() {
+    ensure_base_privacy
+    cat > "$CONF_FILE" <<'EOF'
+# CardputerZero Hostile-Network Stealth Mode: on | off
+STEALTH_MODE=off
+EOF
+    rm -f "$NM_STEALTH"
+    sysctl -qw net.ipv4.icmp_echo_ignore_all=0 2>/dev/null || true
+    flush_firewall
+    nmcli general reload 2>/dev/null || true
+    echo "Stealth Mode: OFF (normal LAN/Wi-Fi inbound access restored; USB-C usb0 always allowed)"
+}
+
+cmd="${1:-status}"
+case "$cmd" in
+    on|enable)
+        require_root "$@"
+        enable_stealth
+        ;;
+    off|disable)
+        require_root "$@"
+        disable_stealth
+        ;;
+    toggle)
+        require_root "$@"
+        if [[ "$(read_mode)" == "on" ]]; then
+            disable_stealth
+        else
+            enable_stealth
+        fi
+        ;;
+    apply)
+        require_root "$@"
+        if [[ "$(read_mode)" == "on" ]]; then
+            enable_stealth
+        else
+            disable_stealth
+        fi
+        ;;
+    status)
+        mode="$(read_mode)"
+        fw="inactive"
+        if command -v iptables >/dev/null 2>&1 && sudo -n iptables -C INPUT -j "$CHAIN" 2>/dev/null; then
+            fw="active (DROP unsolicited on wlan+/eth+)"
+        fi
+        icmp="$(cat /proc/sys/net/ipv4/icmp_echo_ignore_all 2>/dev/null || echo 0)"
+        echo "Stealth Mode      : ${mode^^}"
+        echo "Inbound Firewall  : $fw"
+        echo "ICMP Ping Silence : $([[ "$icmp" == "1" ]] && echo "ON (silent)" || echo "OFF (replies)")"
+        echo "Assoc MAC Mode    : $([[ -f "$NM_STEALTH" ]] && echo "random per connection" || echo "default (scan probes randomized)")"
+        echo "DHCP Hostname     : suppressed (never broadcasts hostname)"
+        ;;
+    *)
+        echo "Usage: $0 {on|off|toggle|apply|status}" >&2
+        exit 1
+        ;;
+esac

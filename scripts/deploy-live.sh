@@ -126,11 +126,12 @@ cp -a "$REPO_ROOT/overlays/apps/"*.fap.sh "$TMP_BUNDLE/usr/share/czctl/apps/"
 cp -a "$REPO_ROOT/overlays/payloads/"* "$TMP_BUNDLE/usr/share/czctl/payloads/"
 cp -a "$REPO_ROOT/overlays/etc/umtprd/umtprd.conf" "$TMP_BUNDLE/etc/umtprd/umtprd.conf"
 
-for s in cz-kali-menu cz-kali-pkgs cz-usb-gadget cz-flipper-gadget cz-badusb cz-ui-mode cz-hw-status cz-hdmi-hotplug; do
+for s in cz-kali-menu cz-kali-pkgs cz-usb-gadget cz-flipper-gadget cz-badusb cz-ui-mode cz-hw-status cz-hdmi-hotplug cz-stealth; do
     cp -a "$REPO_ROOT/scripts/$s" "$TMP_BUNDLE/usr/local/bin/$s"
 done
 
 cp -a "$REPO_ROOT/overlays/systemd/czctl.service" "$TMP_BUNDLE/etc/systemd/system/czctl.service"
+cp -a "$REPO_ROOT/overlays/systemd/cz-stealth.service" "$TMP_BUNDLE/etc/systemd/system/cz-stealth.service"
 cp -a "$REPO_ROOT/overlays/systemd/72-seat-cardputer-czctl.rules" "$TMP_BUNDLE/etc/udev/rules.d/72-seat-cardputer-czctl.rules"
 cp -a "$REPO_ROOT/overlays/initramfs/hook-flipper-boot-menu" "$TMP_BUNDLE/etc/initramfs-tools/hooks/flipper-boot-menu"
 cp -a "$REPO_ROOT/overlays/initramfs/local-top-flipper-boot-menu" "$TMP_BUNDLE/etc/initramfs-tools/scripts/local-top/flipper-boot-menu"
@@ -283,7 +284,10 @@ rm -f /etc/systemd/system/flipctl.service \
       /etc/systemd/system/graphical.target.wants/flipctl.service \
       /etc/udev/rules.d/72-seat-cardputer-flipctl.rules
 install -m 644 etc/systemd/system/czctl.service /etc/systemd/system/czctl.service
+install -m 644 etc/systemd/system/cz-stealth.service /etc/systemd/system/cz-stealth.service
 ln -sfn /etc/systemd/system/czctl.service /etc/systemd/system/flipctl.service
+install -d -m 755 /etc/systemd/system/multi-user.target.wants
+ln -sfn /etc/systemd/system/cz-stealth.service /etc/systemd/system/multi-user.target.wants/cz-stealth.service
 install -m 644 etc/udev/rules.d/72-seat-cardputer-czctl.rules /etc/udev/rules.d/72-seat-cardputer-czctl.rules
 
 cat > /etc/udev/rules.d/70-cardputerzero-peripherals.rules <<'EOF'
@@ -441,6 +445,12 @@ HDMI_DESKTOP_MODE=auto
 HDMI_UNPLUG_DELAY=5
 EOF
 fi
+if [[ ! -f /etc/default/cz-stealth ]]; then
+    cat > /etc/default/cz-stealth <<'EOF'
+# CardputerZero Hostile-Network Stealth Mode: on | off
+STEALTH_MODE=off
+EOF
+fi
 cat > /etc/systemd/system/fb_load.service.d/kali-splash.conf <<'EOF'
 [Service]
 ExecStart=
@@ -462,6 +472,7 @@ for udev_dir in /sys/bus/usb/devices/*; do
     fi
 done
 systemctl daemon-reload
+/usr/local/bin/cz-stealth apply >/dev/null 2>&1 || true
 systemctl stop fb_load.service 2>/dev/null || true
 /usr/local/bin/cz-hdmi-hotplug sync 2>/dev/null || true
 

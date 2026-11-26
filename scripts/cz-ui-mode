@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# cz-ui-mode — Switch M5Stack CardputerZero primary 320x170 LCD shell between:
-#   czctl     — Kali Cyberdeck Shell + :8899 Web KVM (default; alias: flipctl)
-#   applaunch — Official M5Stack APPLaunch carousel (includes Kali Deck card)
-#   status    — Show active LCD owner and :8899 Web KVM endpoint
+# cz-ui-mode - Switch M5Stack CardputerZero primary 320x170 LCD shell between:
+#   czctl     - Kali Cyberdeck Shell (default; alias: flipctl)
+#   applaunch - Official M5Stack APPLaunch carousel (includes Kali Deck card)
+#   status    - Show active LCD owner, Stealth Mode, and :8899 Web KVM state
 
 set -euo pipefail
 
@@ -18,6 +18,34 @@ user_systemctl() {
         uid="$(id -u kali)"
         runuser -u kali -- env XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user "$@" 2>/dev/null || true
     fi
+}
+
+web_kvm_summary() {
+    local mode="off"
+    local stealth="off"
+    if [[ -f /home/kali/.config/flipctl/web_kvm_mode ]]; then
+        mode="$(tr -d '[:space:]' < /home/kali/.config/flipctl/web_kvm_mode || echo off)"
+    fi
+    if [[ -f /etc/default/cz-stealth ]] && grep -q '^STEALTH_MODE=.*on' /etc/default/cz-stealth 2>/dev/null; then
+        stealth="on"
+    fi
+    case "$mode" in
+        usb)
+            echo "USB-only (http://10.55.0.1:8899/ , 6-digit PIN in Network -> Web KVM)"
+            ;;
+        lan)
+            if [[ "$stealth" == "on" ]]; then
+                echo "OFF (suppressed while Stealth Mode is ON)"
+            else
+                local ip4
+                ip4="$(hostname -I 2>/dev/null | awk '{print $1}')"
+                echo "LAN (${ip4:+http://${ip4}:8899/ }, 6-digit PIN in Network -> Web KVM)"
+            fi
+            ;;
+        *)
+            echo "OFF (enable in czctl Network -> Web KVM)"
+            ;;
+    esac
 }
 
 cmd="${1:-status}"
@@ -41,7 +69,7 @@ case "$cmd" in
             systemctl daemon-reload
             systemctl enable --now czctl.service
         fi
-        echo "Primary LCD UI set to: czctl (Kali Cyberdeck Shell + http://$(hostname -I | awk '{print $1}'):8899/)"
+        echo "Primary LCD UI set to: czctl (Kali Cyberdeck Shell; Web KVM: $(web_kvm_summary))"
         ;;
     applaunch)
         require_root "$@"
@@ -66,8 +94,12 @@ case "$cmd" in
         fi
         echo "LCD DRM node      : $(ls -l /dev/dri/cardputer-zero-internal 2>/dev/null || echo missing)"
         echo "LCD fbdev node    : $(ls -l /dev/fb_lcd 2>/dev/null || echo missing)"
-        ip4="$(hostname -I 2>/dev/null | awk '{print $1}')"
-        [[ -n "$ip4" ]] && echo "Web KVM (:8899)   : http://${ip4}:8899/"
+        if [[ -f /etc/default/cz-stealth ]] && grep -q '^STEALTH_MODE=.*on' /etc/default/cz-stealth 2>/dev/null; then
+            echo "Stealth Mode      : ON"
+        else
+            echo "Stealth Mode      : OFF"
+        fi
+        echo "Web KVM (:8899)   : $(web_kvm_summary)"
         ;;
     *)
         echo "Usage: $0 {czctl|flipctl|applaunch|status}" >&2
