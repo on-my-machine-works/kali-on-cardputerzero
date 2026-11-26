@@ -145,7 +145,7 @@ fn run(card: Option<&str>, kernels: Kernels, want_tui: bool) -> std::io::Result<
             }
         }
 
-        // When the rename keyboard is open, let physical 46-key QWERTY typing enter characters directly.
+        // When the rename prompt is open, let physical 46-key QWERTY typing edit directly.
         if kb.is_some() {
             let mut had_typed = false;
             while let Some(tev) = input.as_mut().and_then(EvdevSource::poll_typed) {
@@ -160,14 +160,48 @@ fn run(card: Option<&str>, kernels: Kernels, want_tui: bool) -> std::io::Result<
                         field.type_char(ch);
                         None
                     }
+                    flipper_ui::evdev::TypedEvent::CtrlChar('u') => {
+                        field.clear_line();
+                        None
+                    }
+                    flipper_ui::evdev::TypedEvent::CtrlChar('a')
+                    | flipper_ui::evdev::TypedEvent::Home => {
+                        field.move_home();
+                        None
+                    }
+                    flipper_ui::evdev::TypedEvent::CtrlChar('e')
+                    | flipper_ui::evdev::TypedEvent::End => {
+                        field.move_end();
+                        None
+                    }
                     flipper_ui::evdev::TypedEvent::Backspace => {
                         field.type_backspace();
                         None
                     }
-                    flipper_ui::evdev::TypedEvent::Enter => field.type_enter(saveable),
+                    flipper_ui::evdev::TypedEvent::Delete => {
+                        field.type_delete();
+                        None
+                    }
+                    flipper_ui::evdev::TypedEvent::Left => {
+                        field.move_left();
+                        None
+                    }
+                    flipper_ui::evdev::TypedEvent::Right => {
+                        field.move_right();
+                        None
+                    }
+                    flipper_ui::evdev::TypedEvent::Up | flipper_ui::evdev::TypedEvent::Down => {
+                        field.toggle_discard();
+                        None
+                    }
+                    flipper_ui::evdev::TypedEvent::Enter | flipper_ui::evdev::TypedEvent::F8 => {
+                        field.type_enter(saveable)
+                    }
                     flipper_ui::evdev::TypedEvent::Esc => {
                         field.key(flipper_ui::FlipperKey::Back, saveable)
                     }
+                    flipper_ui::evdev::TypedEvent::CtrlChar(_)
+                    | flipper_ui::evdev::TypedEvent::F6 => None,
                 };
                 warning = flipper_ui::boot::rename_warning(&field.text, &being, menu.profiles());
                 dirty = true;
@@ -520,9 +554,8 @@ fn apply(ui: &Menu, view: &BootView, kb: Option<&keyboard::TextInput>, warning: 
         ui.set_kb_tab_focus(v.tab_focus);
         ui.set_kb_tab_pressed(v.tab_pressed);
         ui.set_kb_discard(v.discard);
-        // The keyboard's own two labelled keys, as flipctl labels them.
         let buttons: Vec<slint::SharedString> =
-            ["Cancel", "", "", "", "Done"].iter().map(|s| (*s).into()).collect();
+            ["", "", "", "", ""].iter().map(|s| (*s).into()).collect();
         ui.set_kb_buttons(slint::ModelRc::new(slint::VecModel::from(buttons)));
     }
 }

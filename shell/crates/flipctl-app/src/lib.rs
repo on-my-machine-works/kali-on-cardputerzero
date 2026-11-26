@@ -51,10 +51,12 @@ pub use app::{
 pub use ask::{claim, type_text, Typing};
 pub use port::device_port_name;
 
-/// The touchpad and the motor, which a hosted app opens itself: the compositor has
-/// no pointer, so the pad reaches nobody unless somebody reads it.
+/// Physical keyboard, touchpad, and haptic motor sources for hosted apps.
 #[cfg(feature = "device")]
-pub use flipper_ui::{evdev::TouchpadSource, haptic::Haptic};
+pub use flipper_ui::{
+    evdev::{EvdevSource, TouchpadSource, TypedEvent},
+    haptic::Haptic,
+};
 
 /// Put a status reading on the panel's bar.
 ///

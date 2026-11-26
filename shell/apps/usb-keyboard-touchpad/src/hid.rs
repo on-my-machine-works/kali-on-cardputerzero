@@ -3,10 +3,19 @@
 //! buttons, x, y and a wheel; report 3 one 16-bit consumer usage. The same reports
 //! go over Bluetooth, whose report map is the same descriptor.
 
-/// Left shift, in the modifier byte.
+/// Modifier bits in the boot keyboard report.
+pub const CTRL: u8 = 0x01;
 const SHIFT: u8 = 0x02;
 
+pub const ENTER: u8 = 0x28;
 pub const BACKSPACE: u8 = 0x2a;
+pub const HOME: u8 = 0x4a;
+pub const DELETE: u8 = 0x4c;
+pub const END: u8 = 0x4d;
+pub const RIGHT: u8 = 0x4f;
+pub const LEFT: u8 = 0x50;
+pub const DOWN: u8 = 0x51;
+pub const UP: u8 = 0x52;
 
 /// Consumer usages for the media keys.
 pub const VOLUME_UP: u16 = 0xe9;

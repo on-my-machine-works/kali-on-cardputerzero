@@ -39,14 +39,25 @@ const KEY_MUTE: u16 = 113;
 const KEY_VOLUMEDOWN: u16 = 114;
 const KEY_VOLUMEUP: u16 = 115;
 
-/// Raw keyboard typing events used by `Screen::TextInput` so all 46 physical keys
-/// (including `4`..`8`, `Backspace`, `Shift`, and `Sym` punctuation) type naturally.
+/// Raw keyboard typing events used by `Screen::TextInput` and `raw_keyboard` apps so
+/// all 46 physical keys (including `4`..`8`, `Backspace`, `Enter`, `Shift`, `Sym`, and
+/// `Fn` navigation chords) operate directly without an on-screen virtual keyboard.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum TypedEvent {
     Char(char),
+    CtrlChar(char),
     Backspace,
+    Delete,
     Enter,
     Esc,
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+    F6,
+    F8,
 }
 
 struct DevEntry {
@@ -229,17 +240,37 @@ impl EvdevSource {
                         _ => {}
                     }
 
-                    // Track physical character typing (including auto-repeat value == 2).
-                    if (value == 1 || value == 2) && !self.ctrl && !self.alt {
-                        match code {
-                            KEY_ESC if value == 1 => self.typed.push_back(TypedEvent::Esc),
-                            KEY_BACKSPACE => self.typed.push_back(TypedEvent::Backspace),
-                            28 | 96 if value == 1 => self.typed.push_back(TypedEvent::Enter),
-                            _ => {
+                    // Track physical character & editing keys (including auto-repeat value == 2).
+                    if (value == 1 || value == 2) && !self.alt {
+                        if self.ctrl {
+                            if value == 1 {
                                 if let Some(ch) =
-                                    evdev_to_ascii(&self.sym_map, is_tca8418, code, self.shift)
+                                    evdev_to_ascii(&self.sym_map, is_tca8418, code, false)
                                 {
-                                    self.typed.push_back(TypedEvent::Char(ch));
+                                    self.typed
+                                        .push_back(TypedEvent::CtrlChar(ch.to_ascii_lowercase()));
+                                }
+                            }
+                        } else {
+                            match code {
+                                KEY_ESC if value == 1 => self.typed.push_back(TypedEvent::Esc),
+                                KEY_BACKSPACE => self.typed.push_back(TypedEvent::Backspace),
+                                111 => self.typed.push_back(TypedEvent::Delete),
+                                28 | 96 if value == 1 => self.typed.push_back(TypedEvent::Enter),
+                                105 => self.typed.push_back(TypedEvent::Left),
+                                106 => self.typed.push_back(TypedEvent::Right),
+                                103 | 104 => self.typed.push_back(TypedEvent::Up),
+                                108 | 109 => self.typed.push_back(TypedEvent::Down),
+                                102 => self.typed.push_back(TypedEvent::Home),
+                                107 => self.typed.push_back(TypedEvent::End),
+                                64 if value == 1 => self.typed.push_back(TypedEvent::F6),
+                                66 if value == 1 => self.typed.push_back(TypedEvent::F8),
+                                _ => {
+                                    if let Some(ch) =
+                                        evdev_to_ascii(&self.sym_map, is_tca8418, code, self.shift)
+                                    {
+                                        self.typed.push_back(TypedEvent::Char(ch));
+                                    }
                                 }
                             }
                         }
@@ -297,6 +328,11 @@ impl EvdevSource {
             self.drain();
         }
         self.typed.pop_front()
+    }
+
+    /// Clear queued semantic navigation events when consuming `poll_typed` directly.
+    pub fn discard_navigation(&mut self) {
+        self.queue.clear();
     }
 
     /// Discard buffered events (e.g., when transitioning into or out of a foreground `/dev/fb_lcd` app).

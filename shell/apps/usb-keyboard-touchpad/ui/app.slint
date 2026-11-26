@@ -1,99 +1,183 @@
-// USB BT Keyboard Touchpad: the on-screen keyboard with no field, the touchpad that is the
-// host's mouse while PTT has handed it over, and the host drawn as a monitor that
-// says which way it is reached and whether it is there. Placed as TV Media Box's
-// keyboard places them; everything arrives worked out from src/main.rs.
+// USB & Bluetooth HID Deck for M5Stack CardputerZero (320x170).
+//
+// Uses CardputerZero's built-in 46-key physical keyboard directly to send USB-C
+// or Bluetooth LE HID keyboard, mouse, and media reports to a host computer,
+// without an on-screen virtual keyboard.
 import { Shell, PanelStatus } from "@app/shell.slint";
-import { TextInputBody, KbCell } from "@flipctl/keyboard.slint";
+import { SelectorFrame } from "@flipctl/frame.slint";
+import { StatusBar } from "@flipctl/statusbar.slint";
 import { FlipperTheme } from "@theme";
 
-export { KbCell, PanelStatus }
+export { PanelStatus }
 
 export component AppWindow inherits Shell {
-    in property <int> pressed_slot: -1;
-
-    in property <[KbCell]> kb_cells;
-    in property <length> kb_chrome_x;
-    in property <length> kb_chrome_y;
-    in property <length> kb_chrome_w;
-    in property <length> kb_chrome_h;
-    in property <string> kb_lang_label;
-    in property <string> kb_tab_label;
-    in property <int> kb_tab_focus;
-    in property <int> kb_tab_pressed;
-    in property <[string]> buttons;
-
-    // Where the touchpad glyph is, and the PTT mark between it and the monitor:
-    // on the Flipper, or slid over to the host.
-    in property <length> pad_x: 70px;
-    in property <length> ptt_x: 144px;
     in property <bool> to_host;
-    // The monitor's two lines: how the host is reached, and how it is.
     in property <string> link;
     in property <string> state;
+    in property <string> last_sent;
+    in property <string> switch_hint;
 
     callback keyed(string, bool);
     key(text, down) => {
         root.keyed(text, down);
     }
 
-    TextInputBody {
-        title: "";
-        field_shown: false;
-        cells: root.kb_cells;
-        chrome_x: root.kb_chrome_x;
-        chrome_y: root.kb_chrome_y;
-        chrome_w: root.kb_chrome_w;
-        chrome_h: root.kb_chrome_h;
-        lang_label: root.kb_lang_label;
-        tab_label: root.kb_tab_label;
-        tab_focus: root.kb_tab_focus;
-        tab_pressed: root.kb_tab_pressed;
-        buttons: root.buttons;
-        pressed_slot: root.pressed_slot;
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: FlipperTheme.white;
     }
 
-    // The Flipper, under the pad while the pad is the Flipper's.
-    Image {
-        x: 26px;
-        y: 30px;
-        source: @image-url("icons/flipper_67x28.png");
+    StatusBar {
+        x: 0;
+        y: 0;
+        battery: PanelStatus.battery;
+        charging: PanelStatus.charging;
+        wifi_connected: PanelStatus.wifi_connected;
+        wifi_quality: PanelStatus.wifi_quality;
+        ethernet: PanelStatus.ethernet;
+        recording: PanelStatus.recording;
+        modem_available: PanelStatus.modem_available;
+        access_tech: PanelStatus.access_tech;
+        modem_quality: PanelStatus.modem_quality;
     }
 
-    // The host, with how it is reached and its state on its screen.
-    Image {
-        x: 174px;
-        y: 24px;
-        source: @image-url("icons/screen_keyboard_forwarding.png");
+    // Top CardputerZero -> Host link badge row (clean Kali Dark frames, no Flipper sprites).
+    SelectorFrame {
+        x: 8px;
+        y: 20px;
+        frame_w: 118px;
+        frame_h: 34px;
+        radius: FlipperTheme.box;
+        shadow: false;
+        filled: true;
+        fill_color: FlipperTheme.disabled_bg;
+        stroke: true;
+        stroke_color: FlipperTheme.divider;
     }
     Text {
-        x: 174px + Math.round((57px - (self.width - 1px)) / 2 / 1px) * 1px;
-        y: 26px;
-        text: root.link;
+        x: 8px + Math.round((118px - (self.width - 1px)) / 2 / 1px) * 1px;
+        y: 24px;
+        text: "CARDPUTER";
         font-size: 16px;
         color: FlipperTheme.black;
     }
     Text {
-        x: 174px + Math.round((57px - (self.width - 1px)) / 2 / 1px) * 1px;
-        y: 38px;
+        x: 8px + Math.round((118px - (self.width - 1px)) / 2 / 1px) * 1px;
+        y: 37px;
+        text: root.to_host ? "Mouse + Media" : "46-Key QWERTY";
+        font-size: 16px;
+        color: FlipperTheme.keycap_dim;
+    }
+
+    Text {
+        x: Math.floor((root.width - (self.width - 1px)) / 2 / 1px) * 1px;
+        y: 31px;
+        text: "--->";
+        font-size: 16px;
+        color: FlipperTheme.accent;
+    }
+
+    SelectorFrame {
+        x: root.width - 126px;
+        y: 20px;
+        frame_w: 118px;
+        frame_h: 34px;
+        radius: FlipperTheme.box;
+        shadow: false;
+        filled: true;
+        fill_color: FlipperTheme.disabled_bg;
+        stroke: true;
+        stroke_color: FlipperTheme.accent;
+    }
+    Text {
+        x: (root.width - 126px) + Math.round((118px - (self.width - 1px)) / 2 / 1px) * 1px;
+        y: 24px;
+        text: root.link;
+        font-size: 16px;
+        color: FlipperTheme.accent;
+    }
+    Text {
+        x: (root.width - 126px) + Math.round((118px - (self.width - 1px)) / 2 / 1px) * 1px;
+        y: 37px;
         text: root.state;
         font-size: 16px;
         color: FlipperTheme.black;
     }
 
-    // PTT, behind the pad, with the arrow saying where pressing it sends the pad.
-    Image {
-        x: root.to_host ? 103px : 160px;
-        y: 38px;
-        source: root.to_host ? @image-url("icons/arrow_left_11px.png") : @image-url("icons/arrow_right_11px.png");
+    // Live physical-keyboard / mouse HID status card.
+    SelectorFrame {
+        x: 8px;
+        y: 62px;
+        frame_w: root.width - 16px;
+        frame_h: 78px;
+        radius: FlipperTheme.box;
+        shadow: false;
+        filled: true;
+        fill_color: FlipperTheme.disabled_bg;
+        stroke: true;
+        stroke_color: FlipperTheme.divider;
     }
-    Image {
-        x: root.ptt_x;
-        y: 37px;
-        source: @image-url("icons/ptt_small_icon.png");
+
+    Text {
+        x: Math.round((root.width - (self.width - 1px)) / 2 / 1px) * 1px;
+        y: 70px;
+        text: root.to_host ? "Mode: MOUSE + MEDIA" : "Mode: PHYSICAL QWERTY -> HOST";
+        font-size: 16px;
+        color: FlipperTheme.accent;
     }
-    Image {
-        x: root.pad_x;
-        y: 23px;
-        source: @image-url("icons/touchpad.png");
+
+    SelectorFrame {
+        x: 22px;
+        y: 88px;
+        frame_w: root.width - 44px;
+        frame_h: 20px;
+        radius: FlipperTheme.menu;
+        shadow: false;
+        filled: true;
+        fill_color: FlipperTheme.white;
+        stroke: true;
+        stroke_color: FlipperTheme.divider;
+    }
+
+    Text {
+        x: Math.round((root.width - (self.width - 1px)) / 2 / 1px) * 1px;
+        y: 92px;
+        text: root.last_sent;
+        font-size: 16px;
+        color: FlipperTheme.black;
+    }
+
+    Text {
+        x: Math.round((root.width - (self.width - 1px)) / 2 / 1px) * 1px;
+        y: 118px;
+        text: root.to_host
+            ? "Arrows: Move   Enter/Bksp: Click   7/5: Vol"
+            : "Type directly (all 46 keys, Shift, Sym, Ctrl)";
+        font-size: 16px;
+        color: FlipperTheme.keycap_dim;
+    }
+
+    // Bottom physical-key legend (keeps digits 4..8 free for live typing).
+    Text {
+        x: 10px;
+        y: 148px;
+        text: "Esc: Close";
+        font-size: 16px;
+        color: FlipperTheme.status_dim;
+    }
+    Text {
+        x: Math.floor((root.width - (self.width - 1px)) / 2 / 1px) * 1px;
+        y: 148px;
+        text: "Fn+6: Mode";
+        font-size: 16px;
+        color: FlipperTheme.status_dim;
+    }
+    Text {
+        x: Math.floor((root.width - 10px - self.width) / 1px) * 1px;
+        y: 148px;
+        text: root.switch_hint;
+        font-size: 16px;
+        color: FlipperTheme.accent;
     }
 }

@@ -371,7 +371,11 @@ spin_h              = 20
 spin_frames         = 8
 boot_spin_lift      = 8
 
-# On-screen + physical keyboard text-input screen (aligned to keys 4, 5, 7, 8).
+# Physical keyboard text-input card (320x170, no on-screen virtual keyboard).
+kb_card_x           = 6
+kb_card_y           = 24
+kb_card_w           = 308
+kb_card_h           = 108
 kb_container_w      = 260
 kb_container_h      = 77
 kb_container_y      = 84
@@ -383,17 +387,18 @@ kb_peek_visible     = 2
 kb_peek_fold_lift   = 1
 kb_peek_falloff     = 2
 kb_glyph_y          = 2
-kb_title_y          = 26
+kb_title_y          = 36
 kb_input_pad        = 6
 kb_input_min_w      = 160
 kb_input_max_w      = 296
-kb_input_h          = 14
-kb_input_gap        = 14
-kb_warning_gap      = 3
-kb_warning_line_h   = 11
-kb_warning_lift     = 8
+kb_input_h          = 18
+kb_input_gap        = 20
+kb_warning_gap      = 7
+kb_warning_line_h   = 12
+kb_warning_lift     = 6
 kb_text_ink_h       = 11
-# Tab 1 (123) at x=78..130 (center 104 = key '5'), Tab 2 (Bksp) at x=190..242 (center 216 = key '7')!
+kb_hint_y           = 110
+kb_legend_y         = 146
 kb_tab_w            = 52
 kb_tab_h            = 15
 kb_tab_inset        = 78

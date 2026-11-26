@@ -3023,6 +3023,8 @@ struct WlApp {
     status: bool,
     /// Whether the app uses audio (and therefore stays unpaused in the background).
     audio: bool,
+    /// Whether the app reads physical `EvdevSource` directly (reserving only `Esc` & `Tab`).
+    raw_keyboard: bool,
     /// Which edge is the app's own top, so the bar goes there rather than on ours.
     rotate: flipper_ui::Rotate,
 }
@@ -3158,6 +3160,7 @@ fn start_hosted(
                 size: (w, h),
                 status: entry.status,
                 audio: entry.audio,
+                raw_keyboard: entry.raw_keyboard,
                 rotate: entry.rotate,
             });
             Some(entry.name.clone())
@@ -3502,7 +3505,7 @@ fn apply_text_input(
     screen.set_kb_tab_label(input.layout.tab_label().into());
     screen.set_kb_tab_focus(input.tab_focus());
     screen.set_kb_tab_pressed(input.tab_pressed());
-    screen.set_kb_buttons(demo::labels(&["Cancel", "", "", "", "Done"]));
+    screen.set_kb_buttons(demo::labels(&["", "", "", "", ""]));
     screen.set_kb_discard(input.discard.map_or(-1, |at| at as i32));
 }
 
@@ -6453,7 +6456,25 @@ fn panel(
         if let Some(front) =
             wl_front.clone().filter(|_| usb_ask.is_none() && !matches!(kb_for, KbFor::App { .. }))
         {
+            let front_raw_kbd =
+                wl_apps.iter().find(|a| a.name == front).is_some_and(|a| a.raw_keyboard);
             let mut leave = None;
+            if front_raw_kbd {
+                if let Some(ev_src) = input.as_mut() {
+                    while let Some(tev) = ev_src.poll_typed() {
+                        if tev == flipper_ui::evdev::TypedEvent::Esc {
+                            leave = Some(false);
+                        }
+                    }
+                }
+                for event in pending_input.drain(..) {
+                    if event.down && event.key == FlipperKey::AppSwitch {
+                        leave = Some(true);
+                    }
+                }
+            } else if let Some(ev_src) = input.as_mut() {
+                while ev_src.poll_typed().is_some() {}
+            }
             for event in pending_input.drain(..).chain(pending_remote.drain(..)) {
                 if keylog {
                     eprintln!("key            {:?} down={} to {front}", event.key, event.down);
@@ -6792,8 +6813,32 @@ fn panel(
                     flipper_ui::key::code::KEY_BACKSPACE => {
                         typed_batch.push(flipper_ui::evdev::TypedEvent::Backspace);
                     }
+                    111 => {
+                        typed_batch.push(flipper_ui::evdev::TypedEvent::Delete);
+                    }
                     flipper_ui::key::code::KEY_ENTER | flipper_ui::key::code::KEY_KPENTER => {
                         typed_batch.push(flipper_ui::evdev::TypedEvent::Enter);
+                    }
+                    flipper_ui::key::code::KEY_LEFT => {
+                        typed_batch.push(flipper_ui::evdev::TypedEvent::Left);
+                    }
+                    flipper_ui::key::code::KEY_RIGHT => {
+                        typed_batch.push(flipper_ui::evdev::TypedEvent::Right);
+                    }
+                    flipper_ui::key::code::KEY_UP | flipper_ui::key::code::KEY_PAGEUP => {
+                        typed_batch.push(flipper_ui::evdev::TypedEvent::Up);
+                    }
+                    flipper_ui::key::code::KEY_DOWN | flipper_ui::key::code::KEY_PAGEDOWN => {
+                        typed_batch.push(flipper_ui::evdev::TypedEvent::Down);
+                    }
+                    102 => {
+                        typed_batch.push(flipper_ui::evdev::TypedEvent::Home);
+                    }
+                    107 => {
+                        typed_batch.push(flipper_ui::evdev::TypedEvent::End);
+                    }
+                    flipper_ui::key::code::KEY_F8 => {
+                        typed_batch.push(flipper_ui::evdev::TypedEvent::F8);
                     }
                     _ => {
                         if let Some(ch) = raw.ch.filter(|c| !c.is_control()) {
@@ -6804,6 +6849,7 @@ fn panel(
             }
             for tev in typed_batch {
                 let Some(kb_in) = kb.as_mut() else { break };
+                let before_text = kb_in.text.clone();
                 let warning = kb_warning!(kb_in);
                 let saveable = match &kb_for {
                     KbFor::Passphrase { .. } => {
@@ -6818,16 +6864,52 @@ fn panel(
                         kb_in.type_char(ch);
                         None
                     }
+                    flipper_ui::evdev::TypedEvent::CtrlChar('u') => {
+                        kb_in.clear_line();
+                        None
+                    }
+                    flipper_ui::evdev::TypedEvent::CtrlChar('a')
+                    | flipper_ui::evdev::TypedEvent::Home => {
+                        kb_in.move_home();
+                        None
+                    }
+                    flipper_ui::evdev::TypedEvent::CtrlChar('e')
+                    | flipper_ui::evdev::TypedEvent::End => {
+                        kb_in.move_end();
+                        None
+                    }
                     flipper_ui::evdev::TypedEvent::Backspace => {
                         kb_in.type_backspace();
                         None
                     }
-                    flipper_ui::evdev::TypedEvent::Enter => kb_in.type_enter(saveable),
+                    flipper_ui::evdev::TypedEvent::Delete => {
+                        kb_in.type_delete();
+                        None
+                    }
+                    flipper_ui::evdev::TypedEvent::Left => {
+                        kb_in.move_left();
+                        None
+                    }
+                    flipper_ui::evdev::TypedEvent::Right => {
+                        kb_in.move_right();
+                        None
+                    }
+                    flipper_ui::evdev::TypedEvent::Up | flipper_ui::evdev::TypedEvent::Down => {
+                        kb_in.toggle_discard();
+                        None
+                    }
+                    flipper_ui::evdev::TypedEvent::Enter | flipper_ui::evdev::TypedEvent::F8 => {
+                        kb_in.type_enter(saveable)
+                    }
                     flipper_ui::evdev::TypedEvent::Esc => kb_in.key(FlipperKey::Back, saveable),
+                    flipper_ui::evdev::TypedEvent::CtrlChar(_)
+                    | flipper_ui::evdev::TypedEvent::F6 => None,
                 };
-                if let KbFor::Passphrase { error, .. } = &mut kb_for {
-                    if !error.is_empty() {
-                        error.clear();
+                if kb_in.text != before_text {
+                    if let KbFor::Passphrase { error, .. } = &mut kb_for {
+                        if !error.is_empty() {
+                            error.clear();
+                        }
                     }
                 }
                 kb_dirty = true;

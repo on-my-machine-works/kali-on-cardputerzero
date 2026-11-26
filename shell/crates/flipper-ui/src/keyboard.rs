@@ -527,8 +527,6 @@ fn steps(delta: i32, per: i32) -> i32 {
 impl TextInput {
     pub fn new(title: &str, text: &str) -> Self {
         let grid = Grid::new(Layout::Abc);
-        // Land on QWERTY, not on the number row: the numbers are the opt-in extra
-        // reached with Up.
         let row = usize::from(grid.has_peek());
         Self {
             title: title.to_string(),
@@ -540,7 +538,9 @@ impl TextInput {
             row,
             col: 0,
             shift: Shift::Off,
-            focus: Focus::Keys,
+            // CardputerZero has a physical 46-key QWERTY keyboard, so text-input
+            // prompts always focus the field directly with no on-screen keyboard.
+            focus: Focus::Field,
             pressed: None,
             ok_down: None,
             shift_tapped: None,
@@ -557,7 +557,7 @@ impl TextInput {
     /// A keyboard with no field, whose keys go to the app: [`TextInput::take_typed`]
     /// has them. `title` is the line above the keys.
     pub fn keys(title: &str) -> Self {
-        Self { keys_only: true, ..Self::new(title, "") }
+        Self { keys_only: true, focus: Focus::Keys, ..Self::new(title, "") }
     }
 
     /// What was typed since the last look, in order.
@@ -827,8 +827,8 @@ impl TextInput {
         }
     }
 
-    /// Handle a key. `valid` is the caller's verdict on the current text; Done is
-    /// refused while it is false, exactly as the disabled button refuses a press.
+    /// Handle a key. `valid` is the caller's verdict on the current text; Done / Enter
+    /// is refused while it is false.
     pub fn key(&mut self, key: FlipperKey, valid: bool) -> Option<Exit> {
         if let Some(at) = self.discard {
             match key {
@@ -836,7 +836,7 @@ impl TextInput {
                 FlipperKey::Up | FlipperKey::Down | FlipperKey::Left | FlipperKey::Right => {
                     self.discard = Some(1 - at);
                 }
-                FlipperKey::Ok => {
+                FlipperKey::Ok | FlipperKey::Run => {
                     self.discard = None;
                     if at == 1 {
                         return Some(Exit::Cancel);
@@ -853,13 +853,29 @@ impl TextInput {
             self.discard = Some(0);
             return None;
         }
-        match key {
-            FlipperKey::Back | FlipperKey::Escape => return Some(Exit::Cancel),
-            FlipperKey::Run => {
-                return if valid { Some(Exit::Save(self.text.clone())) } else { None };
+        if matches!(key, FlipperKey::Back | FlipperKey::Escape) {
+            return Some(Exit::Cancel);
+        }
+        if key == FlipperKey::Run {
+            return if valid { Some(Exit::Save(self.text.clone())) } else { None };
+        }
+
+        // Standard field prompts on CardputerZero have no on-screen virtual keyboard:
+        // focus stays permanently on `Focus::Field`, `Ok` (`Enter`) always confirms
+        // when valid, `Left`/`Right` move the caret, and `Edit` deletes.
+        if !self.keys_only {
+            self.focus = Focus::Field;
+            match key {
+                FlipperKey::Left => self.move_left(),
+                FlipperKey::Right => self.move_right(),
+                FlipperKey::Edit => self.backspace(),
+                FlipperKey::Ok if valid => return Some(Exit::Save(self.text.clone())),
+                _ => {}
             }
-            // The two tabs sit over their own keys, as in the prototype: 123 on
-            // X and backspace on V. Both flash the tab they belong to.
+            return None;
+        }
+
+        match key {
             FlipperKey::View => {
                 let next = if self.layout == Layout::Abc { Layout::Sym } else { Layout::Abc };
                 self.set_layout(next);
@@ -875,24 +891,7 @@ impl TextInput {
         }
 
         match self.focus {
-            Focus::Field => match key {
-                FlipperKey::Left => {
-                    self.cursor = self.cursor.saturating_sub(1);
-                    self.blink = std::time::Instant::now();
-                }
-                FlipperKey::Right => {
-                    self.cursor = (self.cursor + 1).min(self.text.chars().count());
-                    self.blink = std::time::Instant::now();
-                }
-                FlipperKey::Down => {
-                    self.focus = Focus::Keys;
-                    self.snap_to_row(0);
-                }
-                FlipperKey::Ok if valid => {
-                    return Some(Exit::Save(self.text.clone()));
-                }
-                _ => {}
-            },
+            Focus::Field => {}
             Focus::Tab123 | Focus::TabBackspace => match key {
                 FlipperKey::Up => {
                     self.focus = Focus::Keys;
@@ -922,14 +921,7 @@ impl TextInput {
                     FlipperKey::Left => self.move_to(self.row, (self.col + len - 1) % len),
                     FlipperKey::Right => self.move_to(self.row, (self.col + 1) % len),
                     FlipperKey::Up => {
-                        if self.row == 0 && self.keys_only {
-                            // No field to go up to
-                        } else if self.row == 0 {
-                            // Nothing above the top row but the field.
-                            self.focus = Focus::Field;
-                            self.cursor = self.text.chars().count();
-                            self.wave.drive(false, self.col);
-                        } else {
+                        if self.row > 0 {
                             let x = self.grid.cell_center_2x(self.row, self.col);
                             let row = self.row - 1;
                             self.move_to(row, self.grid.closest_col(row, x));
@@ -963,12 +955,8 @@ impl TextInput {
     }
 
     /// A key was let go. Returns whether anything changed.
-    ///
-    /// Holding OK on the shift key latches caps lock, the way the prototype's
-    /// document-level keyup listener does. The tap has already toggled shift by
-    /// then, which the latch overrides.
     pub fn release(&mut self, key: FlipperKey) -> bool {
-        if key != FlipperKey::Ok {
+        if !self.keys_only || key != FlipperKey::Ok {
             return false;
         }
         let Some(at) = self.ok_down.take() else {
@@ -986,7 +974,31 @@ impl TextInput {
 
     /// Insert a character typed directly on CardputerZero's physical 46-key keyboard.
     pub fn type_char(&mut self, ch: char) {
-        if self.discard.is_some() {
+        if let Some(at) = self.discard {
+            if matches!(
+                ch,
+                'f' | 'F'
+                    | 'x'
+                    | 'X'
+                    | 'z'
+                    | 'Z'
+                    | 'c'
+                    | 'C'
+                    | 'w'
+                    | 'W'
+                    | 's'
+                    | 'S'
+                    | 'a'
+                    | 'A'
+                    | 'd'
+                    | 'D'
+                    | 'j'
+                    | 'J'
+                    | 'k'
+                    | 'K'
+            ) {
+                self.discard = Some(1 - at);
+            }
             return;
         }
         if !self.keys_only {
@@ -996,7 +1008,7 @@ impl TextInput {
         self.insert(ch.encode_utf8(&mut buf));
     }
 
-    /// Delete one character from a physical Backspace press.
+    /// Delete one character before the caret from a physical Backspace press.
     pub fn type_backspace(&mut self) {
         if self.discard.is_some() {
             return;
@@ -1007,18 +1019,84 @@ impl TextInput {
         self.backspace();
     }
 
-    /// Submit from a physical Enter key when valid (or handle the discard prompt if open).
+    /// Delete one character at the caret (`Fn + Backspace` / `Delete`).
+    pub fn type_delete(&mut self) {
+        if self.discard.is_some() || self.keys_only {
+            return;
+        }
+        self.focus = Focus::Field;
+        let Some((at, ch)) = self.text.char_indices().nth(self.cursor) else {
+            return;
+        };
+        self.text.replace_range(at..at + ch.len_utf8(), "");
+        self.blink = std::time::Instant::now();
+    }
+
+    /// Move the caret one character left (`Fn + Left`).
+    pub fn move_left(&mut self) {
+        if let Some(at) = self.discard {
+            self.discard = Some(1 - at);
+            return;
+        }
+        self.cursor = self.cursor.saturating_sub(1);
+        self.blink = std::time::Instant::now();
+    }
+
+    /// Move the caret one character right (`Fn + Right`).
+    pub fn move_right(&mut self) {
+        if let Some(at) = self.discard {
+            self.discard = Some(1 - at);
+            return;
+        }
+        self.cursor = (self.cursor + 1).min(self.text.chars().count());
+        self.blink = std::time::Instant::now();
+    }
+
+    /// Jump caret to the start of the field (`Fn + K` / `Home` / `Ctrl+A`).
+    pub fn move_home(&mut self) {
+        if self.discard.is_some() {
+            return;
+        }
+        self.cursor = 0;
+        self.blink = std::time::Instant::now();
+    }
+
+    /// Jump caret to the end of the field (`Fn + N` / `End` / `Ctrl+E`).
+    pub fn move_end(&mut self) {
+        if self.discard.is_some() {
+            return;
+        }
+        self.cursor = self.text.chars().count();
+        self.blink = std::time::Instant::now();
+    }
+
+    /// Clear the entire field (`Ctrl+U`).
+    pub fn clear_line(&mut self) {
+        if self.discard.is_some() || self.keys_only {
+            return;
+        }
+        self.text.clear();
+        self.cursor = 0;
+        self.blink = std::time::Instant::now();
+    }
+
+    /// Toggle Keep / Discard selection when the discard dialog is open (`Fn + Up/Down`).
+    pub fn toggle_discard(&mut self) {
+        if let Some(at) = self.discard {
+            self.discard = Some(1 - at);
+        }
+    }
+
+    /// Submit from a physical Enter key whenever valid (or confirm the discard prompt if open).
     pub fn type_enter(&mut self, valid: bool) -> Option<Exit> {
         if self.discard.is_some() {
             return self.key(FlipperKey::Ok, valid);
         }
-        if self.focus == Focus::Field || self.changed() {
-            if valid {
-                return Some(Exit::Save(self.text.clone()));
-            }
-            return None;
+        if valid {
+            Some(Exit::Save(self.text.clone()))
+        } else {
+            None
         }
-        self.key(FlipperKey::Ok, valid)
     }
 
     /// Latch caps lock, which a long press on the shift key does.
@@ -1033,8 +1111,12 @@ impl TextInput {
             && self.cell(self.row, self.col).is_some_and(|c| c.kind == Kind::Shift)
     }
 
-    /// Every cell, placed. The number row is placed by the wave.
+    /// Placed cells (empty for standard field prompts, since CardputerZero uses
+    /// its physical 46-key keyboard instead of an on-screen virtual keyboard).
     pub fn placed(&self) -> Vec<Placed> {
+        if !self.keys_only {
+            return Vec::new();
+        }
         let (center, amp) = self.wave.eval();
         let kx = keyboard_x(&self.grid);
         let ky = metric::KB_CONTAINER_Y + metric::KB_INNER_Y;

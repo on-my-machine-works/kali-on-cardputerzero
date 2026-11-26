@@ -88,6 +88,9 @@ pub struct AppEntry {
     /// than drawing a picture of one, and simply loses its top 13 pixels. An app on the
     /// framework fills the real bar in itself and leaves this off.
     pub status: bool,
+    /// Whether the app reads CardputerZero's physical 46-key `EvdevSource` directly
+    /// (so `czctl` reserves only `KEY_ESC` to leave and `KEY_TAB` for the switcher).
+    pub raw_keyboard: bool,
     /// Which way the app's picture is turned relative to the panel.
     ///
     /// The panel is landscape and some apps are drawn portrait, to be read with the
@@ -412,6 +415,7 @@ pub fn parse_manifest(
         size: py_size(src, "size"),
         audio: py_bool(src, "audio").unwrap_or(false),
         status: py_bool(src, "status").unwrap_or(false),
+        raw_keyboard: py_bool(src, "raw_keyboard").unwrap_or(false),
         rotate: match py_string(src, "rotate").unwrap_or_default().as_str() {
             "left" => Rotate::Left,
             "right" => Rotate::Right,
