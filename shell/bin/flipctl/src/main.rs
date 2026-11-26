@@ -326,6 +326,7 @@ mod demo {
         HdmiMode,
         Stealth,
         WebKvm,
+        CapUart,
         SwitchApplaunch,
         FbApp {
             prog: &'static str,
@@ -385,6 +386,7 @@ mod demo {
         HdmiMode,
         Stealth,
         WebKvm,
+        CapUart,
     }
 
     pub struct Row {
@@ -433,6 +435,7 @@ mod demo {
             Row { label: "Grove 5V Out", icon: 0, frames: 1, stat: Stat::Rail(cz::Rail::Grove5v), act: Act::Rail(cz::Rail::Grove5v) },
             Row { label: "Grove Pin Mode", icon: 0, frames: 1, stat: Stat::Rail(cz::Rail::GroveMode), act: Act::Rail(cz::Rail::GroveMode) },
             Row { label: "USB-C OTG Mux", icon: 0, frames: 1, stat: Stat::Rail(cz::Rail::UsbMux), act: Act::Rail(cz::Rail::UsbMux) },
+            Row { label: "14P Cap UART", icon: 0, frames: 1, stat: Stat::CapUart, act: Act::CapUart },
             Row { label: "IR Transceiver", icon: 0, frames: 1, stat: Stat::None, act: Act::HostApp("ir-arsenal") },
             Row { label: "Voice Recorder", icon: 0, frames: 1, stat: Stat::None, act: Act::HostApp("voice-recorder") },
             Row { label: "BT/USB HID Pad", icon: 0, frames: 1, stat: Stat::None, act: Act::HostApp("bt-hid-remote") },
@@ -562,6 +565,7 @@ mod demo {
             Stat::HdmiMode => cz::hdmi_status(),
             Stat::Stealth => cz::stealth_status(),
             Stat::WebKvm => cz::web_kvm_status(),
+            Stat::CapUart => cz::cap_uart_status(),
         }
     }
 
@@ -4792,6 +4796,10 @@ fn panel(
         Rollback,
         /// Update a modified profile, losing its changes outside /etc.
         ForceUpdate,
+        /// Reboot to apply a boot-time hardware change (e.g. Cap UART /dev/ttyS0).
+        RebootNow,
+        /// Enable Cap UART in config.txt and reboot immediately for GPS Cap.
+        EnableCapUartAndReboot,
     }
     let mut dialog: Option<Dialog> = None;
     // A dialog that only reports, and when it closes by itself: the lines it was
@@ -8154,7 +8162,10 @@ fn panel(
             };
             let is_toggle = matches!(
                 row.act,
-                demo::Act::Airplane | demo::Act::Rail(_) | demo::Act::Stealth
+                demo::Act::Airplane
+                    | demo::Act::Rail(_)
+                    | demo::Act::Stealth
+                    | demo::Act::CapUart
             );
             let is_step = matches!(
                 row.act,
@@ -8204,6 +8215,24 @@ fn panel(
                                 #[cfg(feature = "remote")]
                                 {
                                     kvm_sync_now = true;
+                                }
+                            }
+                        }
+                        demo::Act::CapUart => {
+                            if let Some(next) = flipper_ui::leds::cz::toggle_cap_uart() {
+                                if next != flipper_ui::leds::cz::cap_uart_live() {
+                                    dialog = Some(Dialog {
+                                        lines: vec![
+                                            format!(
+                                                "14P Cap UART set to {}",
+                                                if next { "ON" } else { "OFF" }
+                                            ),
+                                            "Reboot now to apply?".into(),
+                                        ],
+                                        left: "Later",
+                                        right: "Reboot",
+                                        act: DialogAct::RebootNow,
+                                    });
                                 }
                             }
                         }
@@ -8322,6 +8351,24 @@ fn panel(
                                 }
                             }
                         }
+                        demo::Act::CapUart => {
+                            if let Some(next) = flipper_ui::leds::cz::toggle_cap_uart() {
+                                if next != flipper_ui::leds::cz::cap_uart_live() {
+                                    dialog = Some(Dialog {
+                                        lines: vec![
+                                            format!(
+                                                "14P Cap UART set to {}",
+                                                if next { "ON" } else { "OFF" }
+                                            ),
+                                            "Reboot now to apply?".into(),
+                                        ],
+                                        left: "Later",
+                                        right: "Reboot",
+                                        act: DialogAct::RebootNow,
+                                    });
+                                }
+                            }
+                        }
                         _ => {}
                     }
                     demo::apply_menu(&screen, stack.last().unwrap().0, &net_now);
@@ -8414,6 +8461,13 @@ fn panel(
                                 detail_dirty = true;
                             }
                         }
+                    } else if slot == Some(4) && d.act == DialogAct::RebootNow {
+                        eprintln!("action         rebooting to apply Cap UART setting");
+                        flipper_ui::system::reboot();
+                    } else if slot == Some(4) && d.act == DialogAct::EnableCapUartAndReboot {
+                        let _ = flipper_ui::leds::cz::set_cap_uart(true);
+                        eprintln!("action         enabled Cap UART & rebooting for GPS");
+                        flipper_ui::system::reboot();
                     } else if slot == Some(4) && d.act == DialogAct::ClearAirplane {
                         net.set_airplane(false);
                         // menu.js proceeds to the action the dialog interrupted.
@@ -9261,6 +9315,24 @@ fn panel(
                             }
                         }
                         demo::Act::FbApp { prog, args, .. } => {
+                            if row.label == "GPS (LoRa Cap)"
+                                && !flipper_ui::leds::cz::cap_uart_live()
+                            {
+                                dialog = Some(Dialog {
+                                    lines: vec![
+                                        if flipper_ui::leds::cz::cap_uart_configured() {
+                                            "14P Cap UART awaits reboot".into()
+                                        } else {
+                                            "14P Cap UART (/dev/ttyS0) is OFF".into()
+                                        },
+                                        "Enable 14P Cap UART & reboot?".into(),
+                                    ],
+                                    left: "Back",
+                                    right: "Reboot",
+                                    act: DialogAct::EnableCapUartAndReboot,
+                                });
+                                continue;
+                            }
                             let res = run_fb_app(
                                 row.label,
                                 prog,
@@ -9311,7 +9383,8 @@ fn panel(
                         | demo::Act::UsbGadget
                         | demo::Act::HdmiMode
                         | demo::Act::Stealth
-                        | demo::Act::WebKvm => {}
+                        | demo::Act::WebKvm
+                        | demo::Act::CapUart => {}
                     }
                 }
             }

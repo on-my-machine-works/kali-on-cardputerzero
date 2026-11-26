@@ -1243,6 +1243,7 @@ stage_launcher() {
     install -m 755 "$SCRIPT_DIR/scripts/cz-hdmi-hotplug"   "$MNT_ROOT/usr/local/bin/cz-hdmi-hotplug"
     install -m 755 "$SCRIPT_DIR/scripts/cz-stealth"        "$MNT_ROOT/usr/local/bin/cz-stealth"
     install -m 755 "$SCRIPT_DIR/scripts/cz-ota"            "$MNT_ROOT/usr/local/bin/cz-ota"
+    install -m 755 "$SCRIPT_DIR/scripts/cz-cap-uart"       "$MNT_ROOT/usr/local/bin/cz-cap-uart"
     install -m 755 "$SCRIPT_DIR/scripts/cz-kali-menu"      "$MNT_ROOT/usr/local/bin/cz-kali-menu"
     install -m 755 "$SCRIPT_DIR/scripts/cz-kali-pkgs"      "$MNT_ROOT/usr/local/bin/cz-kali-pkgs"
 
@@ -1339,6 +1340,10 @@ DOCEOF
     cat > "$MNT_ROOT/etc/default/cz-stealth" <<'EOF'
 # CardputerZero Hostile-Network Stealth Mode: on | off
 STEALTH_MODE=off
+EOF
+    cat > "$MNT_ROOT/etc/default/cz-cap-uart" <<'EOF'
+# CardputerZero 14-pin Cap UART (/dev/ttyS0 for LoRa/GNSS GPS): on | off
+CAP_UART_MODE=off
 EOF
     local git_rev build_num rel_ver rel_ch
     git_rev="$(git -C "$SCRIPT_DIR" rev-parse --short=7 HEAD 2>/dev/null || echo unknown)"
@@ -2359,7 +2364,7 @@ CHROOT
     vcheck "grep -qx 'uinput' '$MNT_ROOT/etc/modules-load.d/cardputerzero.conf' && grep -q 'KERNEL==\"uinput\"' '$MNT_ROOT/etc/udev/rules.d/70-cardputerzero-peripherals.rules'" "Missing uinput autoload or udev rule"
     vcheck "dpkg_installed sway && dpkg_installed umtp-responder && dpkg_installed fuse3 && dpkg_installed iperf3 && dpkg_installed zstd" "Missing sway/umtp-responder/fuse3/iperf3/zstd"
     vcheck "dpkg_installed python3-requests && dpkg_installed kali-tweaks" "Missing python3-requests or kali-tweaks"
-    for kbin in cz-sysmon cz-term cz-term80 cz-wifiscan cz-lanscan cz-pktsniff cz-usbgadget cz-kali-menu cz-kali-pkgs cz-usb-gadget cz-flipper-gadget cz-badusb cz-ui-mode cz-hw-status cz-hdmi-hotplug cz-stealth cz-ota monstart monstop; do
+    for kbin in cz-sysmon cz-term cz-term80 cz-wifiscan cz-lanscan cz-pktsniff cz-usbgadget cz-kali-menu cz-kali-pkgs cz-usb-gadget cz-flipper-gadget cz-badusb cz-ui-mode cz-hw-status cz-hdmi-hotplug cz-stealth cz-ota cz-cap-uart monstart monstop; do
         vcheck "[[ -x '$MNT_ROOT/usr/local/bin/$kbin' ]]" "Missing helper binary/script: /usr/local/bin/$kbin"
     done
     for kdt in kali-wifi.desktop kali-term80.desktop kali-zsh.desktop kali-menu.desktop kali-btop.desktop kali-lanscan.desktop kali-pktsniff.desktop kali-usbgadget.desktop kali-pkgs.desktop kali-czctl.desktop; do

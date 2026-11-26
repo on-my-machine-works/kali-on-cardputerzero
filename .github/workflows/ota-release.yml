@@ -89,17 +89,34 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.ota.outputs.ota_tag }}
           OTA_CHANNEL: ${{ inputs.channel || 'release' }}
+          RELEASE_SUMMARY: ${{ inputs.release_summary || '' }}
         run: |
           archive="output/ota/kali-cz-ota-${TAG}-arm64.tar.xz"
           sha_file="${archive}.sha256"
           sha_val="$(awk '{print $1}' "$sha_file")"
           size_h="$(du -h "$archive" | awk '{print $1}')"
+          base_img_tag="$(gh api repos/${GITHUB_REPOSITORY}/releases --jq '[.[] | select(.draft == false) | select([.assets[].name] | index("kali-cardputerzero-arm64.img.xz"))] | .[0].tag_name // empty' 2>/dev/null || true)"
 
           {
             echo "## Kali Cyberdeck OTA Update (\`${TAG}\`)"
             echo ""
             echo "Signed on-device OTA bundle for M5Stack CardputerZero. Install directly from **\`Menu -> Settings -> Update Kali CZ\`** or run \`sudo cz-ota update\` on the device."
+            if [[ -n "$base_img_tag" ]]; then
+              echo ""
+              echo "> **First-time microSD flash?** Download \`kali-cardputerzero-arm64.img.xz\` from [**\`${base_img_tag}\`**](https://github.com/${GITHUB_REPOSITORY}/releases/tag/${base_img_tag}), then update over-the-air to \`${TAG}\`."
+            fi
+            if [[ -n "${RELEASE_SUMMARY}" ]]; then
+              echo ""
+              echo "### Changes"
+              summary_expanded="${RELEASE_SUMMARY//\\n/$'\n'}"
+              if [[ "$summary_expanded" == "- "* || "$summary_expanded" == "#"* ]]; then
+                printf '%s\n' "$summary_expanded"
+              else
+                echo "- ${summary_expanded}"
+              fi
+            fi
             echo ""
+            echo "### Checksums (\`SHA-256\`)"
             echo "| File | Size | SHA-256 |"
             echo "| :--- | :---: | :--- |"
             echo "| \`$(basename "$archive")\` | \`${size_h}\` | \`${sha_val}\` |"

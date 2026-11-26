@@ -122,7 +122,7 @@ ln -sfn czctl "$PAYLOAD/usr/bin/flipctl"
 ln -sfn cz-term "$PAYLOAD/usr/bin/cz-flipper-term"
 
 for s in cz-kali-menu cz-kali-pkgs cz-usb-gadget cz-flipper-gadget cz-badusb \
-         cz-ui-mode cz-hw-status cz-hdmi-hotplug cz-stealth cz-ota; do
+         cz-ui-mode cz-hw-status cz-hdmi-hotplug cz-stealth cz-ota cz-cap-uart; do
     install -m 755 "$REPO_ROOT/scripts/$s" "$PAYLOAD/usr/local/bin/$s"
 done
 
@@ -155,6 +155,13 @@ if [[ ! -f /etc/default/cz-hdmi-desktop ]]; then
 HDMI_DESKTOP_MODE=auto
 HDMI_UNPLUG_DELAY=5
 EOF
+fi
+if [[ ! -f /etc/default/cz-cap-uart ]]; then
+    if [[ -f /boot/firmware/config.txt ]] && grep -qx 'enable_uart=1' /boot/firmware/config.txt 2>/dev/null; then
+        printf '# CardputerZero 14-pin Cap UART (/dev/ttyS0 for LoRa/GNSS GPS): on | off\nCAP_UART_MODE=on\n' > /etc/default/cz-cap-uart
+    else
+        printf '# CardputerZero 14-pin Cap UART (/dev/ttyS0 for LoRa/GNSS GPS): on | off\nCAP_UART_MODE=off\n' > /etc/default/cz-cap-uart
+    fi
 fi
 if ! grep -qx 'uinput' /etc/modules-load.d/cardputerzero.conf 2>/dev/null; then
     echo "uinput" >> /etc/modules-load.d/cardputerzero.conf

@@ -144,7 +144,7 @@ CZ_IMAGE_EPOCH="1"
 CZ_KERNEL_ABI="${DEPLOY_KABI}"
 CZREL
 
-for s in cz-kali-menu cz-kali-pkgs cz-usb-gadget cz-flipper-gadget cz-badusb cz-ui-mode cz-hw-status cz-hdmi-hotplug cz-stealth cz-ota; do
+for s in cz-kali-menu cz-kali-pkgs cz-usb-gadget cz-flipper-gadget cz-badusb cz-ui-mode cz-hw-status cz-hdmi-hotplug cz-stealth cz-ota cz-cap-uart; do
     cp -a "$REPO_ROOT/scripts/$s" "$TMP_BUNDLE/usr/local/bin/$s"
 done
 
@@ -438,15 +438,22 @@ wifi.powersave = 3
 EOF
 iw dev wlan0 set power_save on 2>/dev/null || true
 
-# Boot config.txt DVFS & ACT LED tuning (effective on reboot; ACT trigger also applied live)
+# Boot config.txt DVFS & ACT LED tuning (preserves user's cz-cap-uart ON/OFF choice!)
+install -d -m 755 /etc/default
+if [[ ! -f /etc/default/cz-cap-uart ]]; then
+    if [[ -f /boot/firmware/config.txt ]] && grep -qx 'enable_uart=1' /boot/firmware/config.txt 2>/dev/null; then
+        printf '# CardputerZero 14-pin Cap UART (/dev/ttyS0 for LoRa/GNSS GPS): on | off\nCAP_UART_MODE=on\n' > /etc/default/cz-cap-uart
+    else
+        printf '# CardputerZero 14-pin Cap UART (/dev/ttyS0 for LoRa/GNSS GPS): on | off\nCAP_UART_MODE=off\n' > /etc/default/cz-cap-uart
+    fi
+fi
 if [[ -f /boot/firmware/config.txt && -w /boot/firmware/config.txt ]]; then
     sed -i '/^arm_boost=1$/d' /boot/firmware/config.txt
     if ! grep -qxF 'dtparam=act_led_trigger=mmc0' /boot/firmware/config.txt; then
         sed -i '/^dtparam=audio=off$/a dtparam=act_led_trigger=mmc0' /boot/firmware/config.txt
     fi
-    sed -i 's/^enable_uart=1$/enable_uart=0/' /boot/firmware/config.txt
     sed -i '/^arm_freq_min=/d' /boot/firmware/config.txt
-    for kv in "enable_tvout=0" "initial_turbo=15" "arm_freq=1000" "core_freq_min=150" \
+    for kv in "enable_tvout=0" "initial_turbo=15" "arm_freq=1000" \
               "gpu_freq_min=150" "sdram_freq_min=250" "over_voltage_min=-2"; do
         k="\${kv%%=*}"
         if grep -qE "^\${k}=" /boot/firmware/config.txt; then
@@ -455,6 +462,11 @@ if [[ -f /boot/firmware/config.txt && -w /boot/firmware/config.txt ]]; then
             sed -i "/^disable_overscan=1$/a \${kv}" /boot/firmware/config.txt
         fi
     done
+    if grep -q '^CAP_UART_MODE=.*on' /etc/default/cz-cap-uart 2>/dev/null; then
+        /usr/local/bin/cz-cap-uart on >/dev/null 2>&1 || true
+    else
+        /usr/local/bin/cz-cap-uart off >/dev/null 2>&1 || true
+    fi
 fi
 [[ -w /sys/class/leds/ACT/trigger ]] && echo mmc0 > /sys/class/leds/ACT/trigger 2>/dev/null || true
 

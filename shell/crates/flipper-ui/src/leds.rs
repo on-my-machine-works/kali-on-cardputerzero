@@ -763,6 +763,46 @@ pub mod cz {
             }
         }
     }
+
+    // ── 14-Pin Cap Header UART (`/dev/ttyS0` for LoRa/GNSS GPS) ───────────────
+
+    pub fn cap_uart_configured() -> bool {
+        for p in ["/boot/firmware/config.txt", "/boot/config.txt"] {
+            if let Ok(text) = std::fs::read_to_string(p) {
+                return text.lines().any(|l| l.trim() == "enable_uart=1");
+            }
+        }
+        false
+    }
+
+    pub fn cap_uart_live() -> bool {
+        Path::new("/dev/ttyS0").exists()
+    }
+
+    pub fn cap_uart_status() -> String {
+        match (cap_uart_configured(), cap_uart_live()) {
+            (true, true) => "< ON >".into(),
+            (false, false) => "< OFF >".into(),
+            (true, false) => "< ON (Reboot) >".into(),
+            (false, true) => "< OFF (Reboot) >".into(),
+        }
+    }
+
+    pub fn set_cap_uart(on: bool) -> bool {
+        if !Path::new("/usr/local/bin/cz-cap-uart").exists() {
+            return false;
+        }
+        let arg = if on { "on" } else { "off" };
+        Command::new("sudo")
+            .args(["-n", "/usr/local/bin/cz-cap-uart", arg])
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    pub fn toggle_cap_uart() -> Option<bool> {
+        let next = !cap_uart_configured();
+        set_cap_uart(next).then_some(next)
+    }
 }
 
 #[cfg(test)]

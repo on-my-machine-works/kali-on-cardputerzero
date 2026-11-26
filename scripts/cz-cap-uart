@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# cz-cap-uart - Toggle 14-pin Cap header UART (/dev/ttyS0 on GPIO14/15) for serial Caps & modules
+#
+# Why this is a boot-time switch on Raspberry Pi CM0 (BCM2837):
+#   - OFF (default): enable_uart=0 + core_freq_min=150 -> VideoCore scales down to 150 MHz at idle
+#     (lowest battery draw) and up to 400 MHz turbo.
+#   - ON:            enable_uart=1 (no core_freq_min=150) -> start.elf enables 8250 /dev/ttyS0 and
+#     locks core_freq=250 MHz so ATGM336H GPS NMEA baud timing never drifts.
+#
+# Usage:
+#   sudo cz-cap-uart on       # Enable /dev/ttyS0 in /boot/firmware/config.txt (takes effect on reboot)
+#   sudo cz-cap-uart off      # Disable /dev/ttyS0 for lowest idle power (takes effect on reboot)
+#   sudo cz-cap-uart toggle   # Flip configured mode
+#   cz-cap-uart status        # Show configured & live /dev/ttyS0 state
+
+set -euo pipefail
+
+CONF_STATE="/etc/default/cz-cap-uart"
+BOOT_CFG="/boot/firmware/config.txt"
+[[ -f "$BOOT_CFG" ]] || BOOT_CFG="/boot/config.txt"
+
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        exec sudo "$0" "$@"
+    fi
+}
+
+is_configured_on() {
+    if [[ -f "$BOOT_CFG" ]] && grep -qx 'enable_uart=1' "$BOOT_CFG" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+set_mode_on() {
+    install -d -m 755 /etc/default
+    cat > "$CONF_STATE" <<'EOF'
+# CardputerZero 14-pin Cap UART (/dev/ttyS0 for LoRa/GNSS GPS): on | off
+CAP_UART_MODE=on
+EOF
+    if [[ -f "$BOOT_CFG" && -w "$BOOT_CFG" ]]; then
+        sed -i '/^core_freq_min=/d' "$BOOT_CFG"
+        if grep -q '^enable_uart=' "$BOOT_CFG"; then
+            sed -i 's/^enable_uart=.*/enable_uart=1/' "$BOOT_CFG"
+        else
+            printf '\nenable_uart=1\n' >> "$BOOT_CFG"
+        fi
+        sync
+    fi
+    if [[ -c /dev/ttyS0 ]]; then
+        echo "14P Cap UART (/dev/ttyS0): ON (active)"
+    else
+        echo "14P Cap UART (/dev/ttyS0): ON (reboot required to activate /dev/ttyS0)"
+    fi
+}
+
+set_mode_off() {
+    install -d -m 755 /etc/default
+    cat > "$CONF_STATE" <<'EOF'
+# CardputerZero 14-pin Cap UART (/dev/ttyS0): on | off
+CAP_UART_MODE=off
+EOF
+    if [[ -f "$BOOT_CFG" && -w "$BOOT_CFG" ]]; then
+        if grep -q '^enable_uart=' "$BOOT_CFG"; then
+            sed -i 's/^enable_uart=.*/enable_uart=0/' "$BOOT_CFG"
+        else
+            printf '\nenable_uart=0\n' >> "$BOOT_CFG"
+        fi
+        if ! grep -q '^core_freq_min=' "$BOOT_CFG"; then
+            if grep -q '^arm_freq=' "$BOOT_CFG"; then
+                sed -i '/^arm_freq=/a core_freq_min=150' "$BOOT_CFG"
+            else
+                printf 'core_freq_min=150\n' >> "$BOOT_CFG"
+            fi
+        fi
+        sync
+    fi
+    if [[ ! -c /dev/ttyS0 ]]; then
+        echo "14P Cap UART (/dev/ttyS0): OFF (150 MHz idle / 400 MHz turbo VPU active)"
+    else
+        echo "14P Cap UART (/dev/ttyS0): OFF (reboot required to release /dev/ttyS0)"
+    fi
+}
+
+cmd="${1:-status}"
+case "$cmd" in
+    on|enable)
+        require_root "$@"
+        set_mode_on
+        ;;
+    off|disable)
+        require_root "$@"
+        set_mode_off
+        ;;
+    toggle)
+        require_root "$@"
+        if is_configured_on; then
+            set_mode_off
+        else
+            set_mode_on
+        fi
+        ;;
+    status)
+        cfg="off"
+        is_configured_on && cfg="on"
+        live="absent"
+        [[ -c /dev/ttyS0 ]] && live="present"
+        echo "Configured (config.txt) : ${cfg^^}"
+        echo "Live /dev/ttyS0 node    : ${live}"
+        if [[ "$cfg" == "on" && "$live" == "absent" ]] || [[ "$cfg" == "off" && "$live" == "present" ]]; then
+            echo "Reboot Pending          : YES (run 'sudo reboot' to apply)"
+        else
+            echo "Reboot Pending          : no"
+        fi
+        ;;
+    *)
+        echo "Usage: $0 {on|off|toggle|status}" >&2
+        exit 1
+        ;;
+esac

@@ -98,7 +98,7 @@ You do not need to clone this repository or re-flash your microSD card to update
   - **Hosted Wayland Deck**: `USB Arsenal`, `Wi-Fi Recon`, `Bluetooth & BLE`, `IR Arsenal` (`/dev/lirc0` TX + `/dev/lirc1` RX + `~/ir/*.ir` IR parser), `Net Matrix`, `LAN Recon`, `Packet Capture`, `System Monitor`.
   - **Terminals & TUIs**: `Terminal (Zsh)` (`cz-term` ProFont `53x14` / `45x11` / `53x15` / `80x24` from [`u8g2`](https://github.com/olikraus/u8g2) BDF glyphs with live `Ctrl+Alt+F` font zoom), `Term 80x24 (Dense)`, `Kali QuickMenu` (`cz-kali-menu`), `BadUSB & ISOs` (`cz-badusb --menu`), and `Kali Packages` (`cz-kali-pkgs`).
 - **Cardputer HW**:
-  - Live controls for `Audio Volume`, `LCD Backlight`, `LCD Timeout` (synced with `~/.config/cardputerzero/config.json`), `USB OTG Gadget`, `HDMI Desktop`, `EXT 5V Rail`, `Grove 5V Out`, `Grove Pin Mode`, and `USB-C OTG Mux`.
+  - Live controls for `Audio Volume`, `LCD Backlight`, `LCD Timeout` (synced with `~/.config/cardputerzero/config.json`), `USB OTG Gadget`, `HDMI Desktop`, `EXT 5V Rail`, `Grove 5V Out`, `Grove Pin Mode`, `USB-C OTG Mux`, and `14P Cap UART` (`cz-cap-uart on|off|status` to switch `/dev/ttyS0` between 14-pin serial Cap mode and 150 MHz idle battery-save mode).
   - Direct launchers for `Voice Recorder`, `BT/USB HID Pad` (BLE GATT + USB HID touchpad/keyboard), and official [CardputerZero](https://github.com/CardputerZero) hardware apps (`Camera`, `Compass`, `IR Remote`, `IR Chat`, `LoRa SX1262`, `GPS`, `NFC`, `SubG Chat`, and `M5 Files`).
 - **Switch Between `czctl` and Stock `APPLaunch` (`cz-ui-mode`)**:
   ```bash
@@ -226,7 +226,7 @@ make -C src && make -C src check
 - [`shell/`](shell/): Rust/Slint workspace for `czctl`, `:8899` Web KVM, headless `sway` Wayland host, `kali-usb-deck`, `cz-boot-menu`, and 5 native Wayland apps (`sysmon`, `recorder`, `radio`, `disk-benchmark`, `usb-keyboard-touchpad`).
 - [`overlays/`](overlays/): Wayland `.fap.sh` app launchers (`apps/`), BadUSB `.duck` & IR `.ir` payloads (`payloads/`), Ed25519 OTA public key (`ota/ota-pub.pem`), `umtprd.conf` (`etc/umtprd/`), `czctl.service`, `cz-stealth.service` & `seat1` udev rules (`systemd/`), and optional Btrfs/router overlays.
 - [`src/`](src/): `320x170` C utilities (`cz-term.c` ProFont terminal, `cz-wifiscan.c`, `cz-term80.c`, `cz-sysmon.c`, `cz-lanscan.c`, `cz-pktsniff.c`, `cz-usbgadget.c`) and `libcz_fb_lcd.c` framebuffer shim.
-- [`scripts/`](scripts/): Cortex-A53 shell builder (`build-cz-shell.sh`), signed OTA bundle builder (`build-ota-bundle.sh`), upstream lockfile resolver (`resolve-upstream.py` + `upstream.lock.json`), launcher patcher (`configure-kali-launcher.py`), splash generator (`gen-kali-splash.py`), live SSH deployer (`deploy-live.sh`), and on-device tools (`cz-ota`, `cz-stealth`, `cz-ui-mode`, `cz-usb-gadget`, `cz-flipper-gadget`, `cz-badusb`, `cz-kali-menu`, `cz-kali-pkgs`, `cz-hdmi-hotplug`, `cz-hw-status`).
+- [`scripts/`](scripts/): Cortex-A53 shell builder (`build-cz-shell.sh`), signed OTA bundle builder (`build-ota-bundle.sh`), upstream lockfile resolver (`resolve-upstream.py` + `upstream.lock.json`), launcher patcher (`configure-kali-launcher.py`), splash generator (`gen-kali-splash.py`), live SSH deployer (`deploy-live.sh`), and on-device tools (`cz-ota`, `cz-stealth`, `cz-cap-uart`, `cz-ui-mode`, `cz-usb-gadget`, `cz-flipper-gadget`, `cz-badusb`, `cz-kali-menu`, `cz-kali-pkgs`, `cz-hdmi-hotplug`, `cz-hw-status`).
 
 ## Shout-Out
 
