@@ -159,6 +159,9 @@ pub struct Session {
     seen: u64,
     /// What the reader was last told, so telling it again is free.
     streaming: bool,
+    /// Whether the hosted process group is currently frozen via `SIGSTOP` while
+    /// hidden in the background so idle apps consume 0% CPU and 0 wakeups/sec.
+    paused: bool,
 }
 
 /// The handover between the thread that reads frames and the loop that shows them.
@@ -727,7 +730,23 @@ impl Session {
             reader: Some(reader),
             seen: 0,
             streaming: false,
+            paused: false,
         })
+    }
+
+    /// Freeze or resume the hosted app's process group (`SIGSTOP` / `SIGCONT`).
+    /// Used for non-audio backgrounded apps so they draw 0 mW while out of sight
+    /// yet resume instantaneously when focused or shown in the switcher.
+    pub fn set_paused(&mut self, want: bool) {
+        if self.paused == want {
+            return;
+        }
+        self.paused = want;
+        let group = -(self.app.id() as i32);
+        let sig = if want { libc::SIGSTOP } else { libc::SIGCONT };
+        unsafe {
+            libc::kill(group, sig);
+        }
     }
 
     /// True while the app is still running.
@@ -849,6 +868,13 @@ impl Drop for Session {
         // The group next, because the command is a shell and the program is its child:
         // signalling only what we spawned leaves a game running with no window. The
         // runtime directory is the host's and outlives every app in it.
+        if self.paused {
+            let group = -(self.app.id() as i32);
+            unsafe {
+                libc::kill(group, libc::SIGCONT);
+            }
+            self.paused = false;
+        }
         crate::app::stop_group(self.app.id());
         let _ = self.app.kill();
         let _ = self.app.wait();

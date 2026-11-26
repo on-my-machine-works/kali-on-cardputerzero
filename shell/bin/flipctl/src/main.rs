@@ -3021,6 +3021,8 @@ struct WlApp {
     size: (u32, u32),
     /// Whether flipctl paints its status bar over this app's frames.
     status: bool,
+    /// Whether the app uses audio (and therefore stays unpaused in the background).
+    audio: bool,
     /// Which edge is the app's own top, so the bar goes there rather than on ours.
     rotate: flipper_ui::Rotate,
 }
@@ -3155,6 +3157,7 @@ fn start_hosted(
                 placed: false,
                 size: (w, h),
                 status: entry.status,
+                audio: entry.audio,
                 rotate: entry.rotate,
             });
             Some(entry.name.clone())
@@ -5095,7 +5098,9 @@ fn panel(
     let mut last_auto = Instant::now();
     // The bar polls sysfs on its own cadence and only reports a change, so an
     // unchanged battery reading never dirties the screen.
-    let mut status = flipper_ui::StatusSource::new(Duration::from_secs(1));
+    let mut status = flipper_ui::StatusSource::new(Duration::from_secs(5));
+    let mut last_logged_status: Option<(i32, bool, flipper_ui::Ethernet, bool, bool)> = None;
+    let mut last_stashed_frame = 0u64;
     // Merged queue so panel buttons and browser clicks take the same path.
     let mut pending_input: Vec<flipper_ui::KeyEvent> = Vec::new();
     // The browser view's presses, kept apart only so a console app in front can tell
@@ -5108,6 +5113,7 @@ fn panel(
     const LOCK_BANNER_SECS: u64 = 3;
     let mut last_activity = Instant::now();
     let mut lcd_asleep = false;
+    let mut was_lcd_asleep = false;
     let mut locked = false;
     let mut want_lock_now = false;
     let mut lock_wait_tab_release = false;
@@ -5124,27 +5130,19 @@ fn panel(
     // FLIPCTL_PERFLOG=1 turns them back on.
     #[cfg(feature = "wayland")]
     let perflog = std::env::var_os("FLIPCTL_PERFLOG").is_some();
-    /// What paces one turn of the loop.
-    ///
-    /// Headless has no SPI transfer to wait on, so without this it spins a core
-    /// rendering frames nobody asked for. The panel has no vblank either and its
-    /// transfer already costs about 15ms, so a short sleep is enough to keep the loop
-    /// off the input fds. A blocking poll(2) over EvdevSource::fds() is the next step,
-    /// once there is a timer source to fold into it.
-    ///
-    /// Called wherever a turn ends, not only at the tail: a turn that leaves early
-    /// still has to be paced, and the one that did not was the front-app path.
+    /// Adaptive event-loop pacer: blocks in `poll(2)` on the keypad evdev fds so
+    /// physical button presses always wake in `<1 ms`, while letting the CPU sleep
+    /// deeply (250 ms on static screens, 500 ms with backlight off) instead of waking
+    /// 71 times per second to inspect unchanged state.
     fn pace(
         bench: bool,
         input: Option<&flipper_ui::evdev::EvdevSource>,
-        flashing: bool,
+        wait_for: Duration,
         has_queued_keys: bool,
     ) {
         if bench || has_queued_keys {
             return;
         }
-        let wait_for =
-            if flashing { Duration::from_millis(2) } else { Duration::from_millis(14) };
         match input {
             Some(ev) => ev.wait(wait_for),
             None => std::thread::sleep(wait_for),
@@ -5931,9 +5929,17 @@ fn panel(
                 .as_ref()
                 .map(|sw| sw.shown().into_iter().map(str::to_string).collect())
                 .unwrap_or_default();
-            for app in wl_apps.iter() {
+            for app in wl_apps.iter_mut() {
                 let typing = matches!(kb_for, KbFor::App { .. });
-                let want = if wl_front.as_deref() == Some(app.name.as_str()) && !typing {
+                let in_front = wl_front.as_deref() == Some(app.name.as_str());
+                let in_deck = watched.iter().any(|name| name == &app.name);
+                let visible = !lcd_asleep && (in_front || in_deck);
+                // Freeze placed non-audio background apps via SIGSTOP so idle monitors
+                // and terminals burn 0.0% CPU while hidden or while the LCD is asleep,
+                // resuming immediately via SIGCONT when focused or shown in the deck.
+                app.session.set_paused(app.placed && !app.audio && !visible);
+
+                let want = if in_front && !typing && !lcd_asleep {
                     // An app in front that has drawn the same picture for a while is
                     // not worth sixty repaints a second. Half a second of stillness at
                     // the front rate, so a pause between frames is not mistaken for an
@@ -5943,7 +5949,7 @@ fn panel(
                     } else {
                         flipper_ui::sway::Attention::Front
                     }
-                } else if watched.iter().any(|name| name == &app.name) {
+                } else if in_deck && !lcd_asleep {
                     flipper_ui::sway::Attention::Card
                 } else {
                     flipper_ui::sway::Attention::Idle
@@ -5955,6 +5961,20 @@ fn panel(
                 }
             }
         }
+        #[cfg(feature = "wayland")]
+        if wl_apps.is_empty() && deps.is_none() && host.is_some() {
+            eprintln!("host           no hosted apps running, stopping compositor");
+            attention.clear();
+            focused_place = None;
+            host = None;
+        }
+
+        #[cfg(feature = "remote")]
+        let active_viewers = web.as_ref().map_or(0, |v| v.viewers());
+        #[cfg(not(feature = "remote"))]
+        let active_viewers = 0usize;
+        let just_woke_lcd = was_lcd_asleep && !lcd_asleep;
+        was_lcd_asleep = lcd_asleep;
 
         // A launch on the last turn means everything still queued predates the app that
         // now has the panel: dropped rather than delivered, because Back and AppSwitch
@@ -5972,20 +5992,45 @@ fn panel(
         // The battery, the radios and the modem. Above the front-app block, because
         // an app that borrows the status bar wears what this reads: polled below it,
         // the borrowed bar was lifted once at launch and then said the same thing for
-        // as long as the app was in front.
-        if let Some(now) = status.poll() {
-            #[cfg(feature = "wayland")]
-            {
-                last_status = now;
-                // The bar an app wears over its own frame is drawn from this, so it is
-                // worth lifting again now and not before.
-                strip_for = None;
+        // as long as the app was in front. Skipped while the LCD is asleep with nobody
+        // watching remotely so `nl80211` and sysfs sleep undisturbed.
+        if !lcd_asleep || active_viewers > 0 || just_woke_lcd {
+            if let Some(now) = status.poll() {
+                #[cfg(feature = "wayland")]
+                {
+                    last_status = now;
+                    // The bar an app wears over its own frame is drawn from this, so it is
+                    // worth lifting again now and not before.
+                    strip_for = None;
+                }
+                apply_status(&screen, now);
+                let log_key = (
+                    now.battery,
+                    now.charging,
+                    now.ethernet,
+                    now.wifi_connected,
+                    now.modem_available,
+                );
+                if last_logged_status != Some(log_key) {
+                    last_logged_status = Some(log_key);
+                    eprintln!(
+                        "status         battery {}% charging={} eth={:?} wifi={} modem={}",
+                        now.battery,
+                        now.charging,
+                        now.ethernet,
+                        now.wifi_connected,
+                        now.modem_available
+                    );
+                }
             }
-            apply_status(&screen, now);
-            eprintln!(
-                "status         battery {}% charging={} eth={:?} wifi={} modem={}",
-                now.battery, now.charging, now.ethernet, now.wifi_connected, now.modem_available
-            );
+        }
+        if just_woke_lcd && screen.get_screen() == Screen::Idle {
+            idle.refresh_sensors();
+            idle.power_mw = flipper_ui::status::charger_power_mw();
+            idle.refresh_links();
+            link_scroll = apply_idle(&screen, &idle, link_scroll);
+            sensor_poll = Instant::now();
+            link_poll = Instant::now();
         }
 
         // The browser view's retry is machine work too: a port busy at startup frees
@@ -6453,7 +6498,7 @@ fn panel(
             // makes chrome over an app, a transition between two of them and a live
             // card for one in the background all possible at all.
             for app in wl_apps.iter_mut() {
-                let on = app.name == front;
+                let on = app.name == front && (!lcd_asleep || active_viewers > 0);
                 app.session.stream(on);
             }
 
@@ -6690,13 +6735,29 @@ fn panel(
                 if bench {
                     continue;
                 }
-                if let Some(app) =
+                if lcd_asleep && active_viewers == 0 {
+                    pace(
+                        bench,
+                        input.as_ref(),
+                        Duration::from_millis(500),
+                        !pending_input.is_empty(),
+                    );
+                } else if let Some(app) =
                     wl_apps.iter().find(|a| Some(a.name.as_str()) == wl_front.as_deref())
                 {
                     let cap = if app.session.still() > 30 { 33 } else { 8 };
                     app.session.wait_ready(Duration::from_millis(cap));
                 } else {
-                    pace(bench, input.as_ref(), press.showing(), !pending_input.is_empty());
+                    pace(
+                        bench,
+                        input.as_ref(),
+                        if press.showing() {
+                            Duration::from_millis(2)
+                        } else {
+                            Duration::from_millis(16)
+                        },
+                        !pending_input.is_empty(),
+                    );
                 }
                 continue;
             }
@@ -9088,10 +9149,15 @@ fn panel(
             card_reported = Instant::now();
         }
 
-        // A second's worth of staleness at most, and only a 36KB copy when there is
-        // something in front worth photographing.
-        if switcher.is_none() && card_stash.elapsed() >= Duration::from_secs(1) {
+        // Stash the front screen's buffer only when a new frame was actually committed,
+        // avoiding a 54 KB allocation + memcpy every second on a static screen.
+        if switcher.is_none()
+            && !lcd_asleep
+            && frames != last_stashed_frame
+            && card_stash.elapsed() >= Duration::from_secs(1)
+        {
             card_stash = Instant::now();
+            last_stashed_frame = frames;
             let front = front_card(pending_front!(), open_screen(screen.get_screen(), &stack));
             stash_front(&mut recents, front, &frame);
         }
@@ -9622,34 +9688,38 @@ fn panel(
             last_auto = Instant::now();
         }
 
-        if sensor_poll.elapsed() >= Duration::from_secs(1) {
-            sensor_poll = Instant::now();
-            if idle.refresh_sensors() {
+        if lcd_asleep && active_viewers == 0 {
+            power_live = None;
+        } else {
+            if sensor_poll.elapsed() >= Duration::from_secs(5) {
+                sensor_poll = Instant::now();
+                if idle.refresh_sensors() {
+                    link_scroll = apply_idle(&screen, &idle, link_scroll);
+                }
+            }
+            // Started on the idle screen, kept under the deck, dropped anywhere else.
+            match screen.get_screen() {
+                Screen::Idle if power_live.is_none() => {
+                    power_live = Some(flipper_ui::watch::Watch::spawn(
+                        "watch-power",
+                        Duration::from_secs(5),
+                        idle.power_mw,
+                        flipper_ui::status::charger_power_mw,
+                    ));
+                }
+                Screen::Idle | Screen::Switcher => {}
+                _ => power_live = None,
+            }
+            if let Some(power) = power_live.as_ref().filter(|w| w.take_dirty()) {
+                idle.power_mw = power.get();
                 link_scroll = apply_idle(&screen, &idle, link_scroll);
             }
-        }
-        // Started on the idle screen, kept under the deck, dropped anywhere else.
-        match screen.get_screen() {
-            Screen::Idle if power_live.is_none() => {
-                power_live = Some(flipper_ui::watch::Watch::spawn(
-                    "watch-power",
-                    Duration::from_secs(1),
-                    idle.power_mw,
-                    flipper_ui::status::charger_power_mw,
-                ));
-            }
-            Screen::Idle | Screen::Switcher => {}
-            _ => power_live = None,
-        }
-        if let Some(power) = power_live.as_ref().filter(|w| w.take_dirty()) {
-            idle.power_mw = power.get();
-            link_scroll = apply_idle(&screen, &idle, link_scroll);
-        }
-        if link_poll.elapsed() >= Duration::from_secs(3) {
-            link_poll = Instant::now();
-            if idle.refresh_links() {
-                link_scroll = apply_idle(&screen, &idle, link_scroll);
-                eprintln!("links          {} interface(s)", idle.links.len());
+            if link_poll.elapsed() >= Duration::from_secs(10) {
+                link_poll = Instant::now();
+                if idle.refresh_links() {
+                    link_scroll = apply_idle(&screen, &idle, link_scroll);
+                    eprintln!("links          {} interface(s)", idle.links.len());
+                }
             }
         }
 
@@ -9881,7 +9951,36 @@ fn panel(
             }
         }
 
-        pace(bench, input.as_ref(), press.showing(), !pending_input.is_empty());
+        let fast_ui = press.showing() || arrow.is_some();
+        #[cfg(feature = "wayland")]
+        let wl_starting = wl_front.is_some() && !wl_drawn;
+        #[cfg(not(feature = "wayland"))]
+        let wl_starting = false;
+        let busy_ui = wl_starting
+            || switcher.as_ref().is_some_and(|s| s.animating())
+            || installing.is_some()
+            || deps.is_some()
+            || wifi_op.is_some()
+            || apply_rx.is_some()
+            || !matches!(shop, Shop::Closed | Shop::Open(_) | Shop::Shut)
+            || (screen.get_screen() == Screen::Wifi && !matches!(wifi_modal, wifi::Modal::None))
+            || boot.is_some()
+            || tab_down_since.is_some()
+            || auto;
+        let wait_for = if fast_ui {
+            Duration::from_millis(2)
+        } else if busy_ui {
+            Duration::from_millis(16)
+        } else if active_viewers > 0 {
+            Duration::from_millis(30)
+        } else if lcd_asleep {
+            Duration::from_millis(500)
+        } else if animates_icon || switcher.is_some() || live.is_some() || notice.is_some() || lock_awake_until.is_some() {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_millis(250)
+        };
+        pace(bench, input.as_ref(), wait_for, !pending_input.is_empty());
     }
 }
 

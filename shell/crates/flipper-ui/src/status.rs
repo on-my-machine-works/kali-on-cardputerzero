@@ -145,7 +145,17 @@ fn read_wifi() -> (bool, i32) {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        return (true, wifi_quality(&name));
+        let raw_q = wifi_quality(&name);
+        // Quantize to the status-bar icon's 5 visual buckets so 1 dB RSSI jitter
+        // does not mark Status dirty or wake the SPI display every poll.
+        let bucketed = match raw_q {
+            q if q <= 0 => 0,
+            1..=24 => 20,
+            25..=49 => 45,
+            50..=74 => 70,
+            _ => 95,
+        };
+        return (true, bucketed);
     }
     (false, 0)
 }
@@ -343,7 +353,13 @@ impl Idle {
     pub fn refresh_sensors(&mut self) -> bool {
         let before = (self.battery_temp, self.cpu_temp);
         self.battery_temp = battery_temp();
-        self.cpu_temp = cpu_temp();
+        let fresh_cpu = cpu_temp();
+        // Apply 0.2 C (2 tenths) deadband so millidegree ADC boundary noise does not
+        // trigger full-frame SPI transfers on an otherwise idle Home screen.
+        self.cpu_temp = match (self.cpu_temp, fresh_cpu) {
+            (Some(prev), Some(now)) if (now - prev).abs() < 2 => Some(prev),
+            (_, other) => other,
+        };
         before != (self.battery_temp, self.cpu_temp)
     }
 
@@ -429,16 +445,24 @@ fn cpu_temp() -> Option<i32> {
 }
 
 /// Power into or out of the battery, in milliwatts, from CardputerZero's BQ27220
-/// fuel gauge (or Flipper One's bq257xx charger).
+/// fuel gauge (or Flipper One's bq257xx charger), quantized to the Idle screen's
+/// 0.01 W (`10 mW`) display resolution so sub-digit noise never dirties the panel.
 pub fn charger_power_mw() -> Option<i32> {
+    let quantize_10mw = |mw: i32| {
+        let half = if mw >= 0 { 5 } else { -5 };
+        ((mw + half) / 10) * 10
+    };
     let num = |field: &str| read(format!("{CHARGER}/{field}"))?.parse::<i64>().ok();
     if let (Some(i), Some(v)) = (num("current_now"), num("voltage_now")) {
-        return Some(((i * v) / 1_000_000_000) as i32);
+        return Some(quantize_10mw(((i * v) / 1_000_000_000) as i32));
+    }
+    if let Some(mw) = crate::battery::live_power_mw() {
+        return Some(quantize_10mw(mw));
     }
     if let (Some(i), Some(v)) = (crate::battery::num("current_now"), crate::battery::num("voltage_now")) {
-        return Some(((i * v) / 1_000_000_000) as i32);
+        return Some(quantize_10mw(((i * v) / 1_000_000_000) as i32));
     }
-    crate::battery::num("power_avg").map(|uw| (uw / 1_000) as i32)
+    crate::battery::num("power_avg").map(|uw| quantize_10mw((uw / 1_000) as i32))
 }
 
 /// The bq257xx driver's fixed supply name.

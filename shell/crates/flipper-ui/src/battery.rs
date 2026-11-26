@@ -104,14 +104,37 @@ fn start() {
 }
 
 /// The gauge's directory: the one supply whose type is Battery. Its driver has been
-/// called both bq28z610 and bq28z620. `type` comes from the driver's description,
-/// not the chip.
+/// called both bq28z610 and bq28z620 (and bq27220-0 on CardputerZero). `type` comes
+/// from the driver's description, not the chip.
 fn pack_dir() -> Option<PathBuf> {
-    std::fs::read_dir(SUPPLIES)
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    if let Some(cached) = DIR.get() {
+        if cached.is_some() {
+            return cached.clone();
+        }
+    }
+    let found = std::fs::read_dir(SUPPLIES)
         .ok()?
         .flatten()
         .map(|e| e.path())
-        .find(|dir| std::fs::read_to_string(dir.join("type")).is_ok_and(|t| t.trim() == "Battery"))
+        .find(|dir| std::fs::read_to_string(dir.join("type")).is_ok_and(|t| t.trim() == "Battery"));
+    if found.is_some() {
+        let _ = DIR.set(found.clone());
+    }
+    found
+}
+
+/// Live battery pack power flow in milliwatts (`current_now * voltage_now`), reading
+/// only those two registers rather than the full 16-property `uevent` file.
+pub fn live_power_mw() -> Option<i32> {
+    let dir = pack_dir()?;
+    let read_i64 = |field: &str| -> Option<i64> {
+        std::fs::read_to_string(dir.join(field)).ok()?.trim().parse().ok()
+    };
+    if let (Some(i), Some(v)) = (read_i64("current_now"), read_i64("voltage_now")) {
+        return Some(((i * v) / 1_000_000_000) as i32);
+    }
+    read_i64("power_avg").map(|uw| (uw / 1_000) as i32)
 }
 
 fn read_pack() -> Option<Props> {
