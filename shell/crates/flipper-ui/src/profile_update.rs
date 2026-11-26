@@ -17,12 +17,32 @@
 //! `@progress <percent> <step>` lines, and ends with a `result` line per profile.
 //! Rollback is the booted profile's alone: the tool defaults to it.
 
+use std::path::Path;
+use std::process::Command;
 use std::sync::mpsc::Sender;
+
+/// True when either Btrfs multi-profile updates or `cz-ota` (`ext4` / GitHub Releases) is installed.
+pub fn available() -> bool {
+    crate::boot::available() || ota_available()
+}
+
+/// True when using CardputerZero's signed GitHub Releases `cz-ota` backend rather than Btrfs subvolumes.
+pub fn ota_mode() -> bool {
+    !crate::boot::available() && ota_available()
+}
+
+fn ota_available() -> bool {
+    Path::new("/usr/local/bin/cz-ota").exists()
+}
 
 /// A build some profile could move to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Offer {
     pub number: u32,
+    /// Human-readable release tag + short commit when provided (e.g. `v2026.11.26 (28147ea)`).
+    pub label: String,
+    /// Short release notes lines for the detail screen.
+    pub notes: Vec<String>,
     /// The build-scripts branch it was built from, which is what a channel is.
     pub branch: String,
     /// What would be downloaded for it, in bytes.
@@ -39,6 +59,8 @@ pub struct Profile {
     /// Which stock it is built from, e.g. `Desktop`.
     pub kind: String,
     pub build: u32,
+    /// Optional human-readable installed version label (e.g. `v2026.11.26 (28147ea)`).
+    pub label: String,
     /// check-profile's word: pristine, booted, customized, packages or system.
     pub state: String,
 }
@@ -51,6 +73,8 @@ pub struct Listing {
     pub booted: Option<String>,
     /// The build the booted profile's last forced update kept, to roll back to.
     pub kept: Option<u32>,
+    /// Optional human-readable label for `kept`.
+    pub kept_label: Option<String>,
     /// Newest first, as the tool lists them.
     pub offers: Vec<Offer>,
 }
@@ -92,18 +116,38 @@ pub fn parse_list(text: &str) -> Result<Listing, String> {
     for line in text.lines() {
         let f: Vec<&str> = line.split_whitespace().collect();
         match f.as_slice() {
-            ["profile", name, kind, build, state] => out.profiles.push(Profile {
+            ["profile", name, kind, build, state, rest @ ..] => out.profiles.push(Profile {
                 name: (*name).into(),
                 kind: (*kind).into(),
                 build: build.parse().map_err(|_| format!("bad build number: {build}"))?,
+                label: rest.join(" "),
                 state: (*state).into(),
             }),
             ["booted", name] => out.booted = Some((*name).into()),
-            ["kept", build] => out.kept = build.parse().ok(),
-            ["build", number, branch, bytes, kinds] => {
+            ["kept", build, rest @ ..] => {
+                out.kept = build.parse().ok();
+                if !rest.is_empty() {
+                    out.kept_label = Some(rest.join(" "));
+                }
+            }
+            ["build", number, branch, bytes, kinds, rest @ ..] => {
                 if let (Ok(number), Ok(bytes)) = (number.parse(), bytes.parse()) {
                     let kinds = kinds.split(',').map(String::from).collect();
-                    out.offers.push(Offer { number, branch: (*branch).into(), bytes, kinds });
+                    out.offers.push(Offer {
+                        number,
+                        label: rest.join(" "),
+                        notes: Vec::new(),
+                        branch: (*branch).into(),
+                        bytes,
+                        kinds,
+                    });
+                }
+            }
+            ["note", number, rest @ ..] if !rest.is_empty() => {
+                if let Ok(number) = number.parse::<u32>() {
+                    if let Some(offer) = out.offers.iter_mut().find(|o| o.number == number) {
+                        offer.notes.push(rest.join(" "));
+                    }
                 }
             }
             _ => {}
@@ -142,6 +186,25 @@ pub fn parse_progress(line: &str) -> Option<(u8, String)> {
 /// Blocks for as long as it checks the profiles and reads the build server, which is
 /// seconds: call it from a thread.
 pub fn list(all: bool) -> Result<Listing, String> {
+    if ota_mode() {
+        let mut cmd = Command::new("/usr/local/bin/cz-ota");
+        cmd.args(["--list", "--every"]);
+        if all {
+            cmd.arg("--all");
+        }
+        let out = cmd.output().map_err(|e| format!("cannot start cz-ota: {e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            return Err(err
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("cz-ota failed to check releases")
+                .into());
+        }
+        return parse_list(&String::from_utf8_lossy(&out.stdout));
+    }
+
     let args: &[&str] = if all {
         &["update-profile", "--list", "--every", "--all"]
     } else {
@@ -168,6 +231,17 @@ pub fn list(all: bool) -> Result<Listing, String> {
 /// rest carries as ever. Blocks for the whole update: call it from a thread.
 pub fn update(build: u32, force: bool, only: Option<&Profile>, tx: &Sender<Step>) {
     let number = build.to_string();
+    if ota_mode() {
+        let mut cmd = Command::new("sudo");
+        cmd.args(["-n", "/usr/local/bin/cz-ota", "--progress", "--from-ui"]);
+        if force {
+            cmd.arg("--force");
+        }
+        cmd.arg(&number);
+        run_cmd(&mut cmd, Some(format!("Updated to build {build}")), tx);
+        return;
+    }
+
     let mut args = vec!["update-profile", "--progress"];
     if only.is_none() {
         args.push("--every");
@@ -189,6 +263,12 @@ pub fn update(build: u32, force: bool, only: Option<&Profile>, tx: &Sender<Step>
 /// Put back the version the booted profile's last update kept, reporting on `tx`.
 pub fn rollback(tx: &Sender<Step>) {
     let _ = tx.send(Step::Working(0, "Rolling back".into()));
+    if ota_mode() {
+        let mut cmd = Command::new("sudo");
+        cmd.args(["-n", "/usr/local/bin/cz-ota", "--rollback", "--from-ui"]);
+        run_cmd(&mut cmd, Some("Rolled back to previous version".into()), tx);
+        return;
+    }
     run(&["update-profile", "--rollback"], None, tx);
 }
 
@@ -197,9 +277,14 @@ pub fn rollback(tx: &Sender<Step>) {
 /// nothing of them. A run that failed on some profile and not others is done all the
 /// same, the failure being one of its lines.
 fn run(args: &[&str], done: Option<String>, tx: &Sender<Step>) {
+    let mut cmd = crate::boot::tool(args);
+    run_cmd(&mut cmd, done, tx);
+}
+
+fn run_cmd(cmd: &mut Command, done: Option<String>, tx: &Sender<Step>) {
     let mut profile = String::new();
     let mut results = Vec::new();
-    let result = crate::app::run_logged(&mut crate::boot::tool(args), &mut |line: String| {
+    let result = crate::app::run_logged(cmd, &mut |line: String| {
         if let Some((pct, step)) = parse_progress(&line) {
             let step = if profile.is_empty() { step } else { format!("{profile}: {step}") };
             let _ = tx.send(Step::Working(pct, step));
@@ -235,6 +320,7 @@ mod tests {
                 name: "@Router".into(),
                 kind: "Router".into(),
                 build: 1219,
+                label: String::new(),
                 state: "packages".into()
             }
         );
@@ -243,6 +329,27 @@ mod tests {
         assert_eq!(l.offers.len(), 2);
         assert_eq!(l.offers[0].kinds, ["Desktop", "Router"]);
         assert_eq!(l.offers[1].bytes, 942021864);
+    }
+
+    #[test]
+    fn reads_ota_labels_and_notes() {
+        let l = parse_list(
+            "profile @Kali Kali 2026112601 booted v2026.11.26 (28147ea)\n\
+             booted @Kali\n\
+             kept 2026112501 v2026.11.25 (b927fe1)\n\
+             build 2026112602 release 19845120 Kali v2026.11.26-2 (a1b2c3d)\n\
+             note 2026112602 Lock down Web KVM with PIN\n\
+             note 2026112602 Add Hostile-Network Stealth Mode\n",
+        )
+        .unwrap();
+        assert_eq!(l.profiles[0].label, "v2026.11.26 (28147ea)");
+        assert_eq!(l.kept, Some(2026112501));
+        assert_eq!(l.kept_label.as_deref(), Some("v2026.11.25 (b927fe1)"));
+        assert_eq!(l.offers[0].label, "v2026.11.26-2 (a1b2c3d)");
+        assert_eq!(
+            l.offers[0].notes,
+            ["Lock down Web KVM with PIN", "Add Hostile-Network Stealth Mode"]
+        );
     }
 
     #[test]

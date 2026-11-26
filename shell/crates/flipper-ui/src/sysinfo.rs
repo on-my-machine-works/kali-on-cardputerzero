@@ -929,6 +929,7 @@ pub struct System {
     /// with: `MemTotal` is short by the firmware's carve-out and the kernel's own.
     pub mem_total: u64,
     pub os: String,
+    pub cz_version: String,
     pub profile: String,
     /// The build the running profile was made from, `BUILD_ID` in its os-release.
     pub build: String,
@@ -1044,6 +1045,17 @@ pub struct Ufs {
 
 pub fn system() -> System {
     let release = read_str("/etc/os-release").unwrap_or_default();
+    let cz_rel = read_str("/etc/cz-release").unwrap_or_default();
+    let cz_version = match (
+        os_release_value(&cz_rel, "CZ_VERSION"),
+        os_release_value(&cz_rel, "CZ_COMMIT"),
+    ) {
+        (Some(v), Some(c)) if !v.is_empty() && !c.is_empty() && c != "unknown" => {
+            format!("{v} ({})", c.get(..7).unwrap_or(&c))
+        }
+        (Some(v), _) => v,
+        _ => String::new(),
+    };
     let (mem_total, mem_used) = memory();
     System {
         model: dt_string("model"),
@@ -1070,6 +1082,7 @@ pub fn system() -> System {
                 }
             })
             .unwrap_or_default(),
+        cz_version,
         profile: crate::status::booted_profile(),
         build: os_release_value(&release, "BUILD_ID").unwrap_or_default(),
         installed: birth("/").map(date).unwrap_or_default(),

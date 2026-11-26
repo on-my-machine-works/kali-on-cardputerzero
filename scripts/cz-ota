@@ -1,0 +1,861 @@
+#!/usr/bin/env bash
+# cz-ota - Signed Over-The-Air (OTA) & offline bundle updater for Kali Cyberdeck Edition
+#
+# Supports both human CLI usage and Flipper `profile_update` UI protocol:
+#   cz-ota status                                  Show installed version & rollback state
+#   cz-ota check [--channel release|nightly]       Check GitHub Releases for signed updates
+#   sudo cz-ota update [version|build] [--yes]     Download, verify Ed25519+SHA256, backup & apply
+#   sudo cz-ota install <bundle.tar.xz> [...]      Offline / USB-C bundle install
+#   sudo cz-ota rollback                           Revert to previous backed-up version
+#
+# UI protocol flags (used by czctl Settings -> Update Kali CZ):
+#   cz-ota --list --every [--all]
+#   sudo cz-ota --progress [--every] [--force] [--from-ui] <build_num>
+#   sudo cz-ota --rollback [--from-ui]
+
+set -euo pipefail
+
+CZ_RELEASE_FILE="/etc/cz-release"
+if [[ -f /etc/default/cz-ota ]]; then
+    # shellcheck disable=SC1091
+    source /etc/default/cz-ota
+fi
+PUBKEY_FILE="${CZ_OTA_PUBKEY:-/usr/share/czctl/ota-pub.pem}"
+OTA_REPO="${CZ_OTA_REPO:-on-my-machine-works/kali-on-cardputerzero}"
+CACHE_DIR="/var/cache/cz-ota"
+MANIFEST_CACHE_DIR="$CACHE_DIR/manifests"
+STATE_DIR="/var/lib/cz-ota"
+STAGING_DIR="$STATE_DIR/staging"
+ROLLBACK_DIR="$STATE_DIR/rollback"
+MIN_FREE_MB=150
+
+read_current_release() {
+    CUR_VERSION="v0.0.0"
+    CUR_BUILD_NUM="1"
+    CUR_COMMIT="unknown"
+    CUR_CHANNEL="release"
+    CUR_IMAGE_EPOCH="1"
+    CUR_KERNEL_ABI="$(uname -r)"
+    if [[ -f "$CZ_RELEASE_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$CZ_RELEASE_FILE"
+        CUR_VERSION="${CZ_VERSION:-$CUR_VERSION}"
+        CUR_BUILD_NUM="${CZ_BUILD_NUM:-$CUR_BUILD_NUM}"
+        CUR_COMMIT="${CZ_COMMIT:-$CUR_COMMIT}"
+        CUR_CHANNEL="${CZ_CHANNEL:-$CUR_CHANNEL}"
+        CUR_IMAGE_EPOCH="${CZ_IMAGE_EPOCH:-$CUR_IMAGE_EPOCH}"
+        CUR_KERNEL_ABI="${CZ_KERNEL_ABI:-$CUR_KERNEL_ABI}"
+    elif [[ -f /etc/os-release ]]; then
+        local bid
+        bid="$(awk -F= '/^BUILD_ID=/{gsub(/"/,"",$2); print $2}' /etc/os-release | head -n1)"
+        [[ -n "$bid" ]] && CUR_VERSION="$bid"
+    fi
+}
+
+read_rollback_release() {
+    KEPT_BUILD_NUM=""
+    KEPT_VERSION=""
+    KEPT_COMMIT=""
+    if [[ -f "$ROLLBACK_DIR/prev.tar.gz" && -f "$ROLLBACK_DIR/prev.cz-release" ]]; then
+        KEPT_BUILD_NUM="$(awk -F= '/^CZ_BUILD_NUM=/{gsub(/"/,"",$2); print $2}' "$ROLLBACK_DIR/prev.cz-release" | head -n1)"
+        KEPT_VERSION="$(awk -F= '/^CZ_VERSION=/{gsub(/"/,"",$2); print $2}' "$ROLLBACK_DIR/prev.cz-release" | head -n1)"
+        KEPT_COMMIT="$(awk -F= '/^CZ_COMMIT=/{gsub(/"/,"",$2); print $2}' "$ROLLBACK_DIR/prev.cz-release" | head -n1)"
+    fi
+}
+
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        exec sudo "$0" "$@"
+    fi
+}
+
+verify_manifest_sig() {
+    local mfile="$1"
+    local sfile="$2"
+    local allow_unsigned="${3:-0}"
+    if [[ -f "$sfile" && -s "$sfile" ]]; then
+        if [[ ! -f "$PUBKEY_FILE" ]]; then
+            echo "OTA public key missing at $PUBKEY_FILE" >&2
+            return 1
+        fi
+        if ! openssl pkeyutl -verify -pubin -inkey "$PUBKEY_FILE" \
+                -sigfile "$sfile" -rawin -in "$mfile" >/dev/null 2>&1; then
+            echo "Ed25519 signature verification FAILED for $mfile" >&2
+            return 1
+        fi
+        return 0
+    fi
+    if [[ "$allow_unsigned" == "1" || "${CZ_OTA_ALLOW_UNSIGNED:-0}" == "1" ]]; then
+        return 0
+    fi
+    echo "Missing Ed25519 signature (.sig) for $mfile" >&2
+    return 1
+}
+
+check_free_space() {
+    mkdir -p "$CACHE_DIR" "$STATE_DIR"
+    local avail_mb
+    avail_mb="$(df -BM "$STATE_DIR" | awk 'NR==2 {gsub("M","",$4); print $4}')"
+    if [[ -n "$avail_mb" ]] && (( avail_mb < MIN_FREE_MB )); then
+        echo "Insufficient disk space in /var (${avail_mb} MB free, need >= ${MIN_FREE_MB} MB)" >&2
+        exit 1
+    fi
+}
+
+# Fetch and verify remote manifests, caching valid ones into $MANIFEST_CACHE_DIR/<build_num>.json
+# (or ~/.cache/cz-ota/manifests when called unprivileged).
+fetch_remote_manifests() {
+    local target_cache="$MANIFEST_CACHE_DIR"
+    if [[ $EUID -ne 0 ]] && [[ ! -w "$CACHE_DIR" ]]; then
+        target_cache="${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/cz-ota/manifests"
+    fi
+    mkdir -p "$target_cache"
+
+    python3 - "$OTA_REPO" "$PUBKEY_FILE" "$target_cache" "${CZ_OTA_MANIFEST_URL:-}" "${CZ_OTA_ALLOW_UNSIGNED:-0}" <<'PY'
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.request
+
+repo, pubkey, cache_dir, override_url, allow_unsigned = sys.argv[1:6]
+
+def http_get(url, timeout=12):
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "cz-ota/1.0 (CardputerZero)",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+def verify_and_store(mbytes, sbytes):
+    with tempfile.TemporaryDirectory() as td:
+        mp = os.path.join(td, "ota-manifest.json")
+        sp = os.path.join(td, "ota-manifest.json.sig")
+        with open(mp, "wb") as f:
+            f.write(mbytes)
+        if sbytes:
+            with open(sp, "wb") as f:
+                f.write(sbytes)
+            if not os.path.isfile(pubkey):
+                return None
+            r = subprocess.run(
+                [
+                    "openssl", "pkeyutl", "-verify", "-pubin",
+                    "-inkey", pubkey, "-sigfile", sp, "-rawin", "-in", mp,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if r.returncode != 0:
+                return None
+        elif allow_unsigned != "1":
+            return None
+
+        data = json.loads(mbytes.decode("utf-8"))
+        bnum = int(data["build_num"])
+        out_m = os.path.join(cache_dir, f"{bnum}.json")
+        out_s = os.path.join(cache_dir, f"{bnum}.json.sig")
+        shutil.copyfile(mp, out_m)
+        if sbytes:
+            shutil.copyfile(sp, out_s)
+        return data
+
+manifests = []
+try:
+    if override_url:
+        for raw_u in [u.strip() for u in override_url.split(",") if u.strip()]:
+            mbytes = http_get(raw_u)
+            sbytes = None
+            try:
+                sbytes = http_get(raw_u + ".sig")
+            except Exception:
+                pass
+            d = verify_and_store(mbytes, sbytes)
+            if d:
+                manifests.append(d)
+    else:
+        pairs = []
+        try:
+            rel_raw = http_get(f"https://api.github.com/repos/{repo}/releases?per_page=10")
+            releases = json.loads(rel_raw.decode("utf-8"))
+            for rel in releases:
+                if rel.get("draft"):
+                    continue
+                assets = {a.get("name"): a.get("browser_download_url") for a in rel.get("assets", [])}
+                if "ota-manifest.json" in assets:
+                    pairs.append((assets["ota-manifest.json"], assets.get("ota-manifest.json.sig")))
+        except Exception:
+            # Rate-limit / CDN fallback: direct latest release asset URL
+            base = f"https://github.com/{repo}/releases/latest/download/ota-manifest.json"
+            pairs.append((base, base + ".sig"))
+
+        for murl, surl in pairs:
+            try:
+                mbytes = http_get(murl)
+                sbytes = http_get(surl) if surl else None
+                d = verify_and_store(mbytes, sbytes)
+                if d:
+                    manifests.append(d)
+            except Exception:
+                continue
+except Exception as e:
+    sys.stderr.write(f"Failed to query update server: {e}\n")
+    sys.exit(1)
+
+manifests.sort(key=lambda x: int(x.get("build_num", 0)), reverse=True)
+print(json.dumps(manifests))
+PY
+}
+
+emit_ui_list() {
+    local show_all="$1"
+    read_current_release
+    read_rollback_release
+
+    local cur_short="${CUR_COMMIT:0:7}"
+    echo "profile @Kali Kali ${CUR_BUILD_NUM} booted ${CUR_VERSION} (${cur_short})"
+    echo "booted @Kali"
+    if [[ -n "$KEPT_BUILD_NUM" ]]; then
+        local kept_short="${KEPT_COMMIT:0:7}"
+        echo "kept ${KEPT_BUILD_NUM} ${KEPT_VERSION} (${kept_short})"
+    fi
+
+    local json_list
+    if ! json_list="$(fetch_remote_manifests)"; then
+        exit 1
+    fi
+
+    python3 - "$json_list" "$CUR_BUILD_NUM" "$show_all" <<'PY'
+import json
+import sys
+
+items = json.loads(sys.argv[1])
+cur_build = int(sys.argv[2])
+show_all = sys.argv[3] == "1"
+
+for m in items:
+    bnum = int(m.get("build_num", 0))
+    if not show_all and bnum <= cur_build:
+        continue
+    branch = m.get("branch") or ("dev" if m.get("channel") == "nightly" else "release")
+    size_b = int(m.get("size_bytes", 0))
+    ver = m.get("version", str(bnum))
+    commit = (m.get("commit") or "")[:7]
+    label = f"{ver} ({commit})" if commit else ver
+    print(f"build {bnum} {branch} {size_b} Kali {label}")
+    for note in (m.get("notes") or [])[:4]:
+        clean = " ".join(str(note).split())
+        if clean:
+            print(f"note {bnum} {clean}")
+PY
+}
+
+atomic_install_tree() {
+    local src_dir="$1"
+    local filelist="$2"
+    python3 - "$src_dir" "$filelist" <<'PY'
+import os
+import shutil
+import stat
+import sys
+
+src_root, list_path = sys.argv[1:3]
+preserve_if_exists = {
+    "etc/default/cz-stealth",
+    "etc/default/cz-hdmi-desktop",
+}
+
+with open(list_path, "r", encoding="utf-8") as f:
+    rel_paths = [line.strip() for line in f if line.strip()]
+
+for rel in rel_paths:
+    rel = rel.lstrip("/")
+    if rel in preserve_if_exists and os.path.lexists("/" + rel):
+        continue
+    sp = os.path.join(src_root, rel)
+    dp = "/" + rel
+    if not os.path.lexists(sp):
+        continue
+    parent = os.path.dirname(dp)
+    os.makedirs(parent, exist_ok=True)
+    tmp = os.path.join(parent, f".{os.path.basename(dp)}.ota.{os.getpid()}")
+    try:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        st = os.lstat(sp)
+        if stat.S_ISLNK(st.st_mode):
+            os.symlink(os.readlink(sp), tmp)
+        else:
+            shutil.copy2(sp, tmp, follow_symlinks=False)
+            os.chmod(tmp, stat.S_IMODE(st.st_mode))
+        os.replace(tmp, dp)
+    finally:
+        if os.path.lexists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+PY
+}
+
+extract_tar_archive() {
+    local archive="$1"
+    local dest_dir="$2"
+    case "$archive" in
+        *.tar.xz|*.txz)   xz -dc "$archive" | tar -xf - -C "$dest_dir" ;;
+        *.tar.gz|*.tgz)   gzip -dc "$archive" | tar -xf - -C "$dest_dir" ;;
+        *.tar.zst|*.tzst) zstd -dc "$archive" | tar -xf - -C "$dest_dir" ;;
+        *)                tar -xf "$archive" -C "$dest_dir" ;;
+    esac
+}
+
+restore_rollback_files() {
+    [[ -f "$ROLLBACK_DIR/prev.tar.gz" ]] || { echo "No rollback archive found" >&2; return 1; }
+    local rstage="$STATE_DIR/rollback-unpack"
+    rm -rf "$rstage"
+    mkdir -p "$rstage"
+    gzip -dc "$ROLLBACK_DIR/prev.tar.gz" | tar -xf - -C "$rstage"
+    if [[ -f "$rstage/FILELIST.present" ]]; then
+        atomic_install_tree "$rstage" "$rstage/FILELIST.present"
+    fi
+    if [[ -f "$rstage/NEWLY_ADDED.list" ]]; then
+        while IFS= read -r added_rel; do
+            [[ -n "$added_rel" ]] || continue
+            rm -f "/${added_rel#/}" 2>/dev/null || true
+        done < "$rstage/NEWLY_ADDED.list"
+    fi
+    if [[ -f "$ROLLBACK_DIR/prev.cz-release" ]]; then
+        install -m 644 "$ROLLBACK_DIR/prev.cz-release" "$CZ_RELEASE_FILE"
+    fi
+    if [[ -f "$ROLLBACK_DIR/prev.installed.list" ]]; then
+        install -m 644 "$ROLLBACK_DIR/prev.installed.list" "$STATE_DIR/installed.list"
+    fi
+    rm -rf "$rstage" "$ROLLBACK_DIR/prev.tar.gz" "$ROLLBACK_DIR/prev.cz-release" "$ROLLBACK_DIR/prev.installed.list"
+    udevadm control --reload-rules 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+    [[ -x /usr/local/bin/cz-stealth ]] && /usr/local/bin/cz-stealth apply >/dev/null 2>&1 || true
+}
+
+commit_staged_internal() {
+    rm -f /run/cz-ota-commit.status /run/cz-ota-commit.done
+    if [[ ! -f "$STAGING_DIR/FILELIST.txt" ]]; then
+        echo "failed: missing staging FILELIST.txt" > /run/cz-ota-commit.status
+        touch /run/cz-ota-commit.done
+        exit 1
+    fi
+
+    local czctl_was_active=0
+    systemctl is-active --quiet czctl.service 2>/dev/null && czctl_was_active=1
+
+    # Prune any managed file from a previous OTA that was removed/renamed in the new bundle
+    if [[ -f "$STATE_DIR/installed.list" ]]; then
+        python3 - "$STATE_DIR/installed.list" "$STAGING_DIR/FILELIST.txt" <<'PY'
+import os, sys
+old_set = {l.strip().lstrip("/") for l in open(sys.argv[1], encoding="utf-8") if l.strip()}
+new_set = {l.strip().lstrip("/") for l in open(sys.argv[2], encoding="utf-8") if l.strip()}
+never_prune = {"etc/cz-release", "etc/default/cz-stealth", "etc/default/cz-hdmi-desktop"}
+for obsolete in sorted(old_set - new_set - never_prune):
+    p = "/" + obsolete
+    if os.path.lexists(p) and not os.path.isdir(p):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+PY
+    fi
+
+    atomic_install_tree "$STAGING_DIR" "$STAGING_DIR/FILELIST.txt"
+    install -m 644 "$STAGING_DIR/FILELIST.txt" "$STATE_DIR/installed.list"
+
+    # Run signed bundle's postinstall.sh hook so multi-version jumps pick up future migrations
+    if [[ -x /usr/share/czctl/ota-tools/postinstall.sh ]]; then
+        /usr/share/czctl/ota-tools/postinstall.sh || true
+    fi
+
+    # Seed non-destructive kali user payloads if new ones arrived
+    if id kali >/dev/null 2>&1; then
+        install -d -m 755 -o kali -g kali /home/kali/Apps /home/kali/isos /home/kali/payloads /home/kali/ir /home/kali/captures /home/kali/Recordings
+        for p in /usr/share/czctl/payloads/*.duck; do
+            [[ -f "$p" ]] || continue
+            dest="/home/kali/payloads/$(basename "$p")"
+            [[ -e "$dest" ]] || install -m 644 -o kali -g kali "$p" "$dest"
+        done
+        for p in /usr/share/czctl/payloads/*.ir; do
+            [[ -f "$p" ]] || continue
+            dest="/home/kali/ir/$(basename "$p")"
+            [[ -e "$dest" ]] || install -m 644 -o kali -g kali "$p" "$dest"
+        done
+    fi
+
+    if [[ -d /usr/share/APPLaunch && -f /usr/share/czctl/ota-tools/configure-kali-launcher.py ]]; then
+        local cur_lsha prev_lsha=""
+        cur_lsha="$(sha256sum /usr/share/czctl/ota-tools/configure-kali-launcher.py | awk '{print $1}')"
+        [[ -f "$STATE_DIR/launcher.sha256" ]] && prev_lsha="$(cat "$STATE_DIR/launcher.sha256" 2>/dev/null || true)"
+        if [[ "$cur_lsha" != "$prev_lsha" ]]; then
+            python3 /usr/share/czctl/ota-tools/configure-kali-launcher.py / >/dev/null 2>&1 || true
+            id kali >/dev/null 2>&1 && chown -R kali:kali /home/kali/.config 2>/dev/null || true
+            echo "$cur_lsha" > "$STATE_DIR/launcher.sha256"
+        fi
+    fi
+
+    ln -sfn /etc/systemd/system/czctl.service /etc/systemd/system/flipctl.service
+    install -d -m 755 /etc/systemd/system/multi-user.target.wants
+    [[ -f /etc/systemd/system/cz-stealth.service ]] && \
+        ln -sfn /etc/systemd/system/cz-stealth.service /etc/systemd/system/multi-user.target.wants/cz-stealth.service
+
+    udevadm control --reload-rules 2>/dev/null || true
+    systemctl daemon-reload
+    [[ -x /usr/local/bin/cz-stealth ]] && /usr/local/bin/cz-stealth apply >/dev/null 2>&1 || true
+    rm -rf "$STAGING_DIR"
+
+    if (( czctl_was_active )) && [[ "${CZ_OTA_NO_RESTART:-0}" != "1" ]]; then
+        sleep 1
+        systemctl restart czctl.service || true
+        # 8-second post-update health-check watchdog with automatic rollback on crash
+        local healthy=1
+        sleep 3
+        systemctl is-active --quiet czctl.service 2>/dev/null || healthy=0
+        if (( healthy )); then
+            sleep 5
+            systemctl is-active --quiet czctl.service 2>/dev/null || healthy=0
+        fi
+        if (( ! healthy )); then
+            echo "ERROR: Updated czctl.service failed health check; auto-rolling back!" >&2
+            restore_rollback_files || true
+            systemctl restart czctl.service || true
+            echo "rolled_back" > /run/cz-ota-commit.status
+            touch /run/cz-ota-commit.done
+            exit 1
+        fi
+    fi
+
+    echo "ok" > /run/cz-ota-commit.status
+    touch /run/cz-ota-commit.done
+}
+
+rollback_internal() {
+    rm -f /run/cz-ota-commit.status /run/cz-ota-commit.done
+    local czctl_was_active=0
+    systemctl is-active --quiet czctl.service 2>/dev/null && czctl_was_active=1
+
+    restore_rollback_files
+    if (( czctl_was_active )) && [[ "${CZ_OTA_NO_RESTART:-0}" != "1" ]]; then
+        sleep 1
+        systemctl restart czctl.service || true
+    fi
+    echo "ok" > /run/cz-ota-commit.status
+    touch /run/cz-ota-commit.done
+}
+
+stage_and_apply_bundle() {
+    local archive_path="$1"
+    local manifest_path="$2"
+    local sig_path="$3"
+    local allow_unsigned="$4"
+    local progress_mode="$5"
+    local from_ui="$6"
+
+    say_prog() {
+        local pct="$1"; shift
+        if (( progress_mode )); then
+            echo "@progress $pct $*"
+        else
+            echo "[${pct}%] $*"
+        fi
+    }
+
+    say_prog 68 "Verifying Ed25519 signature & SHA-256"
+    if [[ -n "$manifest_path" && -f "$manifest_path" ]]; then
+        verify_manifest_sig "$manifest_path" "$sig_path" "$allow_unsigned"
+        local want_sha
+        want_sha="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sha256"])' "$manifest_path")"
+        local got_sha
+        got_sha="$(sha256sum "$archive_path" | awk '{print $1}')"
+        if [[ "${got_sha,,}" != "${want_sha,,}" ]]; then
+            echo "SHA-256 mismatch for $archive_path ($got_sha != $want_sha)" >&2
+            exit 1
+        fi
+        read_current_release
+        local min_epoch
+        min_epoch="$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("min_image_epoch", 1)))' "$manifest_path")"
+        if (( min_epoch > CUR_IMAGE_EPOCH )); then
+            echo "This update requires image epoch >= $min_epoch (current: $CUR_IMAGE_EPOCH); full SD re-flash required." >&2
+            exit 1
+        fi
+    elif [[ "$allow_unsigned" != "1" && "${CZ_OTA_ALLOW_UNSIGNED:-0}" != "1" ]]; then
+        echo "Refusing unsigned bundle without manifest/.sig (pass --allow-unsigned in dev shell)" >&2
+        exit 1
+    fi
+
+    say_prog 76 "Extracting & checking binary ABI"
+    rm -rf "$STAGING_DIR"
+    mkdir -p "$STAGING_DIR" "$ROLLBACK_DIR"
+    extract_tar_archive "$archive_path" "$STAGING_DIR"
+
+    if [[ ! -f "$STAGING_DIR/FILELIST.txt" ]]; then
+        echo "Invalid OTA bundle: missing FILELIST.txt" >&2
+        rm -rf "$STAGING_DIR"
+        exit 1
+    fi
+
+    for check_elf in "$STAGING_DIR/usr/bin/czctl" "$STAGING_DIR/usr/lib/cz-kali/libcz_fb_lcd.so"; do
+        if [[ -e "$check_elf" ]] && ldd "$check_elf" 2>/dev/null | grep -q 'not found'; then
+            echo "ABI pre-flight failed: missing shared library for $(basename "$check_elf")" >&2
+            ldd "$check_elf" >&2 || true
+            rm -rf "$STAGING_DIR"
+            exit 1
+        fi
+    done
+
+    say_prog 86 "Saving rollback backup"
+    read_current_release
+    local rpack="$STATE_DIR/rollback-stage"
+    rm -rf "$rpack"
+    mkdir -p "$rpack"
+    : > "$rpack/FILELIST.present"
+    : > "$rpack/NEWLY_ADDED.list"
+    while IFS= read -r rel; do
+        [[ -n "$rel" ]] || continue
+        rel="${rel#/}"
+        if [[ -e "/$rel" || -L "/$rel" ]]; then
+            mkdir -p "$rpack/$(dirname "$rel")"
+            cp -a "/$rel" "$rpack/$rel"
+            echo "$rel" >> "$rpack/FILELIST.present"
+        else
+            echo "$rel" >> "$rpack/NEWLY_ADDED.list"
+        fi
+    done < <(cat "$STAGING_DIR/FILELIST.txt" "$STATE_DIR/installed.list" 2>/dev/null | LC_ALL=C sort -u)
+
+    tar --sort=name -cf - -C "$rpack" . | gzip -1 > "$ROLLBACK_DIR/prev.tar.gz.tmp"
+    rm -rf "$rpack"
+    [[ -f "$STATE_DIR/installed.list" ]] && cp -a "$STATE_DIR/installed.list" "$ROLLBACK_DIR/prev.installed.list" || rm -f "$ROLLBACK_DIR/prev.installed.list"
+    if [[ -f "$CZ_RELEASE_FILE" ]]; then
+        cp -a "$CZ_RELEASE_FILE" "$ROLLBACK_DIR/prev.cz-release.tmp"
+    else
+        cat > "$ROLLBACK_DIR/prev.cz-release.tmp" <<EOF
+CZ_VERSION="${CUR_VERSION}"
+CZ_BUILD_NUM="${CUR_BUILD_NUM}"
+CZ_COMMIT="${CUR_COMMIT}"
+CZ_CHANNEL="${CUR_CHANNEL}"
+CZ_IMAGE_EPOCH="${CUR_IMAGE_EPOCH}"
+CZ_KERNEL_ABI="${CUR_KERNEL_ABI}"
+EOF
+    fi
+    mv -f "$ROLLBACK_DIR/prev.tar.gz.tmp" "$ROLLBACK_DIR/prev.tar.gz"
+    mv -f "$ROLLBACK_DIR/prev.cz-release.tmp" "$ROLLBACK_DIR/prev.cz-release"
+
+    local new_ver
+    new_ver="$(awk -F= '/^CZ_VERSION=/{gsub(/"/,"",$2); print $2}' "$STAGING_DIR/etc/cz-release" 2>/dev/null || echo updated)"
+    local new_num
+    new_num="$(awk -F= '/^CZ_BUILD_NUM=/{gsub(/"/,"",$2); print $2}' "$STAGING_DIR/etc/cz-release" 2>/dev/null || echo "$CUR_BUILD_NUM")"
+
+    say_prog 95 "Installing & restarting shell"
+    systemctl reset-failed cz-ota-commit.service 2>/dev/null || true
+    if (( from_ui )); then
+        systemd-run --no-block --collect --unit=cz-ota-commit \
+            --setenv="CZ_OTA_NO_RESTART=${CZ_OTA_NO_RESTART:-0}" \
+            /usr/local/bin/cz-ota _commit-staged >/dev/null
+        for _ in $(seq 1 30); do
+            [[ -f /run/cz-ota-commit.done ]] && break
+            sleep 0.5
+        done
+    else
+        systemd-run --wait --collect --unit=cz-ota-commit \
+            --setenv="CZ_OTA_NO_RESTART=${CZ_OTA_NO_RESTART:-0}" \
+            /usr/local/bin/cz-ota _commit-staged
+    fi
+
+    if [[ "$(cat /run/cz-ota-commit.status 2>/dev/null || echo ok)" != "ok" ]]; then
+        echo "Update failed health check and rolled back to ${CUR_VERSION}" >&2
+        exit 1
+    fi
+
+    if (( progress_mode )); then
+        echo "@progress 100 Installed ${new_ver}"
+        echo "result @Kali updated ${CUR_BUILD_NUM} ${new_num}"
+    else
+        echo "[OK] Updated Kali Cyberdeck Edition: ${CUR_VERSION} -> ${new_ver}"
+    fi
+}
+
+download_with_progress() {
+    local url="$1"
+    local total_bytes="$2"
+    local dest="$3"
+    local progress_mode="$4"
+
+    mkdir -p "$(dirname "$dest")"
+    local part="${dest}.part"
+    rm -f "$part"
+
+    curl -fsSL --connect-timeout 15 --output "$part" "$url" &
+    local cpid=$!
+    while kill -0 "$cpid" 2>/dev/null; do
+        if [[ -f "$part" ]] && (( total_bytes > 0 )); then
+            local got
+            got="$(stat -c '%s' "$part" 2>/dev/null || echo 0)"
+            local pct=$(( 10 + (got * 55 / total_bytes) ))
+            (( pct > 65 )) && pct=65
+            local got_mb=$(( got / 1048576 ))
+            local tot_mb=$(( (total_bytes + 1048575) / 1048576 ))
+            if (( progress_mode )); then
+                echo "@progress ${pct} Downloading (${got_mb}/${tot_mb} MB)"
+            fi
+        fi
+        sleep 0.3
+    done
+    if ! wait "$cpid"; then
+        rm -f "$part"
+        echo "Download failed from $url" >&2
+        exit 1
+    fi
+    mv -f "$part" "$dest"
+}
+
+run_remote_update() {
+    local target_spec="$1"
+    local force="$2"
+    local allow_unsigned="$3"
+    local progress_mode="$4"
+    local from_ui="$5"
+
+    require_root "$@"
+    check_free_space
+    read_current_release
+
+    if (( progress_mode )); then
+        echo "@profile @Kali"
+        echo "@progress 5 Checking release manifest"
+    else
+        echo "[*] Querying signed OTA releases from ${OTA_REPO} ..."
+    fi
+
+    local manifests_json
+    manifests_json="$(fetch_remote_manifests)"
+
+    local selected_json
+    selected_json="$(python3 - "$manifests_json" "$target_spec" "$CUR_BUILD_NUM" "$force" <<'PY'
+import json
+import sys
+
+items, spec, cur_b, force = json.loads(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4] == "1"
+if not items:
+    sys.exit(2)
+
+chosen = None
+if not spec:
+    chosen = items[0]
+    if not force and int(chosen.get("build_num", 0)) <= cur_b:
+        sys.exit(3)
+else:
+    for m in items:
+        if str(m.get("build_num")) == spec or m.get("version") == spec:
+            chosen = m
+            break
+    if chosen is None:
+        sys.exit(4)
+    if not force and int(chosen.get("build_num", 0)) <= cur_b:
+        sys.exit(3)
+
+print(json.dumps(chosen))
+PY
+)" || {
+        local rc=$?
+        if [[ $rc -eq 3 ]]; then
+            if (( progress_mode )); then
+                echo "result @Kali current ${CUR_BUILD_NUM}"
+                exit 0
+            fi
+            echo "Already up to date (${CUR_VERSION}, build ${CUR_BUILD_NUM}). Pass --force to reinstall."
+            exit 0
+        fi
+        echo "No matching signed OTA release found${target_spec:+ for '$target_spec'}." >&2
+        exit 1
+    }
+
+    local bnum url size_b archive
+    bnum="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["build_num"])' "$selected_json")"
+    url="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["download_url"])' "$selected_json")"
+    size_b="$(python3 -c 'import json,sys; print(int(json.loads(sys.argv[1]).get("size_bytes", 0)))' "$selected_json")"
+    archive="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("archive", "ota.tar.xz"))' "$selected_json")"
+
+    local mfile="$MANIFEST_CACHE_DIR/${bnum}.json"
+    local sfile="$MANIFEST_CACHE_DIR/${bnum}.json.sig"
+    local dest="$CACHE_DIR/$archive"
+
+    download_with_progress "$url" "$size_b" "$dest" "$progress_mode"
+    stage_and_apply_bundle "$dest" "$mfile" "$sfile" "$allow_unsigned" "$progress_mode" "$from_ui"
+    rm -f "$dest"
+}
+
+# ─── Parse CLI & UI-Protocol Arguments ──────────────────────────────────────
+
+if [[ "${1:-}" == "_commit-staged" ]]; then
+    require_root "$@"
+    commit_staged_internal
+    exit 0
+elif [[ "${1:-}" == "_rollback-now" ]]; then
+    require_root "$@"
+    rollback_internal
+    exit 0
+fi
+
+# Check if invoked in Flipper `update-profile` flag style (`--list`, `--progress`, `--rollback`)
+if [[ "${1:-}" == --* ]]; then
+    LIST=0; ALL=0; PROGRESS=0; FORCE=0; ROLLBACK=0; FROM_UI=0; ALLOW_UNSIGNED=0; BUILD_ARG=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --list)           LIST=1 ;;
+            --all)            ALL=1 ;;
+            --every)          ;;
+            --progress)       PROGRESS=1 ;;
+            -f|--force)       FORCE=1 ;;
+            --rollback)       ROLLBACK=1 ;;
+            --from-ui)        FROM_UI=1 ;;
+            --allow-unsigned) ALLOW_UNSIGNED=1 ;;
+            -h|--help)
+                sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+                exit 0
+                ;;
+            *)
+                BUILD_ARG="$1"
+                ;;
+        esac
+        shift
+    done
+
+    if (( LIST )); then
+        emit_ui_list "$ALL"
+        exit 0
+    elif (( ROLLBACK )); then
+        require_root --rollback $( (( FROM_UI )) && echo --from-ui )
+        read_rollback_release
+        [[ -n "$KEPT_BUILD_NUM" ]] || { echo "No earlier version is saved for rollback" >&2; exit 1; }
+        systemctl reset-failed cz-ota-rollback.service 2>/dev/null || true
+        if (( FROM_UI )); then
+            systemd-run --no-block --collect --unit=cz-ota-rollback \
+                --setenv="CZ_OTA_NO_RESTART=${CZ_OTA_NO_RESTART:-0}" \
+                /usr/local/bin/cz-ota _rollback-now >/dev/null
+            for _ in $(seq 1 20); do
+                [[ -f /run/cz-ota-commit.done ]] && break
+                sleep 0.5
+            done
+        else
+            systemd-run --wait --collect --unit=cz-ota-rollback \
+                --setenv="CZ_OTA_NO_RESTART=${CZ_OTA_NO_RESTART:-0}" \
+                /usr/local/bin/cz-ota _rollback-now
+        fi
+        echo "Kali is back at ${KEPT_VERSION} (${KEPT_BUILD_NUM})"
+        exit 0
+    elif (( PROGRESS )); then
+        run_remote_update "$BUILD_ARG" "$FORCE" "$ALLOW_UNSIGNED" 1 "$FROM_UI"
+        exit 0
+    fi
+fi
+
+subcmd="${1:-status}"
+shift || true
+
+case "$subcmd" in
+    status)
+        read_current_release
+        read_rollback_release
+        echo "Installed Version : ${CUR_VERSION} (commit ${CUR_COMMIT:0:7}, build ${CUR_BUILD_NUM})"
+        echo "Channel           : ${CUR_CHANNEL}"
+        echo "Kernel ABI        : $(uname -r)"
+        if [[ -n "$KEPT_BUILD_NUM" ]]; then
+            echo "Rollback Backup   : ${KEPT_VERSION} (commit ${KEPT_COMMIT:0:7}, build ${KEPT_BUILD_NUM})"
+        else
+            echo "Rollback Backup   : none"
+        fi
+        echo "OTA Public Key    : $([[ -f "$PUBKEY_FILE" ]] && echo "present ($PUBKEY_FILE)" || echo "missing")"
+        ;;
+    check)
+        WANT_CH=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --channel) shift; WANT_CH="${1:-}" ;;
+            esac
+            shift || true
+        done
+        read_current_release
+        echo "Installed : ${CUR_VERSION} (${CUR_COMMIT:0:7}, build ${CUR_BUILD_NUM})"
+        manifests_json="$(fetch_remote_manifests)"
+        python3 - "$manifests_json" "$CUR_BUILD_NUM" "$WANT_CH" <<'PY'
+import json
+import sys
+
+items, cur_b, want_ch = json.loads(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+if want_ch:
+    items = [m for m in items if m.get("channel") == want_ch or m.get("branch") == want_ch]
+newer = [m for m in items if int(m.get("build_num", 0)) > cur_b]
+if not newer:
+    print("Status    : Up to date (no newer signed release found)")
+    sys.exit(0)
+top = newer[0]
+mb = int(top.get("size_bytes", 0)) / 1048576.0
+print(f"Available : {top['version']} ({top.get('commit','')[:7]}, build {top['build_num']}, {mb:.1f} MB)")
+for n in top.get("notes") or []:
+    print(f"  - {n}")
+print("Run 'sudo cz-ota update' (or open Settings -> Update Kali CZ) to install.")
+PY
+        ;;
+    update)
+        FORCE=0; ALLOW_UNSIGNED=0; TARGET_SPEC=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -f|--force)       FORCE=1 ;;
+                -y|--yes)         ;;
+                --allow-unsigned) ALLOW_UNSIGNED=1 ;;
+                *)                TARGET_SPEC="$1" ;;
+            esac
+            shift
+        done
+        require_root update ${TARGET_SPEC:+"$TARGET_SPEC"} $( (( FORCE )) && echo --force ) $( (( ALLOW_UNSIGNED )) && echo --allow-unsigned )
+        run_remote_update "$TARGET_SPEC" "$FORCE" "$ALLOW_UNSIGNED" 0 0
+        ;;
+    install)
+        ARCHIVE=""; MANIFEST=""; SIG=""; ALLOW_UNSIGNED=0
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --manifest)       shift; MANIFEST="${1:-}" ;;
+                --sig)            shift; SIG="${1:-}" ;;
+                --allow-unsigned) ALLOW_UNSIGNED=1 ;;
+                *)                [[ -z "$ARCHIVE" ]] && ARCHIVE="$1" ;;
+            esac
+            shift || true
+        done
+        [[ -n "$ARCHIVE" && -f "$ARCHIVE" ]] || { echo "Usage: sudo cz-ota install <bundle.tar.xz> [--manifest ota-manifest.json] [--sig ota-manifest.json.sig]" >&2; exit 1; }
+        ARCHIVE="$(readlink -f "$ARCHIVE")"
+        if [[ -z "$MANIFEST" && -f "$(dirname "$ARCHIVE")/ota-manifest.json" ]]; then
+            MANIFEST="$(dirname "$ARCHIVE")/ota-manifest.json"
+        fi
+        if [[ -z "$SIG" && -n "$MANIFEST" && -f "${MANIFEST}.sig" ]]; then
+            SIG="${MANIFEST}.sig"
+        fi
+        require_root install "$ARCHIVE" ${MANIFEST:+--manifest "$MANIFEST"} ${SIG:+--sig "$SIG"} $( (( ALLOW_UNSIGNED )) && echo --allow-unsigned )
+        check_free_space
+        stage_and_apply_bundle "$ARCHIVE" "$MANIFEST" "$SIG" "$ALLOW_UNSIGNED" 0 0
+        ;;
+    rollback)
+        require_root rollback
+        read_rollback_release
+        [[ -n "$KEPT_BUILD_NUM" ]] || { echo "No rollback backup available in $ROLLBACK_DIR" >&2; exit 1; }
+        echo "[*] Rolling back to ${KEPT_VERSION} (commit ${KEPT_COMMIT:0:7}) ..."
+        systemctl reset-failed cz-ota-rollback.service 2>/dev/null || true
+        systemd-run --wait --collect --unit=cz-ota-rollback \
+            --setenv="CZ_OTA_NO_RESTART=${CZ_OTA_NO_RESTART:-0}" \
+            /usr/local/bin/cz-ota _rollback-now
+        echo "[OK] Rolled back to ${KEPT_VERSION}"
+        ;;
+    *)
+        sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' >&2
+        exit 1
+        ;;
+esac

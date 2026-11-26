@@ -247,9 +247,8 @@ mod demo {
         menu.rows
             .iter()
             .filter(|r| match r.act {
-                Act::Boot | Act::Detail(Detail::Update | Detail::Profile) => {
-                    flipper_ui::boot::available()
-                }
+                Act::Boot | Act::Detail(Detail::Update) => flipper_ui::boot::available(),
+                Act::Detail(Detail::Profile) => flipper_ui::profile_update::available(),
                 Act::Apps | Act::Manager | Act::HostApp(_) => can_host_apps(),
                 Act::Detail(Detail::Modem) => flipper_ui::sysinfo::modem_present(),
                 Act::Flipctl2 => flipper_ui::old_flipctl_loader::available(),
@@ -484,6 +483,7 @@ mod demo {
         rows: &[
             Row { label: "UI Theme", icon: 0, frames: 1, stat: Stat::Theme, act: Act::Theme },
             Row { label: "App Scaling", icon: 0, frames: 1, stat: Stat::AppScale, act: Act::AppScale },
+            Row { label: "Update Kali CZ", icon: 0, frames: 1, stat: Stat::None, act: Act::Detail(Detail::Profile) },
             Row { label: "System info", icon: 0, frames: 1, stat: Stat::None, act: Act::Detail(Detail::System) },
             Row { label: "Battery info", icon: 0, frames: 1, stat: Stat::None, act: Act::Detail(Detail::Battery) },
             Row { label: "Disk info", icon: 0, frames: 1, stat: Stat::None, act: Act::Detail(Detail::Disk) },
@@ -1002,7 +1002,7 @@ mod detail {
     /// The Update FlipperOS screen: what `update-profile --list --every` said about the
     /// profiles, which channel and build are showing, and the run started from here.
     pub struct ProfileScreen {
-        pub channel: Channel,
+        pub channel: std::cell::Cell<Channel>,
         /// Which of `offers()` is chosen, an index into that filtered list.
         pub at: usize,
         listing: std::cell::RefCell<Option<Result<Listing, String>>>,
@@ -1042,8 +1042,17 @@ mod detail {
         fn open() -> Self {
             let listing = Self::spawn_list(false);
             let started = listing.is_some();
+            let default_channel = if flipper_ui::profile_update::ota_mode() {
+                let is_nightly = std::fs::read_to_string("/etc/cz-release")
+                    .ok()
+                    .and_then(|s| sysinfo::os_release_value(&s, "CZ_CHANNEL"))
+                    .is_some_and(|c| c == "nightly" || c == "dev");
+                if is_nightly { Channel::Nightly } else { Channel::Release }
+            } else {
+                Channel::default()
+            };
             Self {
-                channel: Channel::default(),
+                channel: std::cell::Cell::new(default_channel),
                 at: 0,
                 listing: std::cell::RefCell::new(
                     (!started).then(|| Err("cannot ask update-profile".to_string())),
@@ -1062,21 +1071,37 @@ mod detail {
         /// Take the listing once it is read, and every report the run has made since
         /// the last frame, keeping the newest.
         fn collect(&self) {
-            let mut loading = self.loading.borrow_mut();
-            if let Some(rx) = loading.as_ref() {
-                match rx.try_recv() {
-                    Ok(found) => {
-                        *self.listing.borrow_mut() = Some(found);
-                        *loading = None;
-                        self.dirty.set(true);
+            let mut switched_initial = false;
+            {
+                let mut loading = self.loading.borrow_mut();
+                if let Some(rx) = loading.as_ref() {
+                    match rx.try_recv() {
+                        Ok(found) => {
+                            *self.listing.borrow_mut() = Some(found);
+                            *loading = None;
+                            self.dirty.set(true);
+                            switched_initial = true;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        Err(_) => {
+                            *self.listing.borrow_mut() =
+                                Some(Err("update-profile did not answer".into()));
+                            *loading = None;
+                            self.dirty.set(true);
+                        }
                     }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                    Err(_) => {
-                        *self.listing.borrow_mut() =
-                            Some(Err("update-profile did not answer".into()));
-                        *loading = None;
-                        self.dirty.set(true);
-                    }
+                }
+            }
+            if switched_initial
+                && flipper_ui::profile_update::ota_mode()
+                && !self.forced()
+                && self.offers().is_empty()
+            {
+                let cur = self.channel.get();
+                let other = cur.step(true);
+                self.channel.set(other);
+                if self.offers().is_empty() {
+                    self.channel.set(cur);
                 }
             }
             let mut running = self.running.borrow_mut();
@@ -1141,7 +1166,7 @@ mod detail {
         /// The builds on the channel showing, newest first; when forced, every one
         /// the profile it is narrowed to has a stock in.
         fn offers(&self) -> Vec<Offer> {
-            let branch = self.channel.branch();
+            let branch = self.channel.get().branch();
             let forced = self.forced();
             let only = self.only_profile();
             self.listing().map_or_else(Vec::new, |l| {
@@ -1184,11 +1209,6 @@ mod detail {
             (self.going(&listing, &offer) > 0).then_some(offer)
         }
 
-        /// The number of the build Update would start.
-        pub fn chosen_number(&self) -> Option<u32> {
-            self.chosen().map(|o| o.number)
-        }
-
         /// Unlocked by PTT: any build may be chosen, and Update forces it, whatever
         /// the profile's state.
         pub fn forced(&self) -> bool {
@@ -1223,9 +1243,18 @@ mod detail {
             self.taps.set((0, None));
         }
 
+        pub fn chosen_label(&self) -> Option<String> {
+            self.chosen().map(|o| if o.label.is_empty() { o.number.to_string() } else { o.label })
+        }
+
         /// The build there is to go back to.
         pub fn kept(&self) -> Option<u32> {
             self.listing()?.kept
+        }
+
+        pub fn kept_display(&self) -> Option<String> {
+            let l = self.listing()?;
+            l.kept.map(|k| l.kept_label.unwrap_or_else(|| format!("build {k}")))
         }
 
         pub fn step_version(&mut self, forward: bool) -> bool {
@@ -1237,7 +1266,7 @@ mod detail {
         }
 
         pub fn step_channel(&mut self) {
-            self.channel = self.channel.step(true);
+            self.channel.set(self.channel.get().step(true));
             self.at = 0;
             self.dirty.set(true);
         }
@@ -1432,8 +1461,13 @@ mod detail {
                 // stopped, and powering off in the middle is what it warns about.
                 Live::Profile(p) if p.busy() => ["", "", "", "", ""],
                 Live::Profile(p) if p.finished().is_some() => {
-                    let reboot =
-                        if matches!(p.finished(), Some(Step::Done(_))) { "Reboot" } else { "" };
+                    let reboot = if matches!(p.finished(), Some(Step::Done(_)))
+                        && !flipper_ui::profile_update::ota_mode()
+                    {
+                        "Reboot"
+                    } else {
+                        ""
+                    };
                     ["Back", "", "", "", reboot]
                 }
                 Live::Profile(p) if !p.loading() => {
@@ -1725,6 +1759,9 @@ mod detail {
             sections.push(("MCU", std::mem::take(&mut out)));
         }
         out.extend(long("OS", &s.os));
+        if !s.cz_version.is_empty() {
+            out.extend(long("Cyberdeck", &s.cz_version));
+        }
         if flipper_ui::boot::available() {
             out.extend(long("Profile", &s.profile));
         }
@@ -2296,23 +2333,32 @@ mod detail {
         let (free, held): (Vec<_>, Vec<_>) =
             listing.profiles.iter().partition(|p| profile_update::updatable(&p.state));
         let mut out = Vec::new();
-        for (heading, group) in [
-            ("Updated automatically", &free),
-            (if p.forced() { "Changes dropped" } else { "Blocked" }, &held),
-        ] {
-            if group.is_empty() {
-                continue;
+        let is_ota = flipper_ui::profile_update::ota_mode();
+        if is_ota {
+            if let Some(cur) = listing.profiles.first() {
+                let ver = if cur.label.is_empty() { cur.build.to_string() } else { cur.label.clone() };
+                out.push(row("Installed", &ver));
             }
-            out.push(row(heading, ""));
-            for profile in group {
-                out.push(row(
-                    &format!("{} {}", boot::display_name(&profile.name), profile.build),
-                    status_text(&profile.state),
-                ));
+        } else {
+            for (heading, group) in [
+                ("Updated automatically", &free),
+                (if p.forced() { "Changes dropped" } else { "Blocked" }, &held),
+            ] {
+                if group.is_empty() {
+                    continue;
+                }
+                out.push(row(heading, ""));
+                for profile in group {
+                    out.push(row(
+                        &format!("{} {}", boot::display_name(&profile.name), profile.build),
+                        status_text(&profile.state),
+                    ));
+                }
             }
         }
         if let Some(kept) = listing.kept {
-            out.push(row("Previous", &kept.to_string()));
+            let prev = listing.kept_label.as_deref().map(String::from).unwrap_or_else(|| kept.to_string());
+            out.push(row("Previous", &prev));
         }
         out.push(divider());
         match p.step.borrow().clone() {
@@ -2327,7 +2373,11 @@ mod detail {
                 for said in &results {
                     out.extend(wrapped(said));
                 }
-                out.push(text("Reboot to use it"));
+                if is_ota {
+                    out.push(text("Shell restarting onto updated build..."));
+                } else {
+                    out.push(text("Reboot to use it"));
+                }
             }
             Some(Step::Failed(e)) => {
                 out.push(row("Update failed", ""));
@@ -2335,29 +2385,42 @@ mod detail {
             }
             None if free.is_empty() && !p.forced() => {}
             None => {
-                if p.forced() {
+                if p.forced() && !is_ota {
                     let only = p.only_profile().map(|o| boot::display_name(&o.name));
                     out.push(row("Profiles", only.as_deref().unwrap_or("All")));
                 }
                 match p.offers().get(p.at) {
                     Some(offer) => {
-                        out.push(chevron("Version", &offer.number.to_string()));
-                        let channel =
-                            if p.forced() { offer.branch.as_str() } else { p.channel.name() };
+                        let ver_txt = if offer.label.is_empty() {
+                            offer.number.to_string()
+                        } else {
+                            offer.label.clone()
+                        };
+                        out.push(chevron("Version", &ver_txt));
+                        let channel = if p.forced() {
+                            offer.branch.as_str()
+                        } else {
+                            p.channel.get().name()
+                        };
                         out.push(row("Channel", channel));
                         out.push(row("Download", &update::megabytes(offer.bytes)));
-                        let going = p.going(&listing, offer);
-                        let of = listing.profiles.len();
-                        out.push(text(&format!("Updates {going} of {of} profiles")));
-                        if p.forced() && p.modified() {
+                        if !is_ota {
+                            let going = p.going(&listing, offer);
+                            let of = listing.profiles.len();
+                            out.push(text(&format!("Updates {going} of {of} profiles")));
+                        }
+                        for note in &offer.notes {
+                            out.extend(wrapped(note));
+                        }
+                        if p.forced() && p.modified() && !is_ota {
                             out.push(text("Package and system changes are dropped"));
                             out.push(text("These keep a copy to go back to"));
                         }
                     }
                     None if p.forced() => out.push(text("no build for these profiles")),
                     None => {
-                        out.push(row("Channel", p.channel.name()));
-                        let none = format!("no newer {} build", p.channel.name());
+                        out.push(row("Channel", p.channel.get().name()));
+                        let none = format!("no newer {} build", p.channel.get().name());
                         out.push(text(&none));
                     }
                 }
@@ -8700,17 +8763,23 @@ fn panel(
                                     p.finished(),
                                     Some(flipper_ui::profile_update::Step::Done(_))
                                 ) {
-                                    eprintln!("action         reboot after profile update");
-                                    flipper_ui::system::reboot();
+                                    if !flipper_ui::profile_update::ota_mode() {
+                                        eprintln!("action         reboot after profile update");
+                                        flipper_ui::system::reboot();
+                                    }
                                 } else if p.forced() {
-                                    if let Some(n) = p.chosen_number() {
+                                    if let Some(lbl) = p.chosen_label() {
                                         dialog = Some(Dialog {
                                             lines: std::iter::once(format!(
-                                                "Force update to build {n}?"
+                                                "Reinstall {lbl}?"
                                             ))
-                                            .chain(p.modified().then(|| {
-                                                "Package and system changes are dropped".into()
-                                            }))
+                                            .chain(
+                                                (p.modified()
+                                                    && !flipper_ui::profile_update::ota_mode())
+                                                .then(|| {
+                                                    "Package and system changes are dropped".into()
+                                                }),
+                                            )
                                             .collect(),
                                             left: "Back",
                                             right: "Update",
@@ -8729,14 +8798,14 @@ fn panel(
                                 l.buttons(&applying, detail_offset)[3] == "Rollback"
                             }) =>
                         {
-                            if let Some(kept) = match &live {
-                                Some(detail::Live::Profile(p)) => p.kept(),
+                            if let Some(kept_lbl) = match &live {
+                                Some(detail::Live::Profile(p)) => p.kept_display(),
                                 _ => None,
                             } {
                                 dialog = Some(Dialog {
                                     lines: vec![
-                                        format!("Go back to build {kept}?"),
-                                        "The current profile version will be deleted".into(),
+                                        format!("Go back to {kept_lbl}?"),
+                                        "Restores the previous Cyberdeck build".into(),
                                     ],
                                     left: "Back",
                                     right: "Rollback",
