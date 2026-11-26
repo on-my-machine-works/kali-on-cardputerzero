@@ -176,10 +176,10 @@
       ],
       "asset_regex": "^[Cc]ap-[Cc][Cc]1101-[Ss]ub[Gg]-[Cc]hat.*_m5stack1_arm64\\.deb$|^m5cardputerzero-cap-cc1101-subg-chat_[^/]+_m5stack1_arm64\\.deb$",
       "locked": {
-        "tag": "v1.0.1",
-        "filename": "m5cardputerzero-cap-cc1101-subg-chat_1.0.1_m5stack1_arm64.deb",
-        "url": "https://github.com/CardputerZero/Cap-CC1101-SubG-Chat/releases/download/v1.0.1/m5cardputerzero-cap-cc1101-subg-chat_1.0.1_m5stack1_arm64.deb",
-        "sha256": "8ba26d9a513488673b5e8d9c3af5bc1ec6a04a4c3f859d256e420ee425e8c534"
+        "tag": "v1.0.2",
+        "filename": "m5cardputerzero-cap-cc1101-subg-chat_1.0.2_m5stack1_arm64.deb",
+        "url": "https://github.com/CardputerZero/Cap-CC1101-SubG-Chat/releases/download/v1.0.2/m5cardputerzero-cap-cc1101-subg-chat_1.0.2_m5stack1_arm64.deb",
+        "sha256": "c8ca85e63e0721790bd1dc65764046e78e68f5be1abe26a948c5fcdf23937b91"
       }
     },
     {
@@ -218,10 +218,10 @@
       ],
       "asset_regex": "^m5cardputerzero-cap-lora-1262_[^/]+_m5stack1_arm64\\.deb$",
       "locked": {
-        "tag": "v1.0.1",
-        "filename": "m5cardputerzero-cap-lora-1262_1.0.1_m5stack1_arm64.deb",
-        "url": "https://github.com/CardputerZero/Cap-LoRa-1262/releases/download/v1.0.1/m5cardputerzero-cap-lora-1262_1.0.1_m5stack1_arm64.deb",
-        "sha256": "5238fa7e20a5c63e8eb4e3ff38d6ee730c797e2afdeebfd18da200584ef84f5c"
+        "tag": "v1.0.4",
+        "filename": "m5cardputerzero-cap-lora-1262_1.0.4_m5stack1_arm64.deb",
+        "url": "https://github.com/CardputerZero/Cap-LoRa-1262/releases/download/v1.0.4/m5cardputerzero-cap-lora-1262_1.0.4_m5stack1_arm64.deb",
+        "sha256": "f567ffc70c5aeaeaa1dd8d07dec584c351902b629d8dbfd38162bd36156973ef"
       }
     },
     {
