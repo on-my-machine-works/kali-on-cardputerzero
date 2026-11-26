@@ -666,6 +666,19 @@ ACTION=="add", SUBSYSTEM=="rtc", KERNEL=="rtc0", RUN+="/sbin/hwclock --hctosys -
 KERNEL=="hidg[0-9]*", GROUP="plugdev", MODE="0660"
 KERNEL=="rfkill", SUBSYSTEM=="misc", GROUP="netdev", MODE="0664"
 KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="input", MODE="0660"
+
+# Set conservative 60% initial LCD backlight on boot & tuned ondemand DVFS governor (600 MHz idle / 1000 MHz turbo)
+ACTION=="add", SUBSYSTEM=="backlight", KERNEL=="backlight", ATTR{brightness}="60"
+ACTION=="add", SUBSYSTEM=="cpu", TEST=="cpufreq/scaling_governor", ATTR{cpufreq/scaling_governor}="ondemand", RUN+="/bin/sh -c '[ -w /sys/devices/system/cpu/cpufreq/ondemand/up_threshold ] && echo 85 > /sys/devices/system/cpu/cpufreq/ondemand/up_threshold || true'"
+
+# Enable USB runtime autosuspend on internal USB 2.0 Hub (05e3:0610) & 10/100 LAN (0fe6:9900)
+# Note: r8152 calls usb_disable_autosuspend() inside rtl8152_probe() when binding 1-1.1:1.0,
+# so we also re-enable autosuspend on the parent usb_device upon DRIVER=="r8152" bind.
+# Drops unplugged dwc2 High-Speed SOF interrupts from 8,004/sec to 0/sec (~350 mW battery savings)
+# while preserving USB Remote Wakeup (bmAttributes=0xa0) on RJ45 link-up.
+ACTION=="add|bind|change", SUBSYSTEM=="usb", DEVTYPE=="usb_device", ATTR{idVendor}=="05e3", ATTR{idProduct}=="0610", ATTR{power/autosuspend_delay_ms}="0", ATTR{power/control}="auto"
+ACTION=="add|bind|change", SUBSYSTEM=="usb", DEVTYPE=="usb_device", ATTR{idVendor}=="0fe6", ATTR{idProduct}=="9900", ATTR{power/autosuspend_delay_ms}="500", ATTR{power/control}="auto"
+ACTION=="add|bind", SUBSYSTEM=="usb", DRIVER=="r8152", ATTRS{idVendor}=="0fe6", ATTRS{idProduct}=="9900", RUN+="/bin/sh -c 'echo 500 > /sys$devpath/../power/autosuspend_delay_ms; echo auto > /sys$devpath/../power/control'"
 EOF
     install -m 644 "$SCRIPT_DIR/overlays/systemd/72-seat-cardputer-czctl.rules" \
         "$MNT_ROOT/etc/udev/rules.d/72-seat-cardputer-czctl.rules"
@@ -958,8 +971,8 @@ update-alternatives --set regulatory.db /lib/firmware/regulatory.db-upstream 2>/
 update-alternatives --set x-session-manager /usr/bin/startlxde 2>/dev/null || true
 update-alternatives --set x-terminal-emulator /usr/bin/qterminal 2>/dev/null || true
 
-# Do not let dnsmasq/hostapd auto-start at boot (used on-demand by pentesting tools)
-systemctl disable dnsmasq.service hostapd.service 2>/dev/null || true
+# Do not let dnsmasq/hostapd/ModemManager/iio-sensor-proxy auto-start at boot (saves idle RAM & CPU/I2C/USB wakeups)
+systemctl disable dnsmasq.service hostapd.service ModemManager.service iio-sensor-proxy.service 2>/dev/null || true
 
 # Enable core system services
 systemctl set-default graphical.target
@@ -1406,6 +1419,8 @@ dtparam=i2s=on
 dtparam=spi=on
 # Disable legacy PWM bcm2835 audio; ES8389 I2S codec handles onboard audio
 dtparam=audio=off
+# Blink CM0 green ACT LED only on SD card I/O instead of solid-on (actpwr)
+dtparam=act_led_trigger=mmc0
 
 # Sony IMX219 8MP CSI Camera (explicit overlay rather than firmware auto-probe)
 camera_auto_detect=0
@@ -1419,7 +1434,17 @@ dtoverlay=vc4-kms-v3d,cma-64
 max_framebuffers=2
 disable_fw_kms_setup=1
 disable_overscan=1
-arm_boost=1
+enable_tvout=0
+
+# RP3A0 (CM0) dynamic idle DVFS floors:
+# - Full 1000 MHz @ 1.2563V turbo on load; 600 MHz ARM / 150 MHz VPU @ 1.2000V at idle
+# - Shorten RPi boot turbo lock from 60s default to 15s so idle voltage drops right after boot
+initial_turbo=15
+arm_freq=1000
+core_freq_min=150
+gpu_freq_min=150
+sdram_freq_min=250
+over_voltage_min=-2
 
 [cm4]
 otg_mode=1
@@ -1428,8 +1453,10 @@ otg_mode=1
 dtoverlay=dwc2,dr_mode=host
 
 [all]
-# Enable UART (ttyAMA0 -> Bluetooth HCI; ttyS0 -> 14P Cap Bus / LoRa+GNSS)
-enable_uart=1
+# Keep secondary mini-UART (ttyS0) off by default so VideoCore core_freq & VDD_CORE
+# can scale down at idle (Bluetooth uses PL011 ttyAMA0 and is unaffected; set
+# enable_uart=1 if attaching an external 14P ttyS0 LoRa/GNSS Cap)
+enable_uart=0
 
 # USB 2.0 OTG controller (supports both Host mode and USB Gadget mode)
 dtoverlay=dwc2
@@ -1540,8 +1567,12 @@ monitor.alsa.rules = [
 ]
 EOF
 
-    # Mask systemd-backlight auto-restore (M5IOE1 PWM driver sets safe boot brightness)
+    # Mask systemd-backlight auto-restore (M5IOE1 PWM driver + udev set safe 60% boot brightness)
+    # and mask iio-sensor-proxy + disable D-Bus ModemManager auto-activation to avoid idle IMU/USB polling
     ln -sfn /dev/null "$MNT_ROOT/etc/systemd/system/systemd-backlight@backlight:backlight.service"
+    ln -sfn /dev/null "$MNT_ROOT/etc/systemd/system/iio-sensor-proxy.service"
+    rm -f "$MNT_ROOT/etc/systemd/system/multi-user.target.wants/ModemManager.service" \
+          "$MNT_ROOT/etc/systemd/system/dbus-org.freedesktop.ModemManager1.service"
 
     # 2. X11 / HDMI Desktop Separation:
     #    - Ignore internal TCA8418 keypad & IR receiver in Xorg so APPLaunch keeps exclusive LCD control
@@ -1769,12 +1800,13 @@ path-exclude=/usr/share/fonts/opentype/noto/NotoSansCJK-Light.ttc
 path-exclude=/usr/share/fonts/opentype/noto/NotoSansCJK-Thin.ttc
 EOF
 
-    # 9. Persistent bounded systemd journal (max 50M)
-    install -d "$MNT_ROOT/var/log/journal" "$MNT_ROOT/etc/systemd/journald.conf.d"
-    cat > "$MNT_ROOT/etc/systemd/journald.conf.d/persist.conf" <<'EOF'
+    # 9. Volatile bounded systemd journal in RAM (max 16M) to eliminate idle ext4 jbd2 / microSD writes
+    rm -rf "$MNT_ROOT/etc/systemd/journald.conf.d/persist.conf"
+    install -d "$MNT_ROOT/etc/systemd/journald.conf.d"
+    cat > "$MNT_ROOT/etc/systemd/journald.conf.d/volatile.conf" <<'EOF'
 [Journal]
-Storage=persistent
-SystemMaxUse=50M
+Storage=volatile
+RuntimeMaxUse=16M
 EOF
 
     # 10. Firmware sync hooks (and optional Btrfs initramfs8 profile recovery selector)
@@ -1846,14 +1878,18 @@ CHROOT
 stage_tweaks() {
     log "Configuring NetworkManager, hostname ($CZ_HOSTNAME), first-boot resize & SSH keygen"
 
-    # NetworkManager owns all interfaces (including USB/RJ45 Ethernet)
-    install -d "$MNT_ROOT/etc/NetworkManager"
+    # NetworkManager owns all interfaces (including USB/RJ45 Ethernet) and enforces 802.11 Wi-Fi PSM
+    install -d "$MNT_ROOT/etc/NetworkManager" "$MNT_ROOT/etc/NetworkManager/conf.d"
     cat > "$MNT_ROOT/etc/NetworkManager/NetworkManager.conf" <<'EOF'
 [main]
 plugins=ifupdown,keyfile
 
 [ifupdown]
 managed=true
+EOF
+    cat > "$MNT_ROOT/etc/NetworkManager/conf.d/20-wifi-powersave.conf" <<'EOF'
+[connection]
+wifi.powersave = 3
 EOF
     ln -sfn /dev/null "$MNT_ROOT/etc/systemd/system/networking.service"
 
@@ -2165,11 +2201,14 @@ CHROOT
 
     # Boot config.txt & cmdline.txt
     for line in "dtparam=i2c_arm=on" "dtparam=i2s=on" "dtparam=spi=on" "dtparam=audio=off" \
-                "dtoverlay=imx219" "dtoverlay=vc4-kms-v3d,cma-64" "enable_uart=1" "dtoverlay=dwc2" \
+                "dtparam=act_led_trigger=mmc0" \
+                "enable_tvout=0" "initial_turbo=15" "core_freq_min=150" "over_voltage_min=-2" \
+                "dtoverlay=imx219" "dtoverlay=vc4-kms-v3d,cma-64" "enable_uart=0" "dtoverlay=dwc2" \
                 "dtoverlay=cardputerzero-v5-overlay" "dtoverlay=bq27220_v5" "dtoverlay=bmi270_bmm150_overlay" \
                 "dtoverlay=gpio-ir,gpio_pin=13,gpio_pull=up" "dtoverlay=gpio-ir-tx,gpio_pin=12"; do
         vcheck "grep -qxF '$line' '$MNT_BOOT/config.txt'" "config.txt missing: $line"
     done
+    vcheck "! grep -qxF 'arm_boost=1' '$MNT_BOOT/config.txt'" "config.txt must not set arm_boost=1 (raises idle core voltage floor)"
     vcheck "grep -q 'root=PARTUUID=' '$MNT_BOOT/cmdline.txt'" "cmdline.txt missing root=PARTUUID"
     vcheck "grep -qw 'fbcon=map:99' '$MNT_BOOT/cmdline.txt'" "cmdline.txt missing fbcon=map:99"
     vcheck "! grep -qE 'console=(serial0|ttyS0)' '$MNT_BOOT/cmdline.txt'" "cmdline.txt must not claim serial0/ttyS0"
@@ -2227,6 +2266,7 @@ CHROOT
     vcheck "[[ ! -e '$MNT_ROOT/etc/modules-load.d/rtw88xxau.conf' && -f '$MNT_ROOT/etc/udev/rules.d/99-rtw88xxau.rules' ]]" "88XXau must be hotplug-only (no boot modules-load)"
     vcheck "grep -qx 'AutoEnable=false' '$MNT_ROOT/etc/bluetooth/main.conf'" "Bluetooth AutoEnable=false not set in /etc/bluetooth/main.conf"
     vcheck "grep -q 'KERNEL==\"rfkill\"' '$MNT_ROOT/etc/udev/rules.d/70-cardputerzero-peripherals.rules'" "Missing rfkill netdev permission rule"
+    vcheck "grep -q '0fe6' '$MNT_ROOT/etc/udev/rules.d/70-cardputerzero-peripherals.rules' && [[ -f '$MNT_ROOT/etc/NetworkManager/conf.d/20-wifi-powersave.conf' && -f '$MNT_ROOT/etc/systemd/journald.conf.d/volatile.conf' ]]" "Missing USB LAN autosuspend, Wi-Fi powersave, or volatile journald config"
     vcheck "[[ -f '$MNT_ROOT/etc/X11/xorg.conf.d/40-cardputerzero-no-grab.conf' ]]" "Missing X11 keypad/IR ignore config"
     vcheck "[[ -f '$MNT_ROOT/etc/X11/xorg.conf.d/98-vc4-no-glamor.conf' ]]" "Missing X11 no-glamor config"
     vcheck "[[ -f '$MNT_ROOT/etc/systemd/system/lightdm.service.d/hdmi-on-demand.conf' && -f '$MNT_ROOT/etc/systemd/system/cz-hdmi-hotplug.service' && -f '$MNT_ROOT/etc/default/cz-hdmi-desktop' ]]" "Missing on-demand HDMI desktop units/config"

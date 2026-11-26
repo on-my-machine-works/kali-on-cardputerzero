@@ -294,6 +294,19 @@ ACTION=="add", SUBSYSTEM=="rtc", KERNEL=="rtc0", RUN+="/sbin/hwclock --hctosys -
 KERNEL=="hidg[0-9]*", GROUP="plugdev", MODE="0660"
 KERNEL=="rfkill", SUBSYSTEM=="misc", GROUP="netdev", MODE="0664"
 KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="input", MODE="0660"
+
+# Set conservative 60% initial LCD backlight on boot & tuned ondemand DVFS governor (600 MHz idle / 1000 MHz turbo)
+ACTION=="add", SUBSYSTEM=="backlight", KERNEL=="backlight", ATTR{brightness}="60"
+ACTION=="add", SUBSYSTEM=="cpu", TEST=="cpufreq/scaling_governor", ATTR{cpufreq/scaling_governor}="ondemand", RUN+="/bin/sh -c '[ -w /sys/devices/system/cpu/cpufreq/ondemand/up_threshold ] && echo 85 > /sys/devices/system/cpu/cpufreq/ondemand/up_threshold || true'"
+
+# Enable USB runtime autosuspend on internal USB 2.0 Hub (05e3:0610) & 10/100 LAN (0fe6:9900)
+# Note: r8152 calls usb_disable_autosuspend() inside rtl8152_probe() when binding 1-1.1:1.0,
+# so we also re-enable autosuspend on the parent usb_device upon DRIVER=="r8152" bind.
+# Drops unplugged dwc2 High-Speed SOF interrupts from 8,004/sec to 0/sec (~350 mW battery savings)
+# while preserving USB Remote Wakeup (bmAttributes=0xa0) on RJ45 link-up.
+ACTION=="add|bind|change", SUBSYSTEM=="usb", DEVTYPE=="usb_device", ATTR{idVendor}=="05e3", ATTR{idProduct}=="0610", ATTR{power/autosuspend_delay_ms}="0", ATTR{power/control}="auto"
+ACTION=="add|bind|change", SUBSYSTEM=="usb", DEVTYPE=="usb_device", ATTR{idVendor}=="0fe6", ATTR{idProduct}=="9900", ATTR{power/autosuspend_delay_ms}="500", ATTR{power/control}="auto"
+ACTION=="add|bind", SUBSYSTEM=="usb", DRIVER=="r8152", ATTRS{idVendor}=="0fe6", ATTRS{idProduct}=="9900", RUN+="/bin/sh -c 'echo 500 > /sys$devpath/../power/autosuspend_delay_ms; echo auto > /sys$devpath/../power/control'"
 EOF
 
 modprobe uinput 2>/dev/null || true
@@ -370,11 +383,55 @@ if [[ -x /usr/lib/cz-kali/camera_app.real && -d /opt/rpi-libcamera && -d camera-
     install -m 755 camera-debs/camera_app.wrapper /usr/bin/camera_app
 fi
 
-# 8. Idle RAM/CPU hygiene & on-demand HDMI hotplug sync
+# 8. Idle power, RAM/CPU hygiene & on-demand HDMI hotplug sync
 sudo -u kali XDG_RUNTIME_DIR=/run/user/1000 \
     systemctl --user stop filter-chain.service mpris-proxy.service 2>/dev/null || true
 ln -sfn /dev/null /etc/systemd/user/filter-chain.service
 ln -sfn /dev/null /etc/systemd/user/mpris-proxy.service
+
+# Stop & disable idle background pollers (iio-sensor-proxy IMU poller & unused ModemManager)
+systemctl stop iio-sensor-proxy.service ModemManager.service 2>/dev/null || true
+systemctl disable ModemManager.service iio-sensor-proxy.service 2>/dev/null || true
+ln -sfn /dev/null /etc/systemd/system/iio-sensor-proxy.service
+rm -f /etc/systemd/system/multi-user.target.wants/ModemManager.service \
+      /etc/systemd/system/dbus-org.freedesktop.ModemManager1.service
+
+# Volatile bounded journald (eliminates background ext4 jbd2 / microSD writes)
+install -d -m 755 /etc/systemd/journald.conf.d /etc/NetworkManager/conf.d
+rm -f /etc/systemd/journald.conf.d/persist.conf
+cat > /etc/systemd/journald.conf.d/volatile.conf <<'EOF'
+[Journal]
+Storage=volatile
+RuntimeMaxUse=16M
+EOF
+systemctl restart systemd-journald.service 2>/dev/null || true
+
+# Explicit Wi-Fi 802.11 PSM power-save in NetworkManager + live wlan0 apply
+cat > /etc/NetworkManager/conf.d/20-wifi-powersave.conf <<'EOF'
+[connection]
+wifi.powersave = 3
+EOF
+iw dev wlan0 set power_save on 2>/dev/null || true
+
+# Boot config.txt DVFS & ACT LED tuning (effective on reboot; ACT trigger also applied live)
+if [[ -f /boot/firmware/config.txt && -w /boot/firmware/config.txt ]]; then
+    sed -i '/^arm_boost=1$/d' /boot/firmware/config.txt
+    if ! grep -qxF 'dtparam=act_led_trigger=mmc0' /boot/firmware/config.txt; then
+        sed -i '/^dtparam=audio=off$/a dtparam=act_led_trigger=mmc0' /boot/firmware/config.txt
+    fi
+    sed -i 's/^enable_uart=1$/enable_uart=0/' /boot/firmware/config.txt
+    sed -i '/^arm_freq_min=/d' /boot/firmware/config.txt
+    for kv in "enable_tvout=0" "initial_turbo=15" "arm_freq=1000" "core_freq_min=150" \
+              "gpu_freq_min=150" "sdram_freq_min=250" "over_voltage_min=-2"; do
+        k="\${kv%%=*}"
+        if grep -qE "^\${k}=" /boot/firmware/config.txt; then
+            sed -i "s|^\${k}=.*|\${kv}|" /boot/firmware/config.txt
+        else
+            sed -i "/^disable_overscan=1$/a \${kv}" /boot/firmware/config.txt
+        fi
+    done
+fi
+[[ -w /sys/class/leds/ACT/trigger ]] && echo mmc0 > /sys/class/leds/ACT/trigger 2>/dev/null || true
 
 install -d -m 755 /etc/default /etc/systemd/system/lightdm.service.d /etc/systemd/system/fb_load.service.d
 if [[ ! -f /etc/default/cz-hdmi-desktop ]]; then
@@ -391,7 +448,19 @@ ExecStart=/usr/sbin/fb_load --keep-open /boot/firmware/splash.bmp /dev/dri/cardp
 EOF
 
 udevadm control --reload-rules 2>/dev/null || true
-udevadm trigger --subsystem-match=drm --subsystem-match=graphics --subsystem-match=input --subsystem-match=backlight --subsystem-match=misc 2>/dev/null || true
+udevadm trigger --subsystem-match=drm --subsystem-match=graphics --subsystem-match=input --subsystem-match=backlight --subsystem-match=misc --subsystem-match=usb 2>/dev/null || true
+for udev_dir in /sys/bus/usb/devices/*; do
+    [[ -f "\$udev_dir/idVendor" && -f "\$udev_dir/idProduct" ]] || continue
+    vid="\$(cat "\$udev_dir/idVendor" 2>/dev/null || true)"
+    pid="\$(cat "\$udev_dir/idProduct" 2>/dev/null || true)"
+    if [[ "\$vid:\$pid" == "05e3:0610" ]]; then
+        echo 0 > "\$udev_dir/power/autosuspend_delay_ms" 2>/dev/null || true
+        echo auto > "\$udev_dir/power/control" 2>/dev/null || true
+    elif [[ "\$vid:\$pid" == "0fe6:9900" ]]; then
+        echo 500 > "\$udev_dir/power/autosuspend_delay_ms" 2>/dev/null || true
+        echo auto > "\$udev_dir/power/control" 2>/dev/null || true
+    fi
+done
 systemctl daemon-reload
 systemctl stop fb_load.service 2>/dev/null || true
 /usr/local/bin/cz-hdmi-hotplug sync 2>/dev/null || true
