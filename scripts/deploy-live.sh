@@ -306,7 +306,7 @@ ACTION=="add", SUBSYSTEM=="cpu", TEST=="cpufreq/scaling_governor", ATTR{cpufreq/
 # while preserving USB Remote Wakeup (bmAttributes=0xa0) on RJ45 link-up.
 ACTION=="add|bind|change", SUBSYSTEM=="usb", DEVTYPE=="usb_device", ATTR{idVendor}=="05e3", ATTR{idProduct}=="0610", ATTR{power/autosuspend_delay_ms}="0", ATTR{power/control}="auto"
 ACTION=="add|bind|change", SUBSYSTEM=="usb", DEVTYPE=="usb_device", ATTR{idVendor}=="0fe6", ATTR{idProduct}=="9900", ATTR{power/autosuspend_delay_ms}="500", ATTR{power/control}="auto"
-ACTION=="add|bind", SUBSYSTEM=="usb", DRIVER=="r8152", ATTRS{idVendor}=="0fe6", ATTRS{idProduct}=="9900", RUN+="/bin/sh -c 'echo 500 > /sys$devpath/../power/autosuspend_delay_ms; echo auto > /sys$devpath/../power/control'"
+ACTION=="add|bind", SUBSYSTEM=="usb", DRIVER=="r8152", ATTRS{idVendor}=="0fe6", ATTRS{idProduct}=="9900", RUN+="/bin/sh -c 'echo 500 > /sys\$devpath/../power/autosuspend_delay_ms; echo auto > /sys\$devpath/../power/control'"
 EOF
 
 modprobe uinput 2>/dev/null || true
