@@ -34,7 +34,7 @@ on:
       keep_rolling_releases:
         description: 'Recent rolling (weekly-* and dated vYYYY.MM.DD) releases to retain (0 = keep all)'
         required: false
-        default: '3'
+        default: '0'
         type: string
 
 permissions:
@@ -51,7 +51,7 @@ jobs:
     timeout-minutes: 150
     env:
       M5_UPDATE_MODE: ${{ inputs.m5_update_mode || 'auto' }}
-      KEEP_ROLLING_RELEASES: ${{ inputs.keep_rolling_releases || '3' }}
+      KEEP_ROLLING_RELEASES: ${{ inputs.keep_rolling_releases || '0' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
