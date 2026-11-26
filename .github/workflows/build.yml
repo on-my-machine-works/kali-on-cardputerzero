@@ -91,16 +91,44 @@ jobs:
         if: runner.arch != 'ARM64'
         run: rustup target add aarch64-unknown-linux-gnu
 
+      - name: Resolve release tag & monotonic build number
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CUSTOM_TAG: ${{ inputs.release_tag || '' }}
+        run: |
+          date_slug="$(date -u +%Y.%m.%d)"
+          if [[ -n "${CUSTOM_TAG}" ]]; then
+            base_tag="${CUSTOM_TAG}"
+          elif [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            base_tag="weekly-${date_slug}"
+          else
+            base_tag="v${date_slug}"
+          fi
+          tag="$base_tag"
+          suffix=2
+          while gh release view "$tag" >/dev/null 2>&1; do
+            tag="${base_tag}-${suffix}"
+            suffix=$((suffix + 1))
+          done
+          build_num="$(date -u +%s)"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "date_slug=${date_slug}" >> "$GITHUB_OUTPUT"
+          echo "build_num=${build_num}" >> "$GITHUB_OUTPUT"
+
       - name: Verify UI token guardrails, Rust workspace tests & Cortex-A53 shell build
         run: |
           sh shell/ci/no-raw-colours.sh
           CARGO_PROFILE_TEST_DEBUG=0 cargo test --manifest-path shell/Cargo.toml --workspace
+          CARGO_PROFILE_TEST_DEBUG=0 cargo test --manifest-path shell/Cargo.toml -p flipper-ui --features remote --test remote
           ./scripts/build-cz-shell.sh
           rm -rf shell/target
 
       - name: Build, verify, finalize and compress image
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CZ_VERSION: ${{ steps.meta.outputs.tag }}
+          CZ_BUILD_NUM: ${{ steps.meta.outputs.build_num }}
         run: |
           sudo -E ./build-kali-cardputerzero.sh fetch rootfs image
           sudo rm -rf work/rootfs
@@ -128,30 +156,26 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CUSTOM_TAG: ${{ inputs.release_tag || '' }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          DATE_SLUG: ${{ steps.meta.outputs.date_slug }}
+          BUILD_NUM: ${{ steps.meta.outputs.build_num }}
           RELEASE_SUMMARY: ${{ inputs.release_summary || '' }}
           OTA_SIGNING_KEY: ${{ secrets.OTA_SIGNING_PRIVATE_KEY }}
         run: |
-          date_slug="$(date -u +%Y.%m.%d)"
-          if [[ -n "${CUSTOM_TAG}" ]]; then
-            base_tag="${CUSTOM_TAG}"
-          elif [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
-            base_tag="weekly-${date_slug}"
-          else
-            base_tag="v${date_slug}"
-          fi
-          tag="$base_tag"
-          suffix=2
-          while gh release view "$tag" >/dev/null 2>&1; do
-            tag="${base_tag}-${suffix}"
-            suffix=$((suffix + 1))
-          done
+          tag="${RELEASE_TAG}"
+          date_slug="${DATE_SLUG}"
 
           if [[ "$tag" == weekly-* ]]; then
             rel_title="Kali Cyberdeck CardputerZero (${date_slug})"
           else
             rel_title="Kali Cyberdeck CardputerZero ${tag}"
           fi
+
+          short_sha="$(printf '%.7s' "${{ steps.lockfile.outputs.target_sha }}")"
+          OTA_VERSION="$tag" OTA_BUILD_NUM="$BUILD_NUM" OTA_COMMIT="$short_sha" OTA_NOTES="${RELEASE_SUMMARY}" ./scripts/build-ota-bundle.sh
+          ota_archive="output/ota/kali-cz-ota-${tag}-arm64.tar.xz"
+          ota_sha="$(awk '{print $1}' "${ota_archive}.sha256")"
+          ota_size="$(du -h "$ota_archive" | awk '{print $1}')"
 
           kver="$(python3 -c 'import json; print(json.load(open("upstream.lock.json"))["kernel"]["kver"])')"
           xz_sha="$(awk '{print $1}' output/kali-cardputerzero-arm64.img.xz.sha256)"
@@ -161,7 +185,7 @@ jobs:
           {
             echo "## Kali Linux Cyberdeck Edition (\`arm64\`) for M5Stack CardputerZero (\`${tag}\`)"
             echo ""
-            echo "Kali Rolling (\`arm64\`) microSD image (\`ext4\`) for M5Stack CardputerZero (\`v5\` / CM0) with Linux \`${kver}\`, native \`320x170\` Kali Cyberdeck Shell (\`czctl\`), \`:8899\` Web Remote (KVM), 12 handheld apps, composite USB-C OTG Arsenal, and full M5Stack hardware & \`APPLaunch\` support."
+            echo "Kali Rolling (\`arm64\`) microSD image (\`ext4\`) and signed on-device OTA bundle for M5Stack CardputerZero (\`v5\` / CM0) with Linux \`${kver}\`, native \`320x170\` Kali Cyberdeck Shell (\`czctl\`), PIN-protected \`:8899\` Web KVM, Hostile-Network Stealth Mode (\`cz-stealth\`), signed OTA updater (\`cz-ota\`), 12 handheld apps, composite USB-C OTG Arsenal, and full M5Stack hardware & \`APPLaunch\` support."
             if [[ -n "${RELEASE_SUMMARY}" ]]; then
               echo ""
               summary_expanded="${RELEASE_SUMMARY//\\n/$'\n'}"
@@ -176,15 +200,20 @@ jobs:
             echo "### Checksums (\`SHA-256\`)"
             echo "| File | Size | SHA-256 |"
             echo "| :--- | :---: | :--- |"
-            echo "| \`kali-cardputerzero-arm64.img.xz\` | \`${xz_size}\` | \`${xz_sha}\` |"
+            echo "| \`kali-cardputerzero-arm64.img.xz\` *(full microSD image)* | \`${xz_size}\` | \`${xz_sha}\` |"
+            echo "| \`kali-cz-ota-${tag}-arm64.tar.xz\` *(signed OTA bundle)* | \`${ota_size}\` | \`${ota_sha}\` |"
             echo "| \`kali-cardputerzero-arm64.img\` *(uncompressed)* | \`7.0G\` | \`${raw_sha}\` |"
             echo ""
-            echo "### Verify & Flash"
+            echo "### Flash MicroSD or Update Over-The-Air"
             echo '```bash'
+            echo "# Fresh microSD flash:"
             echo "sha256sum -c kali-cardputerzero-arm64.img.xz.sha256"
             echo "xzcat kali-cardputerzero-arm64.img.xz | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync"
+            echo ""
+            echo "# On-device OTA update (or Menu -> Settings -> Update Kali CZ):"
+            echo "sudo cz-ota update"
             echo '```'
-            echo "*(Default login: \`kali\` / \`kali\`, Web KVM on \`:8899\`; see \`README.md\` for \`czctl\`, USB OTG Arsenal, HDMI desktop, and external Wi-Fi usage.)*"
+            echo "*(Default login: \`kali\` / \`kali\`; Web KVM on \`:8899\` is off by default and PIN-protected when enabled in \`Network -> Web KVM (:8899)\`; see \`README.md\` for Stealth Mode, OTA, USB OTG Arsenal, HDMI desktop, and external Wi-Fi usage.)*"
           } > /tmp/release-notes.md
 
           if [[ -s work/m5-warnings.md ]]; then
@@ -195,10 +224,9 @@ jobs:
             } >> /tmp/release-notes.md
           fi
 
-          OTA_VERSION="$tag" OTA_NOTES="${RELEASE_SUMMARY}" ./scripts/build-ota-bundle.sh
           ota_assets=(
-            "output/ota/kali-cz-ota-${tag}-arm64.tar.xz"
-            "output/ota/kali-cz-ota-${tag}-arm64.tar.xz.sha256"
+            "$ota_archive"
+            "${ota_archive}.sha256"
             "output/ota/ota-manifest.json"
           )
           if [[ -f output/ota/ota-manifest.json.sig ]]; then

@@ -1340,14 +1340,22 @@ DOCEOF
 # CardputerZero Hostile-Network Stealth Mode: on | off
 STEALTH_MODE=off
 EOF
-    local git_rev build_num
+    local git_rev build_num rel_ver rel_ch
     git_rev="$(git -C "$SCRIPT_DIR" rev-parse --short=7 HEAD 2>/dev/null || echo unknown)"
-    build_num="$(date -u +%s)"
+    build_num="${CZ_BUILD_NUM:-$(date -u +%s)}"
+    rel_ver="${CZ_VERSION:-v$(date -u +%Y.%m.%d)}"
+    if [[ -n "${CZ_CHANNEL:-}" ]]; then
+        rel_ch="$CZ_CHANNEL"
+    elif [[ "$rel_ver" == weekly-* || "$rel_ver" == nightly-* ]]; then
+        rel_ch="nightly"
+    else
+        rel_ch="release"
+    fi
     cat > "$MNT_ROOT/etc/cz-release" <<EOF
-CZ_VERSION="v$(date -u +%Y.%m.%d)"
+CZ_VERSION="${rel_ver}"
 CZ_BUILD_NUM="${build_num}"
 CZ_COMMIT="${git_rev}"
-CZ_CHANNEL="release"
+CZ_CHANNEL="${rel_ch}"
 CZ_BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 CZ_IMAGE_EPOCH="1"
 CZ_KERNEL_ABI="${LOCKED_KVER:-6.18.39+rpt-rpi-v8}"
