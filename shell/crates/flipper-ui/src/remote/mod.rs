@@ -123,6 +123,52 @@ struct Shared {
     /// that has just been deleted from underneath it. It clears this when it has
     /// looked again.
     apps_changed: AtomicBool,
+    /// Set when `RemoteView` is dropped so accept threads and stream pumps exit immediately.
+    stopped: AtomicBool,
+}
+
+#[derive(Clone)]
+pub struct AuthConfig {
+    pub pin: String,
+    pub session_token: String,
+    pub usb_only: bool,
+}
+
+impl AuthConfig {
+    pub fn new(pin: String, usb_only: bool) -> Self {
+        Self { pin, session_token: random_hex_token(), usb_only }
+    }
+}
+
+fn random_hex_token() -> String {
+    let mut bytes = [0u8; 16];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut bytes);
+    } else {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        bytes.copy_from_slice(&seed.to_le_bytes());
+    }
+    let mut out = String::with_capacity(32);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+fn ct_eq(a: &str, b: &str) -> bool {
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    if ab.len() != bb.len() || ab.is_empty() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in ab.iter().zip(bb.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[derive(Clone)]
@@ -144,28 +190,73 @@ pub struct RemoteView {
     events: Receiver<KeyEvent>,
     raw_events: Receiver<RawKeyEvent>,
     addr: std::net::SocketAddr,
+    bound_addrs: Vec<std::net::SocketAddr>,
     last_viewers: usize,
 }
 
+impl Drop for RemoteView {
+    fn drop(&mut self) {
+        self.shared.stopped.store(true, Ordering::SeqCst);
+        {
+            let viewers = self.shared.viewer_queues.lock().unwrap_or_else(|e| e.into_inner());
+            for viewer in viewers.iter() {
+                viewer.ready.notify_all();
+            }
+        }
+        for addr in &self.bound_addrs {
+            let target = match addr {
+                std::net::SocketAddr::V4(v4) if v4.ip().is_unspecified() => {
+                    std::net::SocketAddr::from(([127, 0, 0, 1], v4.port()))
+                }
+                std::net::SocketAddr::V6(v6) if v6.ip().is_unspecified() => {
+                    std::net::SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], v6.port()))
+                }
+                other => *other,
+            };
+            let _ = TcpStream::connect_timeout(&target, Duration::from_millis(20));
+        }
+    }
+}
+
 impl RemoteView {
-    /// Bind and start serving. `assets` is the directory holding `device.png`.
+    /// Bind and start serving (unauthenticated; used by local tests and explicit `--remote`).
     pub fn bind(addr: &str, assets: PathBuf) -> std::io::Result<Self> {
         Self::bind_with_peer(addr, assets, None)
     }
 
-    /// As `bind`, plus a `host:port` running the fake-flipctl2 prototype.
-    ///
-    /// With a peer, `/` serves the side-by-side comparison and `/peer.png`
-    /// proxies the prototype's `/api/screen`. Proxying server-side keeps the page
-    /// same-origin, which matters because the prototype's server sends no CORS
-    /// headers. The photo view stays available at `/device`.
+    /// As `bind`, plus an optional `host:port` peer.
     pub fn bind_with_peer(
         addr: &str,
         assets: PathBuf,
         peer: Option<String>,
     ) -> std::io::Result<Self> {
-        let listener = TcpListener::bind(addr)?;
-        let local = listener.local_addr()?;
+        Self::bind_secured(&[addr], assets, peer, None)
+    }
+
+    /// Bind one or more addresses with optional PIN/cookie authentication and USB-only filtering.
+    pub fn bind_secured(
+        addrs: &[&str],
+        assets: PathBuf,
+        peer: Option<String>,
+        auth: Option<AuthConfig>,
+    ) -> std::io::Result<Self> {
+        let mut listeners = Vec::new();
+        let mut last_err = None;
+        for addr in addrs {
+            match TcpListener::bind(addr) {
+                Ok(l) => listeners.push(l),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if listeners.is_empty() {
+            return Err(last_err.unwrap_or_else(|| std::io::Error::other("no addresses to bind")));
+        }
+
+        let mut bound_addrs = Vec::with_capacity(listeners.len());
+        for l in &listeners {
+            bound_addrs.push(l.local_addr()?);
+        }
+        let local = bound_addrs[0];
 
         let shared = Arc::new(Shared {
             generation: AtomicU64::new(0),
@@ -175,18 +266,28 @@ impl RemoteView {
             running: Mutex::new(Vec::new()),
             launch: Mutex::new(None),
             apps_changed: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
         });
         let (tx, events) = mpsc::channel();
         let (raw_tx, raw_events) = mpsc::channel();
 
-        {
+        for listener in listeners {
             let shared = shared.clone();
-            std::thread::Builder::new()
-                .name("remote-accept".into())
-                .spawn(move || accept_loop(listener, shared, tx, raw_tx, assets, peer))?;
+            let tx = tx.clone();
+            let raw_tx = raw_tx.clone();
+            let assets = assets.clone();
+            let peer = peer.clone();
+            let auth = auth.clone();
+            std::thread::Builder::new().name("remote-accept".into()).spawn(move || {
+                accept_loop(listener, shared, tx, raw_tx, assets, peer, auth)
+            })?;
         }
 
-        Ok(Self { shared, events, raw_events, addr: local, last_viewers: 0 })
+        Ok(Self { shared, events, raw_events, addr: local, bound_addrs, last_viewers: 0 })
+    }
+
+    pub fn bound_count(&self) -> usize {
+        self.bound_addrs.len()
     }
 
     /// Pop the next direct PC keyboard event (`{"evdev": code, "down": bool, "ch": "..."}`).
@@ -282,21 +383,97 @@ fn accept_loop(
     raw_tx: Sender<RawKeyEvent>,
     assets: PathBuf,
     peer: Option<String>,
+    auth: Option<AuthConfig>,
 ) {
     for stream in listener.incoming() {
+        if shared.stopped.load(Ordering::SeqCst) {
+            break;
+        }
         let Ok(stream) = stream else { continue };
+        if shared.stopped.load(Ordering::SeqCst) {
+            break;
+        }
         let shared = shared.clone();
         let tx = tx.clone();
         let raw_tx = raw_tx.clone();
         let assets = assets.clone();
         let peer = peer.clone();
+        let auth = auth.clone();
         // One thread per connection. A viewer holds its /stream open, so this is
         // one long-lived thread per browser tab plus short-lived ones for the
         // page, the photo and each key press.
         let _ = std::thread::Builder::new().name("remote-conn".into()).spawn(move || {
-            let _ = serve(stream, &shared, &tx, &raw_tx, &assets, peer.as_deref());
+            let _ = serve(stream, &shared, &tx, &raw_tx, &assets, peer.as_deref(), auth.as_ref());
         });
     }
+}
+
+fn is_usb_or_loopback_peer(addr: std::net::SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback() || (v4.octets()[0] == 10 && v4.octets()[1] == 55 && v4.octets()[2] == 0)
+        }
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                return true;
+            }
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.is_loopback()
+                    || (v4.octets()[0] == 10 && v4.octets()[1] == 55 && v4.octets()[2] == 0);
+            }
+            false
+        }
+    }
+}
+
+fn strip_port(host: &str) -> &str {
+    let h = host.trim();
+    if let Some(rest) = h.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return &h[..=end + 1];
+        }
+        return h;
+    }
+    match h.rsplit_once(':') {
+        Some((base, port)) if !base.contains(':') && port.chars().all(|c| c.is_ascii_digit()) => base,
+        _ => h,
+    }
+}
+
+fn is_allowed_host(host: &str) -> bool {
+    if host.is_empty() {
+        return false;
+    }
+    let bare = strip_port(host);
+    if bare.starts_with('[') && bare.ends_with(']') {
+        return bare[1..bare.len() - 1].parse::<std::net::Ipv6Addr>().is_ok();
+    }
+    if bare.parse::<std::net::Ipv4Addr>().is_ok() {
+        return true;
+    }
+    let lower = bare.to_ascii_lowercase();
+    lower == "localhost" || lower.ends_with(".local")
+}
+
+fn origin_matches_host(origin: &str, host: &str) -> bool {
+    let rest = origin
+        .trim()
+        .strip_prefix("http://")
+        .or_else(|| origin.trim().strip_prefix("https://"))
+        .unwrap_or("");
+    let origin_authority = rest.split('/').next().unwrap_or("");
+    !origin_authority.is_empty() && origin_authority.eq_ignore_ascii_case(host.trim())
+}
+
+fn has_valid_cookie(cookie_hdr: &str, expected_token: &str) -> bool {
+    for part in cookie_hdr.split(';') {
+        if let Some((k, v)) = part.trim().split_once('=') {
+            if k.trim() == "cz_kvm" && ct_eq(v.trim(), expected_token) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn serve(
@@ -306,8 +483,22 @@ fn serve(
     raw_tx: &Sender<RawKeyEvent>,
     assets: &PathBuf,
     peer: Option<&str>,
+    auth: Option<&AuthConfig>,
 ) -> std::io::Result<()> {
+    if shared.stopped.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    if let Some(cfg) = auth {
+        if cfg.usb_only {
+            let Ok(peer_addr) = stream.peer_addr() else { return Ok(()) };
+            if !is_usb_or_loopback_peer(peer_addr) {
+                return write_response(&mut stream, "403 Forbidden", "text/plain", b"usb/local only");
+            }
+        }
+    }
+
     stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
 
     let mut request = String::new();
@@ -319,6 +510,9 @@ fn serve(
     let target = parts.next().unwrap_or_default().to_string();
 
     let mut content_length = 0usize;
+    let mut host_hdr = String::new();
+    let mut origin_hdr = String::new();
+    let mut cookie_hdr = String::new();
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
@@ -328,14 +522,102 @@ fn serve(
         if line.is_empty() {
             break;
         }
-        if let Some(v) =
-            line.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-        {
-            content_length = v.1.trim().parse().unwrap_or(0);
+        if let Some((k, v)) = line.split_once(':') {
+            let v = v.trim();
+            if k.eq_ignore_ascii_case("content-length") {
+                content_length = v.parse().unwrap_or(0);
+            } else if k.eq_ignore_ascii_case("host") {
+                host_hdr = v.to_string();
+            } else if k.eq_ignore_ascii_case("origin") {
+                origin_hdr = v.to_string();
+            } else if k.eq_ignore_ascii_case("cookie") {
+                if !cookie_hdr.is_empty() {
+                    cookie_hdr.push_str("; ");
+                }
+                cookie_hdr.push_str(v);
+            }
         }
     }
 
+    // Remove the short header read timeout before streaming or long-running actions.
+    let _ = stream.set_read_timeout(None);
+
     let path = target.split('?').next().unwrap_or("/");
+
+    if let Some(cfg) = auth {
+        if !is_allowed_host(&host_hdr) {
+            return write_response(
+                &mut stream,
+                "403 Forbidden",
+                "text/plain",
+                b"forbidden host header",
+            );
+        }
+        if method == "POST" && !origin_hdr.is_empty() && !origin_matches_host(&origin_hdr, &host_hdr)
+        {
+            return write_response(
+                &mut stream,
+                "403 Forbidden",
+                "text/plain",
+                b"cross-origin request blocked",
+            );
+        }
+
+        if method == "POST" && path == "/login" {
+            let mut body = vec![0; content_length.min(MAX_INPUT_BODY)];
+            reader.read_exact(&mut body)?;
+            let text = String::from_utf8_lossy(&body);
+            let submitted = field(&text, "pin")
+                .or_else(|| text.trim().strip_prefix("pin=").map(|s| s.trim().to_string()))
+                .unwrap_or_default();
+            if ct_eq(submitted.trim(), &cfg.pin) {
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Set-Cookie: cz_kvm={}; Path=/; HttpOnly; SameSite=Strict\r\n\
+                     Content-Length: 11\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n\
+                     {{\"ok\":true}}",
+                    cfg.session_token
+                )?;
+                return stream.flush();
+            }
+            std::thread::sleep(Duration::from_millis(250));
+            return write_response(&mut stream, "401 Unauthorized", "text/plain", b"invalid pin");
+        }
+
+        if method == "POST" && path == "/logout" {
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                 Set-Cookie: cz_kvm=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict\r\n\
+                 Content-Length: 2\r\nCache-Control: no-store\r\nConnection: close\r\n\r\nok"
+            )?;
+            return stream.flush();
+        }
+
+        if !has_valid_cookie(&cookie_hdr, &cfg.session_token) {
+            let login_page = include_str!("login.html");
+            if method == "GET"
+                && matches!(
+                    path,
+                    "/" | "/index.html" | "/device" | "/apps" | "/apps.html" | "/diff" | "/compare"
+                )
+            {
+                return write_response(
+                    &mut stream,
+                    "200 OK",
+                    "text/html; charset=utf-8",
+                    login_page.as_bytes(),
+                );
+            }
+            return write_response(
+                &mut stream,
+                "401 Unauthorized",
+                "text/plain",
+                b"pin authentication required",
+            );
+        }
+    }
     // The shared script's URL carries a version, and the pages are rewritten to
     // request that exact one.
     //
@@ -812,7 +1094,7 @@ fn stream_frames(mut stream: TcpStream, shared: &Arc<Shared>) -> std::io::Result
         queue.ready.notify_all();
     }
 
-    let result = pump(&mut stream, &queue);
+    let result = pump(&mut stream, &queue, shared);
 
     shared
         .viewer_queues
@@ -835,7 +1117,11 @@ fn write_heartbeat(stream: &mut TcpStream) -> std::io::Result<()> {
     stream.flush()
 }
 
-fn pump(stream: &mut TcpStream, viewer: &Arc<ViewerQueue>) -> std::io::Result<()> {
+fn pump(
+    stream: &mut TcpStream,
+    viewer: &Arc<ViewerQueue>,
+    shared: &Arc<Shared>,
+) -> std::io::Result<()> {
     let frame_time = Duration::from_millis(1000 / MAX_FPS);
     let mut body = Vec::new();
     // When the last frame went out, so the rate limit can be a minimum interval
@@ -844,14 +1130,23 @@ fn pump(stream: &mut TcpStream, viewer: &Arc<ViewerQueue>) -> std::io::Result<()
     let mut last_sent = std::time::Instant::now() - frame_time;
 
     loop {
+        if shared.stopped.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         let mut queue = viewer.frames.lock().unwrap_or_else(|e| e.into_inner());
         loop {
+            if shared.stopped.load(Ordering::SeqCst) {
+                return Ok(());
+            }
             if !queue.is_empty() {
                 break;
             }
             let (guard, timed_out) =
                 viewer.ready.wait_timeout(queue, HEARTBEAT).unwrap_or_else(|e| e.into_inner());
             queue = guard;
+            if shared.stopped.load(Ordering::SeqCst) {
+                return Ok(());
+            }
             if !queue.is_empty() {
                 break;
             }

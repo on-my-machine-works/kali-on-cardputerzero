@@ -29,7 +29,6 @@ StandardOutput=journal
 StandardError=journal
 ExecStart=/usr/bin/czctl --panel \
     --kms-device /dev/dri/cardputer-zero-internal \
-    --remote [::]:8899 \
     --assets /usr/share/czctl/assets/remote
 
 ExecStopPost=-/usr/bin/pkill -x sway

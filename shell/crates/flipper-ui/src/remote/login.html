@@ -1,0 +1,73 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kali CZ Web KVM - Unlock</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; background: #080c16; color: #ebf3ff;
+    font: 14px/1.4 system-ui, -apple-system, sans-serif;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .card {
+    width: min(360px, 90vw); padding: 24px; border-radius: 10px;
+    background: #0f1626; border: 1px solid #22385c;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, .55);
+    box-sizing: border-box; text-align: center;
+  }
+  .badge {
+    display: inline-block; background: #122648; color: #38bcff;
+    border: 1px solid #2c84f5; border-radius: 4px; padding: 3px 8px;
+    font: 700 11px monospace; letter-spacing: .08em; margin-bottom: 12px;
+  }
+  h1 { margin: 0 0 6px; font-size: 17px; font-weight: 600; }
+  p { margin: 0 0 16px; color: #8098b9; font-size: 13px; }
+  form { display: flex; flex-direction: column; gap: 10px; }
+  input {
+    padding: 10px 12px; border-radius: 6px; border: 1px solid #22385c;
+    background: #080c16; color: #ebf3ff; font: 600 18px monospace;
+    text-align: center; letter-spacing: .2em; outline: none;
+  }
+  input:focus { border-color: #38bcff; }
+  button {
+    padding: 10px 14px; border-radius: 6px; border: 1px solid #38bcff;
+    background: #2c84f5; color: #fff; font: 600 14px system-ui, sans-serif;
+    cursor: pointer;
+  }
+  button:hover { background: #3892ff; }
+  .err { min-height: 18px; color: #f84e5c; font-size: 12px; margin-top: 8px; }
+</style>
+<div class="card">
+  <div class="badge">KALI CYBERDECK KVM</div>
+  <h1>Web KVM Locked</h1>
+  <p>Enter the 6-digit PIN shown on CardputerZero under <b>Network &rarr; Web KVM</b>.</p>
+  <form id="f">
+    <input id="pin" type="password" inputmode="numeric" autocomplete="one-time-code" maxlength="16" placeholder="••••••" autofocus required>
+    <button type="submit">Unlock KVM</button>
+  </form>
+  <div class="err" id="err"></div>
+</div>
+<script>
+  const f = document.getElementById('f');
+  const pin = document.getElementById('pin');
+  const err = document.getElementById('err');
+  f.addEventListener('submit', async e => {
+    e.preventDefault();
+    err.textContent = '';
+    try {
+      const res = await fetch('login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pin: pin.value.trim() }),
+      });
+      if (res.ok) {
+        location.reload();
+      } else {
+        err.textContent = 'Invalid PIN. Check Network -> Web KVM on device.';
+        pin.value = '';
+        pin.focus();
+      }
+    } catch (_) {
+      err.textContent = 'Connection failed.';
+    }
+  });
+</script>

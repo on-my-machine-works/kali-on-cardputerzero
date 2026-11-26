@@ -617,6 +617,152 @@ pub mod cz {
         });
         true
     }
+
+    // ── Hostile-Network Stealth Mode (`cz-stealth`) & `:8899` Web KVM Policy ──
+
+    fn pending_stealth() -> &'static Mutex<Option<(bool, std::time::Instant)>> {
+        static PENDING: OnceLock<Mutex<Option<(bool, std::time::Instant)>>> = OnceLock::new();
+        PENDING.get_or_init(|| Mutex::new(None))
+    }
+
+    pub fn stealth_enabled() -> bool {
+        if let Ok(mut guard) = pending_stealth().lock() {
+            if let Some((on, until)) = *guard {
+                if std::time::Instant::now() < until {
+                    return on;
+                }
+                *guard = None;
+            }
+        }
+        if let Ok(text) = std::fs::read_to_string("/etc/default/cz-stealth") {
+            for line in text.lines() {
+                if let Some(val) = line.trim().strip_prefix("STEALTH_MODE=") {
+                    return val.trim_matches('"') == "on";
+                }
+            }
+        }
+        false
+    }
+
+    pub fn stealth_status() -> String {
+        if stealth_enabled() { "< ON >".into() } else { "< OFF >".into() }
+    }
+
+    pub fn toggle_stealth() -> bool {
+        if !Path::new("/usr/local/bin/cz-stealth").exists() {
+            return false;
+        }
+        let next = !stealth_enabled();
+        if let Ok(mut guard) = pending_stealth().lock() {
+            *guard = Some((next, std::time::Instant::now() + std::time::Duration::from_millis(2500)));
+        }
+        let arg = if next { "on" } else { "off" };
+        thread::spawn(move || {
+            let _ = Command::new("sudo")
+                .args(["-n", "/usr/local/bin/cz-stealth", arg])
+                .status();
+        });
+        true
+    }
+
+    #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+    pub enum WebKvmMode {
+        Off,
+        Usb,
+        Lan,
+    }
+
+    impl WebKvmMode {
+        pub const ALL: [Self; 3] = [Self::Off, Self::Usb, Self::Lan];
+
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Off => "off",
+                Self::Usb => "usb",
+                Self::Lan => "lan",
+            }
+        }
+
+        pub fn parse(s: &str) -> Self {
+            match s.trim() {
+                "usb" => Self::Usb,
+                "lan" => Self::Lan,
+                _ => Self::Off,
+            }
+        }
+    }
+
+    fn flipctl_config_dir() -> PathBuf {
+        crate::app::xdg_home("XDG_CONFIG_HOME", ".config").join("flipctl")
+    }
+
+    pub fn web_kvm_mode() -> WebKvmMode {
+        let p = flipctl_config_dir().join("web_kvm_mode");
+        std::fs::read_to_string(p).map(|s| WebKvmMode::parse(&s)).unwrap_or(WebKvmMode::Off)
+    }
+
+    pub fn step_web_kvm_mode(forward: bool) -> WebKvmMode {
+        let cur = web_kvm_mode();
+        let idx = WebKvmMode::ALL.iter().position(|&m| m == cur).unwrap_or(0);
+        let next_idx = if forward {
+            (idx + 1) % WebKvmMode::ALL.len()
+        } else {
+            (idx + WebKvmMode::ALL.len() - 1) % WebKvmMode::ALL.len()
+        };
+        let next = WebKvmMode::ALL[next_idx];
+        let dir = flipctl_config_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("web_kvm_mode"), format!("{}\n", next.as_str()));
+        if next != WebKvmMode::Off {
+            let _ = web_kvm_pin();
+        }
+        next
+    }
+
+    pub fn web_kvm_pin() -> String {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = flipctl_config_dir();
+        let path = dir.join("remote_pin");
+        if let Ok(existing) = std::fs::read_to_string(&path) {
+            let trimmed = existing.trim();
+            if trimmed.len() == 6 && trimmed.chars().all(|c| c.is_ascii_digit()) {
+                return trimmed.to_string();
+            }
+        }
+        let mut bytes = [0u8; 4];
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            let _ = f.read_exact(&mut bytes);
+        }
+        let num = 100_000 + (u32::from_le_bytes(bytes) % 900_000);
+        let pin = format!("{num:06}");
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "{pin}");
+        }
+        pin
+    }
+
+    pub fn web_kvm_status() -> String {
+        match web_kvm_mode() {
+            WebKvmMode::Off => "< Off >".into(),
+            WebKvmMode::Usb => format!("< USB: {} >", web_kvm_pin()),
+            WebKvmMode::Lan => {
+                if stealth_enabled() {
+                    "< Off (Stealth) >".into()
+                } else {
+                    format!("< LAN: {} >", web_kvm_pin())
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

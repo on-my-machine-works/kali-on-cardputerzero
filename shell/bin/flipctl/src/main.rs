@@ -325,6 +325,8 @@ mod demo {
         Rail(cz::Rail),
         UsbGadget,
         HdmiMode,
+        Stealth,
+        WebKvm,
         SwitchApplaunch,
         FbApp {
             prog: &'static str,
@@ -382,6 +384,8 @@ mod demo {
         Rail(cz::Rail),
         UsbGadget,
         HdmiMode,
+        Stealth,
+        WebKvm,
     }
 
     pub struct Row {
@@ -451,6 +455,8 @@ mod demo {
     pub static NETWORK: Menu = Menu {
         title: "Network",
         rows: &[
+            Row { label: "Stealth mode", icon: 9, frames: 10, stat: Stat::Stealth, act: Act::Stealth },
+            Row { label: "Web KVM (:8899)", icon: 10, frames: 1, stat: Stat::WebKvm, act: Act::WebKvm },
             Row { label: "Airplane mode", icon: 9, frames: 10, stat: Stat::Airplane, act: Act::Airplane },
             Row { label: "Wi-Fi", icon: 12, frames: 1, stat: Stat::Wifi, act: Act::Wifi },
             Row { label: "Bluetooth", icon: 5, frames: 10, stat: Stat::Bluetooth, act: Act::HostApp("bt-arsenal") },
@@ -485,6 +491,8 @@ mod demo {
             Row { label: "LCD Backlight", icon: 0, frames: 1, stat: Stat::Backlight, act: Act::Backlight },
             Row { label: "LCD Timeout", icon: 0, frames: 1, stat: Stat::LcdTimeout, act: Act::LcdTimeout },
             Row { label: "Lock Screen", icon: 0, frames: 1, stat: Stat::None, act: Act::LockScreen },
+            Row { label: "Stealth mode", icon: 0, frames: 1, stat: Stat::Stealth, act: Act::Stealth },
+            Row { label: "Web KVM (:8899)", icon: 0, frames: 1, stat: Stat::WebKvm, act: Act::WebKvm },
             Row { label: "HDMI Desktop", icon: 0, frames: 1, stat: Stat::HdmiMode, act: Act::HdmiMode },
             Row { label: "USB OTG Gadget", icon: 0, frames: 1, stat: Stat::UsbGadget, act: Act::UsbGadget },
             Row { label: "LED Brightness", icon: 0, frames: 1, stat: Stat::None, act: Act::Sub(&LEDS) },
@@ -552,6 +560,8 @@ mod demo {
             Stat::Rail(rail) => rail.status(),
             Stat::UsbGadget => cz::usb_gadget_status(),
             Stat::HdmiMode => cz::hdmi_status(),
+            Stat::Stealth => cz::stealth_status(),
+            Stat::WebKvm => cz::web_kvm_status(),
         }
     }
 
@@ -3947,7 +3957,12 @@ fn apply_idle(
     screen.set_battery_temp(idle.battery_temp.unwrap_or(UNKNOWN));
     screen.set_cpu_temp(idle.cpu_temp.unwrap_or(UNKNOWN));
     screen.set_power_mw(idle.power_mw.unwrap_or(UNKNOWN));
-    screen.set_hostname(idle.hostname.as_str().into());
+    let host_label = if flipper_ui::leds::cz::stealth_enabled() {
+        format!("{} [STEALTH]", idle.hostname)
+    } else {
+        idle.hostname.clone()
+    };
+    screen.set_hostname(host_label.as_str().into());
     screen.set_profile(idle.profile.as_str().into());
     // No profiles on this machine means no row for one, and the rest moves up.
     screen.set_has_profile(flipper_ui::boot::available());
@@ -4463,14 +4478,13 @@ fn panel(
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| "crates/flipper-ui/assets/remote".into());
     #[cfg(feature = "remote")]
+    let mut active_kvm_cfg: Option<(flipper_ui::leds::cz::WebKvmMode, String, usize)> = None;
+    #[cfg(feature = "remote")]
+    let mut kvm_sync_now = false;
+    #[cfg(feature = "remote")]
     let mut web = match remote.clone() {
         Some(addr) => {
             let dir = assets_dir.clone();
-            // A port that is already taken must not cost the panel. It happened
-            // repeatedly during development: a forgotten instance held 9999, every
-            // start after that died here, and the panel went black with the real
-            // fault three layers away. The browser view is a convenience; the panel
-            // is the product.
             match flipper_ui::remote::RemoteView::bind_with_peer(&addr, dir, peer.clone()) {
                 Ok(view) => {
                     eprintln!("remote view    http://{}/", view.addr());
@@ -4480,17 +4494,22 @@ fn panel(
                     Some(view)
                 }
                 Err(e) => {
-                    // Retried below rather than given up on. Not serving is worse
-                    // than it looks: the compositor hands Back and the app switcher
-                    // to flipctl through this endpoint, so without it those two keys
-                    // stop working while everything else carries on, which reads as
-                    // a UI bug rather than a bind that failed minutes earlier.
                     eprintln!("remote view    not serving on {addr} yet: {e}");
                     None
                 }
             }
         }
-        None => None,
+        None => {
+            let mut managed = None;
+            sync_managed_web_kvm(
+                &mut managed,
+                &mut active_kvm_cfg,
+                &assets_dir,
+                &peer,
+                false,
+            );
+            managed
+        }
     };
     #[cfg(not(feature = "remote"))]
     if remote.is_some() {
@@ -4513,6 +4532,7 @@ fn panel(
     let mut idle = flipper_ui::status::Idle::read_all();
     // The idle screen's address list, scrolled this many lines down.
     let mut link_scroll = apply_idle(&screen, &idle, 0);
+    let mut last_stealth_shown = flipper_ui::leds::cz::stealth_enabled();
     let mut sensor_poll = Instant::now();
     let mut link_poll = Instant::now();
     // The charger's power reading, polled only while the idle screen is up: every
@@ -6044,15 +6064,45 @@ fn panel(
         // keys the compositor reserves for us, so keep trying rather than running on
         // half deaf.
         #[cfg(feature = "remote")]
-        if web.is_none() && remote.is_some() && rebind.elapsed() >= Duration::from_secs(5) {
+        if remote.is_some() {
+            if web.is_none() && rebind.elapsed() >= Duration::from_secs(5) {
+                rebind = Instant::now();
+                let addr = remote.clone().unwrap_or_default();
+                let dir = assets_dir.clone();
+                if let Ok(view) =
+                    flipper_ui::remote::RemoteView::bind_with_peer(&addr, dir, peer.clone())
+                {
+                    eprintln!("remote view    http://{}/ (bound on retry)", view.addr());
+                    web = Some(view);
+                }
+            }
+        } else if kvm_sync_now || rebind.elapsed() >= Duration::from_secs(3) {
+            let try_usb = !kvm_sync_now;
+            kvm_sync_now = false;
             rebind = Instant::now();
-            let addr = remote.clone().unwrap_or_default();
-            let dir = assets_dir.clone();
-            if let Ok(view) =
-                flipper_ui::remote::RemoteView::bind_with_peer(&addr, dir, peer.clone())
-            {
-                eprintln!("remote view    http://{}/ (bound on retry)", view.addr());
-                web = Some(view);
+            sync_managed_web_kvm(&mut web, &mut active_kvm_cfg, &assets_dir, &peer, try_usb);
+            if web.is_none() {
+                app_frame_seen.clear();
+            }
+            let stealth_now = flipper_ui::leds::cz::stealth_enabled();
+            if stealth_now != last_stealth_shown {
+                last_stealth_shown = stealth_now;
+                link_scroll = apply_idle(&screen, &idle, link_scroll);
+                if screen.get_screen() == Screen::Menu {
+                    demo::apply_menu(&screen, stack.last().unwrap().0, &net_now);
+                }
+            }
+        }
+        #[cfg(not(feature = "remote"))]
+        if rebind.elapsed() >= Duration::from_secs(3) {
+            rebind = Instant::now();
+            let stealth_now = flipper_ui::leds::cz::stealth_enabled();
+            if stealth_now != last_stealth_shown {
+                last_stealth_shown = stealth_now;
+                link_scroll = apply_idle(&screen, &idle, link_scroll);
+                if screen.get_screen() == Screen::Menu {
+                    demo::apply_menu(&screen, stack.last().unwrap().0, &net_now);
+                }
             }
         }
 
@@ -8039,7 +8089,10 @@ fn panel(
             let Some(row) = visible.get(selected as usize).copied() else {
                 continue;
             };
-            let is_toggle = matches!(row.act, demo::Act::Airplane | demo::Act::Rail(_));
+            let is_toggle = matches!(
+                row.act,
+                demo::Act::Airplane | demo::Act::Rail(_) | demo::Act::Stealth
+            );
             let is_step = matches!(
                 row.act,
                 demo::Act::Theme
@@ -8049,6 +8102,7 @@ fn panel(
                     | demo::Act::Audio
                     | demo::Act::UsbGadget
                     | demo::Act::HdmiMode
+                    | demo::Act::WebKvm
             );
             let led = match row.act {
                 demo::Act::Led(group) => Some(group),
@@ -8080,6 +8134,16 @@ fn panel(
                         demo::Act::Rail(rail) => {
                             rail.toggle();
                         }
+                        demo::Act::Stealth => {
+                            if flipper_ui::leds::cz::toggle_stealth() {
+                                last_stealth_shown = flipper_ui::leds::cz::stealth_enabled();
+                                link_scroll = apply_idle(&screen, &idle, link_scroll);
+                                #[cfg(feature = "remote")]
+                                {
+                                    kvm_sync_now = true;
+                                }
+                            }
+                        }
                         _ => {}
                     }
                     arrow = Some((
@@ -8109,6 +8173,14 @@ fn panel(
                         demo::Act::Audio => flipper_ui::audio::step_volume(right),
                         demo::Act::UsbGadget => flipper_ui::leds::cz::step_usb_gadget(right),
                         demo::Act::HdmiMode => flipper_ui::leds::cz::step_hdmi_mode(right),
+                        demo::Act::WebKvm => {
+                            flipper_ui::leds::cz::step_web_kvm_mode(right);
+                            #[cfg(feature = "remote")]
+                            {
+                                kvm_sync_now = true;
+                            }
+                            true
+                        }
                         _ => false,
                     };
                     if moved {
@@ -8157,6 +8229,14 @@ fn panel(
                         demo::Act::Audio => flipper_ui::audio::toggle_mute(),
                         demo::Act::UsbGadget => flipper_ui::leds::cz::step_usb_gadget(true),
                         demo::Act::HdmiMode => flipper_ui::leds::cz::step_hdmi_mode(true),
+                        demo::Act::WebKvm => {
+                            flipper_ui::leds::cz::step_web_kvm_mode(true);
+                            #[cfg(feature = "remote")]
+                            {
+                                kvm_sync_now = true;
+                            }
+                            true
+                        }
                         _ => false,
                     };
                     if moved {
@@ -8168,6 +8248,16 @@ fn panel(
                         demo::Act::Airplane => net.set_airplane(!net_now.airplane),
                         demo::Act::Rail(rail) => {
                             rail.toggle();
+                        }
+                        demo::Act::Stealth => {
+                            if flipper_ui::leds::cz::toggle_stealth() {
+                                last_stealth_shown = flipper_ui::leds::cz::stealth_enabled();
+                                link_scroll = apply_idle(&screen, &idle, link_scroll);
+                                #[cfg(feature = "remote")]
+                                {
+                                    kvm_sync_now = true;
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -9150,7 +9240,9 @@ fn panel(
                         | demo::Act::Audio
                         | demo::Act::Rail(_)
                         | demo::Act::UsbGadget
-                        | demo::Act::HdmiMode => {}
+                        | demo::Act::HdmiMode
+                        | demo::Act::Stealth
+                        | demo::Act::WebKvm => {}
                     }
                 }
             }
@@ -10063,6 +10155,78 @@ fn panel(
             Duration::from_millis(250)
         };
         pace(bench, input.as_ref(), wait_for, !pending_input.is_empty());
+    }
+}
+
+#[cfg(feature = "remote")]
+fn sync_managed_web_kvm(
+    web: &mut Option<flipper_ui::remote::RemoteView>,
+    active_cfg: &mut Option<(flipper_ui::leds::cz::WebKvmMode, String, usize)>,
+    assets_dir: &std::path::Path,
+    peer: &Option<String>,
+    try_usb_upgrade: bool,
+) {
+    use flipper_ui::leds::cz::{self, WebKvmMode};
+    use flipper_ui::remote::{AuthConfig, RemoteView};
+
+    let raw_mode = cz::web_kvm_mode();
+    let stealth = cz::stealth_enabled();
+    let effective = match raw_mode {
+        WebKvmMode::Off => WebKvmMode::Off,
+        WebKvmMode::Lan if stealth => WebKvmMode::Off,
+        other => other,
+    };
+
+    if effective == WebKvmMode::Off {
+        if web.is_some() {
+            *web = None;
+            eprintln!("remote view    disabled (mode={} stealth={})", raw_mode.as_str(), stealth);
+        }
+        *active_cfg = None;
+        return;
+    }
+
+    let pin = cz::web_kvm_pin();
+    let need_rebind = match active_cfg.as_ref() {
+        None => true,
+        Some((cur_mode, cur_pin, bound_cnt)) => {
+            if *cur_mode != effective || *cur_pin != pin || web.is_none() {
+                true
+            } else if try_usb_upgrade && effective == WebKvmMode::Usb && *bound_cnt < 2 {
+                std::net::TcpListener::bind("10.55.0.1:8899").is_ok()
+            } else {
+                false
+            }
+        }
+    };
+
+    if !need_rebind {
+        return;
+    }
+
+    *web = None;
+    let (addrs, usb_only): (&[&str], bool) = match effective {
+        WebKvmMode::Usb => (&["127.0.0.1:8899", "10.55.0.1:8899"], true),
+        WebKvmMode::Lan => (&["[::]:8899"], false),
+        WebKvmMode::Off => unreachable!(),
+    };
+    let auth = AuthConfig::new(pin.clone(), usb_only);
+    match RemoteView::bind_secured(addrs, assets_dir.to_path_buf(), peer.clone(), Some(auth)) {
+        Ok(view) => {
+            let cnt = view.bound_count();
+            eprintln!(
+                "remote view    http://{}/ (mode={}, pin-protected, {} listener(s))",
+                view.addr(),
+                effective.as_str(),
+                cnt
+            );
+            *active_cfg = Some((effective, pin, cnt));
+            *web = Some(view);
+        }
+        Err(e) => {
+            eprintln!("remote view    not serving ({}) yet: {e}", effective.as_str());
+            *active_cfg = None;
+        }
     }
 }
 

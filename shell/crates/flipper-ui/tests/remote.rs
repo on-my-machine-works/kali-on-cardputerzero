@@ -255,3 +255,108 @@ fn a_second_viewer_also_gets_a_whole_frame() {
         "both viewers must receive a complete screen"
     );
 }
+
+#[test]
+fn pin_auth_gates_stream_and_input_blocks_csrf_and_unbinds_on_drop() {
+    use flipper_ui::remote::AuthConfig;
+
+    let mut view = RemoteView::bind_secured(
+        &["127.0.0.1:0"],
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/remote"),
+        None,
+        Some(AuthConfig::new("654321".into(), true)),
+    )
+    .expect("bind secured");
+    let addr = view.addr();
+    let host = format!("127.0.0.1:{}", addr.port());
+
+    // 1. Unauthenticated `/` serves the PIN login gate, not the KVM canvas.
+    let (status, body) = request(addr, &format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n"));
+    assert!(status.contains("200"), "login gate status: {status}");
+    let html = String::from_utf8_lossy(&page_slice(&body));
+    assert!(html.contains("Web KVM Locked"), "should serve PIN login gate");
+    assert!(!html.contains("<canvas id=\"panel\""), "must not leak KVM page before login");
+
+    // 2. Unauthenticated `/stream` and `/input` are rejected with 401.
+    let (st_stream, _) = request(addr, &format!("GET /stream HTTP/1.1\r\nHost: {host}\r\n\r\n"));
+    assert!(st_stream.contains("401"), "unauth stream must 401: {st_stream}");
+    let payload = "{\"key\":\"ok\",\"down\":true}";
+    let (st_in, _) = request(
+        addr,
+        &format!(
+            "POST /input HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        ),
+    );
+    assert!(st_in.contains("401"), "unauth input must 401: {st_in}");
+    assert!(view.poll().is_none(), "unauthenticated POST must not inject keys");
+
+    // 3. DNS-rebinding Host header is rejected with 403.
+    let (st_rebind, _) = request(addr, "GET / HTTP/1.1\r\nHost: evil.example.com\r\n\r\n");
+    assert!(st_rebind.contains("403"), "rebinding Host must 403: {st_rebind}");
+
+    // 4. Login with valid PIN issues HttpOnly SameSite=Strict session cookie.
+    let login_body = "{\"pin\":\"654321\"}";
+    let mut stream = TcpStream::connect(addr).expect("connect login");
+    write!(
+        stream,
+        "POST /login HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nContent-Length: {}\r\n\r\n{login_body}",
+        login_body.len()
+    )
+    .expect("write login");
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line).expect("login status");
+    assert!(status_line.contains("200"), "valid PIN should succeed: {status_line}");
+    let mut cookie = String::new();
+    loop {
+        let mut h = String::new();
+        reader.read_line(&mut h).expect("hdr");
+        let ht = h.trim_end();
+        if ht.is_empty() {
+            break;
+        }
+        if let Some((_, v)) = ht.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
+        {
+            cookie = v.split(';').next().unwrap_or("").trim().to_string();
+            assert!(v.contains("HttpOnly") && v.contains("SameSite=Strict"));
+        }
+    }
+    assert!(cookie.starts_with("cz_kvm="), "expected session cookie, got {cookie}");
+
+    // 5. Cross-origin POST even with valid cookie is blocked (403).
+    let (st_csrf, _) = request(
+        addr,
+        &format!(
+            "POST /input HTTP/1.1\r\nHost: {host}\r\nOrigin: http://attacker.invalid\r\nCookie: {cookie}\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        ),
+    );
+    assert!(st_csrf.contains("403"), "cross-origin POST must 403: {st_csrf}");
+    assert!(view.poll().is_none());
+
+    // 6. Same-origin authenticated POST /input succeeds.
+    let (st_ok, _) = request(
+        addr,
+        &format!(
+            "POST /input HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nCookie: {cookie}\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        ),
+    );
+    assert!(st_ok.contains("200"), "authenticated POST /input must 200: {st_ok}");
+    assert_eq!(view.poll().map(|e| e.key), Some(FlipperKey::Ok));
+
+    // 7. Dropping RemoteView immediately closes the TCP listener so the port can be rebound.
+    drop(view);
+    for _ in 0..50 {
+        if std::net::TcpListener::bind(addr).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("listener port {addr} remained bound after dropping RemoteView");
+}
+
+fn page_slice(b: &[u8]) -> &[u8] {
+    b
+}
