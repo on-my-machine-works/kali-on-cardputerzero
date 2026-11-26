@@ -10,6 +10,23 @@ Cyberdeck Edition brings together the best of three worlds: **[Kali Linux](https
 
 Instead of treating the 1.9" SPI screen as a secondary status display, the image boots straight into a native **`320x170` RGB565 DRM/KMS shell (`czctl`)** built with [Slint](https://github.com/slint-ui/slint). It pairs `czctl` with a built-in **`:8899` Browser Web KVM**, **12 hosted Wayland offensive and hardware apps**, a **[ProFont](https://tobiasjung.name/profont/) multi-zoom terminal (`cz-term`)**, and a **composite USB-C OTG Arsenal**, while keeping full M5Stack hardware and Cap support, optional [`APPLaunch`](https://github.com/CardputerZero/launcher) switching, and an on-demand HDMI LXDE desktop within ~118 MiB idle RAM.
 
+<p align="center">
+  <img src="docs/media/czctl-demo.gif" width="641" alt="Animated walkthrough of Kali Linux Cyberdeck Edition on CardputerZero" />
+</p>
+
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <img src="docs/media/hardware-lora-cap.jpg" alt="Running on CardputerZero Transparent Black Version with LoRa and GNSS Cap" /><br />
+      <sub><b>Running on my CardputerZero (Transparent Black Version)</b> with the LoRa/GNSS Cap</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src="docs/media/cardputer-angle.png" alt="CardputerZero showing the live Tab App Switcher across running Kali apps" /><br />
+      <sub><b>Live <code>Tab</code> App Switcher</b>: jump between running Wayland and terminal tools</sub>
+    </td>
+  </tr>
+</table>
+
 ## What Defines Cyberdeck Edition
 
 - **`czctl` `320x170` DRM/KMS Shell**: zero-tearing RGB565 interface in a Kali Dark palette (with runtime theme switching), live battery/thermal/power/IP idle dashboard, `1:1` bezel-aligned softkeys over physical keys `4`-`8`, visual `Tab` App Switcher, `Hold Tab` screen lock (`0 mA` backlight off), and `Hold Esc` hardware rescue.
@@ -80,6 +97,51 @@ You do not need to clone this repository or re-flash your microSD card to update
 
 ## Controls, Shell & App Deck
 
+### `320x170` Shell & App Tour
+
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <img src="docs/media/screen-idle-stealth.png" width="380" alt="Idle Home Dashboard in Stealth Mode" /><br />
+      <sub><b>Idle Dashboard (<code>[STEALTH]</code>)</b>: battery, SoC thermal, power draw, and live link IPs</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src="docs/media/screen-kali-arsenal.png" width="380" alt="Kali Arsenal Menu" /><br />
+      <sub><b>Kali Arsenal (<code>[8]</code>)</b>: hosted Wayland offensive apps, BadUSB, and terminals</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <img src="docs/media/screen-wifi-recon.png" width="380" alt="Wi-Fi Recon Hosted App" /><br />
+      <sub><b>Wi-Fi Recon</b>: RSSI/channel/security scanner + one-key USB monitor mode</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src="docs/media/screen-app-switcher.png" width="380" alt="Live Tab App Switcher" /><br />
+      <sub><b><code>Tab</code> App Switcher</b>: live Wayland card deck with instant focus and kill</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <img src="docs/media/screen-usb-arsenal.png" width="380" alt="Composite USB-C OTG Arsenal" /><br />
+      <sub><b>USB Arsenal</b>: composite <code>usb0</code> + BadUSB HID, MTP, bootable ISOs, and FAT32 loot</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src="docs/media/screen-network-security.png" width="380" alt="Stealth Mode and PIN-Protected Web KVM" /><br />
+      <sub><b>Network Security</b>: one-toggle Stealth Mode + 6-digit PIN Web KVM (<code>:8899</code>)</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <img src="docs/media/screen-ota-update.png" width="380" alt="Signed On-Device OTA Updater" /><br />
+      <sub><b>Update Kali CZ (<code>cz-ota</code>)</b>: Ed25519-signed GitHub Release updates + rollback</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src="docs/media/screen-profont-term.png" width="380" alt="ProFont Terminal and Kali QuickMenu" /><br />
+      <sub><b><code>cz-term</code> (ProFont)</b>: crisp bitmap terminal with live <code>Ctrl+Alt+F</code> font zoom</sub>
+    </td>
+  </tr>
+</table>
+
 ### Physical Keymap & Gestures
 
 | Keys / Gesture | In `czctl` & Hosted Apps | In Text Inputs & Terminals |
@@ -146,7 +208,7 @@ cz-badusb --menu
 
 ### On-Demand HDMI LXDE Desktop (`cz-hdmi-hotplug`)
 
-The 1.9" SPI LCD and Mini-HDMI run independently: `czctl` keeps the internal `TCA8418` keypad isolated on `seat1` while HDMI runs a full Kali LXDE session. When Mini-HDMI is unplugged, `lightdm` stays stopped (saving ~75-90 MiB RAM) and starts automatically on hotplug (`cz-hdmi-hotplug status|auto|always|off`).
+The 1.9" SPI LCD and HDMI run independently: `czctl` keeps the internal `TCA8418` keypad isolated on `seat1` while HDMI runs a full Kali LXDE session. When HDMI is unplugged, `lightdm` stays stopped (saving ~75-90 MiB RAM) and starts automatically on hotplug (`cz-hdmi-hotplug status|auto|always|off`).
 
 ---
 
