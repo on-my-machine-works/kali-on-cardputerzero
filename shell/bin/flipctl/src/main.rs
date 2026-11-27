@@ -5208,6 +5208,9 @@ fn panel(
     let mut last_activity = Instant::now();
     let mut lcd_asleep = false;
     let mut was_lcd_asleep = false;
+    if !bench && flipper_ui::leds::cz::wake_backlight() {
+        eprintln!("display        restored LCD backlight on startup");
+    }
     let mut locked = false;
     let mut want_lock_now = false;
     let mut lock_wait_tab_release = false;
@@ -5773,8 +5776,8 @@ fn panel(
             let any_input = !pending_input.is_empty() || !pending_remote.is_empty() || has_raw;
             if any_input {
                 last_activity = Instant::now();
-                if lcd_asleep {
-                    let _ = flipper_ui::leds::cz::wake_backlight();
+                let woke_hw = flipper_ui::leds::cz::wake_backlight();
+                if lcd_asleep || woke_hw {
                     lcd_asleep = false;
                     for ev in pending_input.drain(..).chain(pending_remote.drain(..)) {
                         if ev.down {
@@ -5899,9 +5902,20 @@ fn panel(
                 window.request_redraw();
                 eprintln!("lock           screen locked");
             } else {
+                let update_in_progress = apply_rx.is_some()
+                    || matches!(live.as_ref(), Some(detail::Live::Profile(p)) if p.busy());
+                if update_in_progress {
+                    last_activity = Instant::now();
+                    if lcd_asleep {
+                        let _ = flipper_ui::leds::cz::wake_backlight();
+                        lcd_asleep = false;
+                        window.request_redraw();
+                    }
+                }
                 let timeout_s = flipper_ui::leds::cz::lcd_timeout_secs();
                 if !lcd_asleep
                     && !bench
+                    && !update_in_progress
                     && timeout_s > 0
                     && last_activity.elapsed() >= Duration::from_secs(u64::from(timeout_s))
                 {

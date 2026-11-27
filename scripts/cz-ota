@@ -420,6 +420,12 @@ PY
     if (( czctl_was_active )) && [[ "${CZ_OTA_NO_RESTART:-0}" != "1" ]]; then
         sleep 1
         systemctl restart czctl.service || true
+        if [[ -d /sys/class/backlight/backlight ]]; then
+            echo 0 > /sys/class/backlight/backlight/bl_power 2>/dev/null || true
+            if [[ "$(tr -d '[:space:]' < /sys/class/backlight/backlight/brightness 2>/dev/null || echo 60)" == "0" ]]; then
+                echo 60 > /sys/class/backlight/backlight/brightness 2>/dev/null || true
+            fi
+        fi
         # 8-second post-update health-check watchdog with automatic rollback on crash
         local healthy=1
         sleep 3
@@ -453,6 +459,12 @@ rollback_internal() {
     if (( czctl_was_active )) && [[ "${CZ_OTA_NO_RESTART:-0}" != "1" ]]; then
         sleep 1
         systemctl restart czctl.service || true
+        if [[ -d /sys/class/backlight/backlight ]]; then
+            echo 0 > /sys/class/backlight/backlight/bl_power 2>/dev/null || true
+            if [[ "$(tr -d '[:space:]' < /sys/class/backlight/backlight/brightness 2>/dev/null || echo 60)" == "0" ]]; then
+                echo 60 > /sys/class/backlight/backlight/brightness 2>/dev/null || true
+            fi
+        fi
     fi
     echo "ok" > /run/cz-ota-commit.status
     touch /run/cz-ota-commit.done

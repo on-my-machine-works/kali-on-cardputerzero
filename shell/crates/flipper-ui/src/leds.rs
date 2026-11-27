@@ -214,15 +214,9 @@ pub mod cz {
             .ok()
             .filter(|&m| m > 0)?;
         let effective = if cur == 0 {
-            saved_backlight_raw()
-                .lock()
-                .ok()
-                .and_then(|g| *g)
-                .unwrap_or_else(|| (80 * max + 50) / 100)
+            load_saved_backlight().unwrap_or_else(|| (60 * max + 50) / 100)
         } else {
-            if let Ok(mut g) = saved_backlight_raw().lock() {
-                *g = Some(cur);
-            }
+            persist_saved_backlight(cur);
             cur
         };
         Some(((effective * 100 + max / 2) / max).clamp(5, 100) as u8)
@@ -242,7 +236,37 @@ pub mod cz {
         }
     }
 
+    const SAVED_BL_FILE: &str = "/tmp/flipctl-saved-backlight";
+
+    fn persist_saved_backlight(raw_val: u32) {
+        if let Ok(mut g) = saved_backlight_raw().lock() {
+            *g = Some(raw_val);
+        }
+        let _ = std::fs::write(SAVED_BL_FILE, format!("{raw_val}\n"));
+    }
+
+    fn load_saved_backlight() -> Option<u32> {
+        if let Some(v) = saved_backlight_raw().lock().ok().and_then(|g| *g) {
+            return Some(v);
+        }
+        std::fs::read_to_string(SAVED_BL_FILE)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|&v| v > 0)
+    }
+
     fn write_backlight_raw(dir: &Path, raw_val: u32) {
+        if raw_val > 0 {
+            let bl_power = dir.join("bl_power");
+            if std::fs::read_to_string(&bl_power)
+                .ok()
+                .is_some_and(|s| s.trim() != "0")
+            {
+                if std::fs::write(&bl_power, "0").is_err() {
+                    let _ = crate::system::write_sysfs(&bl_power, "0");
+                }
+            }
+        }
         let bpath = dir.join("brightness");
         let val_str = raw_val.to_string();
         if std::fs::write(&bpath, &val_str).is_err() {
@@ -268,9 +292,7 @@ pub mod cz {
             return false;
         }
         let raw_val = ((u32::from(next_pct) * max + 50) / 100).clamp(1, max);
-        if let Ok(mut g) = saved_backlight_raw().lock() {
-            *g = Some(raw_val);
-        }
+        persist_saved_backlight(raw_val);
         write_backlight_raw(&dir, raw_val);
         true
     }
@@ -286,33 +308,33 @@ pub mod cz {
         const CYCLE: [u8; 5] = [20, 40, 60, 80, 100];
         let next_pct = CYCLE.into_iter().find(|&p| p > cur_pct + 5).unwrap_or(CYCLE[0]);
         let raw_val = ((u32::from(next_pct) * max + 50) / 100).clamp(1, max);
-        if let Ok(mut g) = saved_backlight_raw().lock() {
-            *g = Some(raw_val);
-        }
+        persist_saved_backlight(raw_val);
         write_backlight_raw(&dir, raw_val);
         true
     }
 
-    /// Turn off the ST7789v3 PWM backlight (`brightness = 0`), remembering the working level.
+    /// Turn off the ST7789v3 PWM backlight (`brightness = 0`), remembering the working level
+    /// both in memory and in `/tmp/flipctl-saved-backlight` across service/OTA restarts.
     pub fn sleep_backlight() -> bool {
         let Some(dir) = backlight_dir() else { return false };
         let Ok(cur_txt) = std::fs::read_to_string(dir.join("brightness")) else { return false };
         let cur = cur_txt.trim().parse::<u32>().unwrap_or(0);
         if cur > 0 {
-            if let Ok(mut g) = saved_backlight_raw().lock() {
-                *g = Some(cur);
-            }
+            persist_saved_backlight(cur);
             write_backlight_raw(&dir, 0);
         }
         true
     }
 
-    /// Restore the ST7789v3 PWM backlight after sleep or screen lock.
+    /// Restore the ST7789v3 PWM backlight after sleep, screen lock, or service restart.
     pub fn wake_backlight() -> bool {
         let Some(dir) = backlight_dir() else { return false };
         let Ok(cur_txt) = std::fs::read_to_string(dir.join("brightness")) else { return false };
         let cur = cur_txt.trim().parse::<u32>().unwrap_or(0);
-        if cur > 0 {
+        let bl_off = std::fs::read_to_string(dir.join("bl_power"))
+            .ok()
+            .is_some_and(|s| s.trim() != "0");
+        if cur > 0 && !bl_off {
             return false;
         }
         let max = std::fs::read_to_string(dir.join("max_brightness"))
@@ -320,12 +342,13 @@ pub mod cz {
             .and_then(|s| s.trim().parse::<u32>().ok())
             .filter(|&m| m > 0)
             .unwrap_or(100);
-        let restore = saved_backlight_raw()
-            .lock()
-            .ok()
-            .and_then(|g| *g)
-            .unwrap_or_else(|| (80 * max + 50) / 100)
-            .clamp(1, max);
+        let restore = if cur > 0 {
+            cur
+        } else {
+            load_saved_backlight()
+                .unwrap_or_else(|| (60 * max + 50) / 100)
+                .clamp(1, max)
+        };
         write_backlight_raw(&dir, restore);
         true
     }
