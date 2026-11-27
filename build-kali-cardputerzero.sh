@@ -746,11 +746,6 @@ DEBCONF
 rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock
 dpkg --configure -a || true
 
-SYS_LIBCAM_PKG="$(apt-cache policy libcamera0.7 2>/dev/null | awk '/Candidate:/ && $2 != "(none)" {print "libcamera0.7"}')"
-if [ -z "$SYS_LIBCAM_PKG" ]; then
-    SYS_LIBCAM_PKG="$(apt-cache search --names-only '^libcamera0\.[0-9]+$' 2>/dev/null | awk '{print $1}' | sort -V | tail -1)"
-fi
-SYS_LIBCAM_PKG="${SYS_LIBCAM_PKG:-libcamera0.7}"
 EXTRA_FS_PKGS=()
 [ "$ROOT_FS" = "btrfs" ] && EXTRA_FS_PKGS+=(btrfs-progs)
 
@@ -835,8 +830,14 @@ eatmydata apt-get install -y --no-install-recommends \
     qterminal \
     feh \
     polkitd \
-    "$SYS_LIBCAM_PKG" \
-    libcamera-ipa \
+    libdw1t64 \
+    libgnutls30t64 \
+    liblttng-ust1t64 \
+    libudev1 \
+    libyaml-0-2 \
+    libcjson1 \
+    libpulse0 \
+    libv4l-0t64 \
     ffmpeg \
     libfmt10 \
     libfreetype6 \
@@ -1010,9 +1011,42 @@ stage_apps() {
 
     run_chroot "${cam_args[@]}" <<'CHROOT'
 rm -rf "$RPI_LIBCAMERA_DIR"
-mkdir -p "$RPI_LIBCAMERA_DIR"
+mkdir -p "$RPI_LIBCAMERA_DIR" /usr/lib/cz-kali
 for d in "$@"; do dpkg-deb -x "$d" "$RPI_LIBCAMERA_DIR"; done
 rm -rf "$RPI_LIBCAMERA_DIR/usr/share/doc" "$RPI_LIBCAMERA_DIR/usr/share/lintian" /var/cache/cz-build/camera
+
+# Build & install cz-rpi-libcamera virtual provider so M5 CameraApp's libcamera0.x
+# dpkg dependency is satisfied cleanly without conflicting with Kali system libraries
+soname_ver="$(basename "$(ls "$RPI_LIBCAMERA_DIR/usr/lib/aarch64-linux-gnu/libcamera.so."0.*.* 2>/dev/null | sort -V | tail -n1)" 2>/dev/null | sed 's/^libcamera\.so\.//')"
+soname_ver="${soname_ver:-0.8.0}"
+abi_xy="$(printf '%s' "$soname_ver" | cut -d. -f1-2)"
+shim_dir="$(mktemp -d)"
+mkdir -p "$shim_dir/DEBIAN" "$shim_dir/usr/share/doc/cz-rpi-libcamera"
+cat > "$shim_dir/DEBIAN/control" <<EOF
+Package: cz-rpi-libcamera
+Version: ${soname_ver}-2
+Section: libs
+Priority: optional
+Architecture: arm64
+Maintainer: Kali Cyberdeck Edition <noreply@kali.org>
+Depends: libc6, libdw1t64, libgcc-s1, libgnutls30t64, liblttng-ust1t64, libstdc++6, libudev1, libyaml-0-2
+Provides: libcamera${abi_xy} (= ${soname_ver}), libcamera0.8 (= 0.8.0), libcamera0.7 (= 0.7.2), libcamera-ipa (= ${soname_ver})
+Description: Isolated Raspberry Pi libcamera runtime virtual provider
+ Satisfies M5 CameraApp libcamera0.x dpkg dependencies via /opt/rpi-libcamera
+ without conflicting with Kali Rolling system Boost, Abseil, or libcamera packages.
+EOF
+printf 'Isolated Raspberry Pi libcamera runtime (%s).\n' "$RPI_LIBCAMERA_DIR" > "$shim_dir/usr/share/doc/cz-rpi-libcamera/README"
+dpkg-deb --root-owner-group -Zxz --build "$shim_dir" /tmp/cz-rpi-libcamera.deb >/dev/null
+dpkg -i /tmp/cz-rpi-libcamera.deb >/dev/null
+rm -rf "$shim_dir" /tmp/cz-rpi-libcamera.deb
+
+# Register /usr/bin/camera_app diversion up front so dpkg unpacks straight to camera_app.real
+if ! dpkg-divert --list /usr/bin/camera_app | grep -q '/usr/bin/camera_app'; then
+    if [ -f /usr/bin/camera_app ] && [ -f /usr/lib/cz-kali/camera_app.real ]; then
+        rm -f /usr/bin/camera_app
+    fi
+    dpkg-divert --local --rename --divert /usr/lib/cz-kali/camera_app.real --add /usr/bin/camera_app
+fi
 CHROOT
 
     # 2. Install raspi-utils & M5 apps with per-package ldd verification and lockfile fallback
@@ -1054,7 +1088,7 @@ bins="$(dpkg -L "$p" 2>/dev/null | grep -E '^/usr/(bin|sbin|share/.*/bin)/' || t
 for bin in $bins; do
     [ -f "$bin" ] && [ -x "$bin" ] || continue
     if file "$bin" | grep -q 'ELF 64-bit'; then
-        if LD_LIBRARY_PATH="$ld_extra" ldd "$bin" | grep -q 'not found'; then
+        if LD_LIBRARY_PATH="$ld_extra" ldd -r "$bin" 2>&1 | grep -qE 'not found|undefined symbol'; then
             exit 1
         fi
     fi
@@ -1107,7 +1141,7 @@ if ! dpkg-divert --list /usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch | gre
 fi
 cp -a /usr/lib/cz-kali/M5CardputerZero-APPLaunch.m5 /usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch
 
-if [ ! -f /usr/lib/cz-kali/camera_app.real ]; then
+if ! dpkg-divert --list /usr/bin/camera_app | grep -q '/usr/bin/camera_app'; then
     dpkg-divert --local --rename --divert /usr/lib/cz-kali/camera_app.real --add /usr/bin/camera_app
 fi
 
@@ -2220,9 +2254,23 @@ rm -f /tmp/cz_fake_lcd
 if [ "$redir_out" != "LCD_REDIRECT_OK:CLEAN" ]; then
     echo "FB_REDIRECT_FAIL:$redir_out"
 fi
-# 4. Check CameraApp against private Raspberry Pi libcamera tree
-if LD_LIBRARY_PATH="$RPI_LIBCAMERA_DIR/usr/lib/aarch64-linux-gnu" ldd /usr/lib/cz-kali/camera_app.real | grep -q 'not found'; then
+# 4. Check CameraApp + every ELF and dlopen'd IPA module inside /opt/rpi-libcamera + dpkg dependency health
+RPI_L="$RPI_LIBCAMERA_DIR/usr/lib/aarch64-linux-gnu"
+if LD_LIBRARY_PATH="$RPI_L" ldd -r /usr/lib/cz-kali/camera_app.real 2>&1 | grep -qE 'not found|undefined symbol'; then
     echo "LDD_FAIL:camera_app.real"
+fi
+while IFS= read -r -d '' rpi_elf; do
+    if file "$rpi_elf" | grep -q 'ELF 64-bit'; then
+        if LD_LIBRARY_PATH="$RPI_L" ldd -r "$rpi_elf" 2>&1 | grep -qE 'not found|undefined symbol'; then
+            echo "LDD_FAIL:$rpi_elf"
+        fi
+    fi
+done < <(find "$RPI_LIBCAMERA_DIR" -type f -print0)
+if ! LD_LIBRARY_PATH="$RPI_L" python3 -c "import ctypes, glob; L='$RPI_L'; [ctypes.CDLL(p, mode=ctypes.RTLD_GLOBAL) for p in sorted(glob.glob(L+'/libcamera-base.so.*')) + sorted(glob.glob(L+'/libcamera.so.*')) + [L+'/libcamera/ipa/ipa_rpi_vc4.so']]"; then
+    echo "LDD_FAIL:dlopen_ipa_rpi_vc4"
+fi
+if ! apt-get check >/dev/null 2>&1; then
+    echo "LDD_FAIL:apt_get_check"
 fi
 # 5. Check vermagic of every compiled CardputerZero .ko module
 for ko in /usr/lib/modules/"$KVER"/extra/*.ko; do

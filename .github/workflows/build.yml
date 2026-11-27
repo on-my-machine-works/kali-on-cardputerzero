@@ -133,7 +133,7 @@ jobs:
           sudo -E ./build-kali-cardputerzero.sh fetch rootfs image
           sudo rm -rf work/rootfs
           sudo -E ./build-kali-cardputerzero.sh kernel drivers packages apps launcher boot configs tweaks verify finalize compress
-          sudo chown -R "$(id -u):$(id -g)" output work upstream.lock.json
+          sudo chown -R "$(id -u):$(id -g)" output work cache upstream.lock.json
           ls -lh output/
 
       - name: Update upstream lockfile

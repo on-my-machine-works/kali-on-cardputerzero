@@ -50,6 +50,8 @@ CAMERA_TRANSITIVE_PREFIXES = (
     "libtensorflow-lite",
     "libboost-",
     "libabsl",
+    "libcpuinfo",
+    "libfarmhash",
 )
 
 # Known SHA-256 digests for Raspberry Pi pool packages pruned from Packages.xz when
@@ -347,7 +349,12 @@ def gh_api_json(url: str, token: str):
     return json.loads(http_get(url, headers=headers, retries=3, timeout=30).decode("utf-8"))
 
 
-def validate_deb_file(deb_path: Path, kali_pkgs: dict[str, dict] | None = None) -> tuple[bool, str]:
+def validate_deb_file(
+    deb_path: Path,
+    kali_pkgs: dict[str, dict] | None = None,
+    rpi_pkgs: dict[str, dict] | None = None,
+    allow_rpi_libcamera: bool = False,
+) -> tuple[bool, str]:
     if not deb_path.exists():
         return False, "missing file"
     p = subprocess.run(["dpkg-deb", "-f", str(deb_path), "Package", "Version", "Architecture"],
@@ -359,12 +366,15 @@ def validate_deb_file(deb_path: Path, kali_pkgs: dict[str, dict] | None = None) 
         return False, f"unexpected Architecture '{arch}'"
     if kali_pkgs is not None:
         deps_raw = subprocess.check_output(["dpkg-deb", "-f", str(deb_path), "Depends"], text=True).strip()
+        avail = set(kali_pkgs.keys())
+        if allow_rpi_libcamera and rpi_pkgs is not None:
+            avail |= set(rpi_pkgs.keys())
         for group in deps_raw.split(","):
             alts = [re.split(r"[\s(:]", a.strip())[0].strip() for a in group.split("|") if a.strip()]
-            # Reject M5 candidate .debs that hard-depend on a newer libcamera0.x SONAME than Kali Rolling ships
+            # Reject M5 candidate .debs that hard-depend on a newer libcamera0.x SONAME than available
             if alts and all(re.fullmatch(r"libcamera\d+\.\d+", a) for a in alts):
-                if not any(a in kali_pkgs for a in alts):
-                    return False, f"Depends on {' | '.join(alts)} not yet in Kali Rolling APT"
+                if not any(a in avail for a in alts):
+                    return False, f"Depends on {' | '.join(alts)} not yet in APT"
     return True, "ok"
 
 
@@ -425,7 +435,7 @@ def _ver_matches_abi(version: str, abi: str) -> bool:
 
 
 def resolve_camera_runtime_debs(root_pkg: str, rpi_pkgs: dict[str, dict], deb_pkgs: dict[str, dict]) -> list[dict]:
-    """Transitively resolve isolated RPi libcamera + libpisp + tflite + boost + absl .debs
+    """Transitively resolve isolated RPi libcamera + libpisp + tflite + boost + absl + cpuinfo/farmhash .debs
     without ever mixing ABI series (e.g. libcamera0.7 with libcamera-ipa 0.8.0)."""
     root_abi = _abi_series_of_libcamera_pkg(root_pkg)
     root_stanza = rpi_pkgs.get(root_pkg) or deb_pkgs.get(root_pkg)
@@ -437,7 +447,7 @@ def resolve_camera_runtime_debs(root_pkg: str, rpi_pkgs: dict[str, dict], deb_pk
             "BaseURL": RPI_MIRROR,
             "Filename": f"pool/main/libc/libcamera/libcamera0.7_{fallback_ver}_arm64.deb",
             "SHA256": KNOWN_RPI_LIBCAMERA_POOL_SHA256[("libcamera0.7", fallback_ver)],
-            "Depends": "libpisp1",
+            "Depends": "libpisp1, libcamera-ipa",
         }
 
     root_ver = root_stanza["Version"] if root_stanza else ""
@@ -465,13 +475,14 @@ def resolve_camera_runtime_debs(root_pkg: str, rpi_pkgs: dict[str, dict], deb_pk
                     f"APT index libcamera-ipa ({cand_ver}) skews from {root_pkg} ({root_ver}); "
                     f"pinning matching pool package libcamera-ipa_{root_ver_no_epoch}_arm64.deb"
                 )
+                fallback_ipa_deps = cand_ipa.get("Depends", "") if cand_ipa else "libpisp1, libtensorflow-lite2.20.0"
                 stanza = {
                     "Package": "libcamera-ipa",
                     "Version": root_ver,
                     "BaseURL": RPI_MIRROR,
                     "Filename": f"pool/main/libc/libcamera/libcamera-ipa_{root_ver_no_epoch}_arm64.deb",
                     "SHA256": KNOWN_RPI_LIBCAMERA_POOL_SHA256.get(("libcamera-ipa", root_ver_no_epoch), ""),
-                    "Depends": root_stanza.get("Depends", "") if root_stanza else "",
+                    "Depends": fallback_ipa_deps,
                 }
         else:
             stanza = rpi_pkgs.get(pkg) or deb_pkgs.get(pkg)
@@ -489,6 +500,49 @@ def resolve_camera_runtime_debs(root_pkg: str, rpi_pkgs: dict[str, dict], deb_pk
                 continue
             queue.append(dep_name)
     return list(selected.values())
+
+
+def download_camera_runtime_tree(
+    camera_deb_path: Path | None,
+    cache_dir: Path,
+    rpi_pkgs: dict[str, dict],
+    deb_pkgs: dict[str, dict],
+) -> list[dict]:
+    """Download matching RPi/Debian libcamera runtime .debs and verify real .deb Depends."""
+    root_cam_pkg = detect_camera_libcamera_pkg(camera_deb_path, rpi_pkgs) if camera_deb_path else "libcamera0.8"
+    cam_stanzas = resolve_camera_runtime_debs(root_cam_pkg, rpi_pkgs, deb_pkgs)
+    by_pkg = {st["Package"]: st for st in cam_stanzas}
+    active_cam_files: set[str] = set()
+    cam_dir = cache_dir / "camera"
+    cam_dir.mkdir(parents=True, exist_ok=True)
+
+    idx = 0
+    stanza_list = list(cam_stanzas)
+    while idx < len(stanza_list):
+        st = stanza_list[idx]
+        idx += 1
+        fn = Path(st["Filename"]).name
+        dest = cam_dir / fn
+        active_cam_files.add(fn)
+        download_file(f"{st['BaseURL']}/{st['Filename']}", dest, st.get("SHA256") or None)
+        # Also inspect actual downloaded .deb Depends so pool-pinned packages never miss transitive deps
+        real_deps = subprocess.check_output(["dpkg-deb", "-f", str(dest), "Depends"], text=True).strip()
+        for group in real_deps.split(","):
+            first_alt = group.strip().split("|")[0].strip()
+            dep_name = re.split(r"[\s(:]", first_alt)[0].strip()
+            if not dep_name or not dep_name.startswith(CAMERA_TRANSITIVE_PREFIXES) or dep_name in by_pkg:
+                continue
+            if re.fullmatch(r"libcamera\d+\.\d+", dep_name) and dep_name != root_cam_pkg:
+                continue
+            extra = rpi_pkgs.get(dep_name) or deb_pkgs.get(dep_name)
+            if extra:
+                by_pkg[dep_name] = extra
+                stanza_list.append(extra)
+
+    for f in cam_dir.glob("*.deb"):
+        if f.name not in active_cam_files:
+            f.unlink()
+    return stanza_list
 
 
 def parse_kver_from_debs(debs: list[dict]) -> str:
@@ -713,7 +767,12 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                     try:
                         tmp_cand = cache_dir / "apps" / f".cand_{c_name}"
                         c_sha = download_file(c_url, tmp_cand)
-                        ok_deb, reason = validate_deb_file(tmp_cand, kali_pkgs)
+                        ok_deb, reason = validate_deb_file(
+                            tmp_cand,
+                            kali_pkgs,
+                            rpi_pkgs,
+                            allow_rpi_libcamera=(slug == "camera"),
+                        )
                         if not ok_deb:
                             raise RuntimeError(reason)
                         if slug == "launcher":
@@ -754,16 +813,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     (work_dir / "apps-manifest.txt").write_text("\n".join(manifest_lines) + "\n", encoding="utf-8")
 
     # ── 5. Dynamic RPi/Debian libcamera Runtime Tree Matching CameraApp ─────────
-    root_cam_pkg = detect_camera_libcamera_pkg(camera_deb_path, rpi_pkgs) if camera_deb_path else "libcamera0.7"
-    cam_stanzas = resolve_camera_runtime_debs(root_cam_pkg, rpi_pkgs, deb_pkgs)
-    active_cam_files = set()
-    for st in cam_stanzas:
-        fn = Path(st["Filename"]).name
-        active_cam_files.add(fn)
-        download_file(f"{st['BaseURL']}/{st['Filename']}", cache_dir / "camera" / fn, st.get("SHA256") or None)
-    for f in (cache_dir / "camera").glob("*.deb"):
-        if f.name not in active_cam_files:
-            f.unlink()
+    cam_stanzas = download_camera_runtime_tree(camera_deb_path, cache_dir, rpi_pkgs, deb_pkgs)
 
     # ── 6. Write resolved-env.sh & resolved-lock.json ───────────────────────────
     kver_base = kver.split("+", 1)[0]
@@ -812,6 +862,40 @@ def cmd_record_fallback(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_resolve_camera(args: argparse.Namespace) -> int:
+    lock_path = Path(args.lock_file).resolve()
+    cache_dir = Path(args.cache_dir).resolve()
+    rlock_path = lock_path.parent / "work/resolved-lock.json"
+    if rlock_path.exists() and rlock_path.stat().st_mtime >= lock_path.stat().st_mtime:
+        lock = json.loads(rlock_path.read_text(encoding="utf-8"))
+    else:
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+
+    for sub in ("camera", "apps/active", "apps/locked"):
+        (cache_dir / sub).mkdir(parents=True, exist_ok=True)
+
+    cam_app = next((a for a in lock["apps"] if a["slug"] == "camera"), None)
+    if not cam_app:
+        raise RuntimeError("camera entry missing from upstream.lock.json")
+
+    locked_info = cam_app["locked"]
+    locked_deb = cache_dir / "apps/locked" / locked_info["filename"]
+    download_file(locked_info["url"], locked_deb, locked_info["sha256"])
+
+    camera_deb = cache_dir / "apps/active" / locked_info["filename"]
+    for stale in (cache_dir / "apps/active").glob("*[Cc]amera*_arm64.deb"):
+        if stale.name != locked_info["filename"]:
+            stale.unlink(missing_ok=True)
+    if not camera_deb.exists() or sha256_file(camera_deb) != locked_info["sha256"].lower():
+        shutil.copy2(locked_deb, camera_deb)
+
+    rpi_pkgs = load_apt_index(RPI_MIRROR, "trixie", ["main"], "arm64", cache_dir)
+    deb_pkgs = load_apt_index(DEBIAN_MIRROR, "trixie", ["main"], "arm64", cache_dir)
+    cam_stanzas = download_camera_runtime_tree(camera_deb, cache_dir, rpi_pkgs, deb_pkgs)
+    ok(f"Camera app ({camera_deb.name}) & isolated RPi libcamera runtime ready ({len(cam_stanzas)} debs)")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -822,6 +906,10 @@ def main() -> int:
     p_res.add_argument("--work-dir", required=True)
     p_res.add_argument("--mode", choices=("auto", "locked"), default="auto")
 
+    p_cam = sub.add_parser("resolve-camera")
+    p_cam.add_argument("--lock-file", required=True)
+    p_cam.add_argument("--cache-dir", required=True)
+
     p_fb = sub.add_parser("record-fallback")
     p_fb.add_argument("--lock-file", required=True)
     p_fb.add_argument("--work-dir", required=True)
@@ -831,6 +919,8 @@ def main() -> int:
     ns = ap.parse_args()
     if ns.cmd == "resolve":
         return cmd_resolve(ns)
+    if ns.cmd == "resolve-camera":
+        return cmd_resolve_camera(ns)
     return cmd_record_fallback(ns)
 
 

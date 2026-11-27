@@ -60,6 +60,25 @@ if (( need_build )); then
     PREBUILT_SHELL_DIR="$PREBUILT_DIR" "$REPO_ROOT/scripts/build-cz-shell.sh"
 fi
 
+CAM_CACHE_DIR="$REPO_ROOT/cache/camera"
+WANT_CAM_DEB="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(next(a["locked"]["filename"] for a in d["apps"] if a["slug"]=="camera"))' "$REPO_ROOT/upstream.lock.json")"
+if [[ -f "$REPO_ROOT/work/resolved-lock.json" && "$REPO_ROOT/work/resolved-lock.json" -nt "$REPO_ROOT/upstream.lock.json" ]]; then
+    WANT_CAM_DEB="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(next(a["locked"]["filename"] for a in d["apps"] if a["slug"]=="camera"))' "$REPO_ROOT/work/resolved-lock.json")"
+fi
+need_cam_resolve=0
+for req_glob in "libcamera0.*" "libcamera-ipa_*" "libpisp1_*" "libtensorflow-lite*" "libabsl*" "libcpuinfo*" "libfarmhash*"; do
+    compgen -G "$CAM_CACHE_DIR/$req_glob.deb" >/dev/null || need_cam_resolve=1
+done
+[[ -f "$REPO_ROOT/cache/apps/active/$WANT_CAM_DEB" || -f "$REPO_ROOT/cache/apps/locked/$WANT_CAM_DEB" ]] || need_cam_resolve=1
+if (( need_cam_resolve )); then
+    python3 "$REPO_ROOT/scripts/resolve-upstream.py" resolve-camera \
+        --lock-file "$REPO_ROOT/upstream.lock.json" \
+        --cache-dir "$REPO_ROOT/cache"
+fi
+CAMERA_APP_DEB="$REPO_ROOT/cache/apps/active/$WANT_CAM_DEB"
+[[ -f "$CAMERA_APP_DEB" ]] || CAMERA_APP_DEB="$REPO_ROOT/cache/apps/locked/$WANT_CAM_DEB"
+[[ -f "$CAMERA_APP_DEB" ]] || { echo "ERROR: Camera app .deb ($WANT_CAM_DEB) missing in cache/apps" >&2; exit 1; }
+
 HOST_ARCH="$(uname -m)"
 CC_ARM="gcc"
 STRIP_ARM="strip"
@@ -136,6 +155,64 @@ ln -sfn czctl "$PAYLOAD/usr/share/flipctl"
 install -m 755 "$REPO_ROOT/scripts/configure-kali-launcher.py" "$PAYLOAD/usr/share/czctl/ota-tools/configure-kali-launcher.py"
 install -m 755 "$REPO_ROOT/scripts/gen-kali-splash.py" "$PAYLOAD/usr/share/czctl/ota-tools/gen-kali-splash.py"
 
+# Stage isolated Raspberry Pi libcamera runtime (/opt/rpi-libcamera) + M5 CameraApp 1.0.4+
+mkdir -p "$PAYLOAD/opt/rpi-libcamera"
+for cdeb in "$CAM_CACHE_DIR/"*.deb; do
+    [[ -f "$cdeb" ]] && dpkg-deb -x "$cdeb" "$PAYLOAD/opt/rpi-libcamera"
+done
+rm -rf "$PAYLOAD/opt/rpi-libcamera/usr/share/doc" "$PAYLOAD/opt/rpi-libcamera/usr/share/lintian"
+
+CAM_UNPACK="$STAGE_TMP/cam-app-unpack"
+mkdir -p "$CAM_UNPACK"
+dpkg-deb -x "$CAMERA_APP_DEB" "$CAM_UNPACK"
+dpkg-deb -e "$CAMERA_APP_DEB" "$CAM_UNPACK/DEBIAN"
+install -m 755 "$CAM_UNPACK/usr/bin/camera_app" "$PAYLOAD/usr/lib/cz-kali/camera_app.real"
+for sdir in CameraApp camera_app APPLaunch; do
+    if [[ -d "$CAM_UNPACK/usr/share/$sdir" ]]; then
+        mkdir -p "$PAYLOAD/usr/share/$sdir"
+        cp -a "$CAM_UNPACK/usr/share/$sdir/." "$PAYLOAD/usr/share/$sdir/"
+    fi
+done
+# Repack uncompressed (-Znone) so outer solid xz -6 deduplicates camera_app.real + assets to ~0 extra bytes
+dpkg-deb --root-owner-group -Znone --build "$CAM_UNPACK" "$PAYLOAD/usr/share/czctl/ota-tools/camera-app.deb" >/dev/null
+
+SONAME_VER="$(basename "$(ls "$PAYLOAD/opt/rpi-libcamera/usr/lib/aarch64-linux-gnu/libcamera.so."0.*.* 2>/dev/null | sort -V | tail -n1)" 2>/dev/null | sed 's/^libcamera\.so\.//')"
+SONAME_VER="${SONAME_VER:-0.8.0}"
+ABI_XY="$(printf '%s' "$SONAME_VER" | cut -d. -f1-2)"
+SHIM_STAGE="$STAGE_TMP/cz-rpi-libcamera-shim"
+mkdir -p "$SHIM_STAGE/DEBIAN" "$SHIM_STAGE/usr/share/doc/cz-rpi-libcamera"
+cat > "$SHIM_STAGE/DEBIAN/control" <<SHIMEOF
+Package: cz-rpi-libcamera
+Version: ${SONAME_VER}-2
+Section: libs
+Priority: optional
+Architecture: arm64
+Maintainer: Kali Cyberdeck Edition <noreply@kali.org>
+Depends: libc6, libdw1t64, libgcc-s1, libgnutls30t64, liblttng-ust1t64, libstdc++6, libudev1, libyaml-0-2
+Provides: libcamera${ABI_XY} (= ${SONAME_VER}), libcamera0.8 (= 0.8.0), libcamera0.7 (= 0.7.2), libcamera-ipa (= ${SONAME_VER})
+Description: Isolated Raspberry Pi libcamera runtime virtual provider
+ Satisfies M5 CameraApp libcamera0.x dpkg dependencies via /opt/rpi-libcamera
+ without conflicting with Kali Rolling system Boost, Abseil, or libcamera packages.
+SHIMEOF
+printf 'Isolated Raspberry Pi libcamera runtime (/opt/rpi-libcamera).\n' > "$SHIM_STAGE/usr/share/doc/cz-rpi-libcamera/README"
+dpkg-deb --root-owner-group -Zxz --build "$SHIM_STAGE" "$PAYLOAD/usr/share/czctl/ota-tools/cz-rpi-libcamera.deb" >/dev/null
+
+cat > "$PAYLOAD/usr/bin/camera_app" <<'CAMWRAP'
+#!/bin/sh
+R=/opt/rpi-libcamera
+L=$R/usr/lib/aarch64-linux-gnu
+export LD_LIBRARY_PATH="$L${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LIBCAMERA_IPA_MODULE_PATH="$L/libcamera/ipa"
+export LIBCAMERA_IPA_PROXY_PATH="$R/usr/libexec/aarch64-linux-gnu/libcamera"
+export LIBCAMERA_IPA_CONFIG_PATH="$R/usr/share/libcamera/ipa"
+export LIBCAMERA_RPI_CONFIG_FILE="${LIBCAMERA_RPI_CONFIG_FILE:-$R/usr/share/libcamera/pipeline/rpi/vc4/rpi_apps.yaml}"
+export CAMERA_APP_FB_DEVICE="${CAMERA_APP_FB_DEVICE:-/dev/fb_lcd}"
+export LV_LINUX_FBDEV_DEVICE="${LV_LINUX_FBDEV_DEVICE:-/dev/fb_lcd}"
+export CAMERA_APP_KEYBOARD_GRAB="${CAMERA_APP_KEYBOARD_GRAB:-0}"
+exec /usr/lib/cz-kali/camera_app.real "$@"
+CAMWRAP
+chmod 755 "$PAYLOAD/usr/bin/camera_app"
+
 cat > "$PAYLOAD/usr/share/czctl/ota-tools/postinstall.sh" <<'POSTEOF'
 #!/usr/bin/env bash
 # Idempotent post-OTA migration hook shipped inside each signed OTA bundle so
@@ -143,7 +220,7 @@ cat > "$PAYLOAD/usr/share/czctl/ota-tools/postinstall.sh" <<'POSTEOF'
 # tweaks even when started by an older on-device cz-ota script.
 set -euo pipefail
 
-install -d -m 755 /etc/default /etc/systemd/system/multi-user.target.wants /etc/modules-load.d
+install -d -m 755 /etc/default /etc/systemd/system/multi-user.target.wants /etc/modules-load.d /usr/lib/cz-kali
 if [[ ! -f /etc/default/cz-stealth ]]; then
     cat > /etc/default/cz-stealth <<'EOF'
 # CardputerZero Hostile-Network Stealth Mode: on | off
@@ -168,6 +245,42 @@ if ! grep -qx 'uinput' /etc/modules-load.d/cardputerzero.conf 2>/dev/null; then
     echo "uinput" >> /etc/modules-load.d/cardputerzero.conf
 fi
 modprobe uinput 2>/dev/null || true
+
+# Sync dpkg metadata for isolated /opt/rpi-libcamera provider & M5 CameraApp upgrade
+if [[ -f /usr/share/czctl/ota-tools/cz-rpi-libcamera.deb ]]; then
+    want_shim_ver="$(dpkg-deb -f /usr/share/czctl/ota-tools/cz-rpi-libcamera.deb Version 2>/dev/null || true)"
+    cur_shim_ver="$(dpkg-query -W -f='${Version}' cz-rpi-libcamera 2>/dev/null || true)"
+    if [[ -n "$want_shim_ver" && "$cur_shim_ver" != "$want_shim_ver" ]]; then
+        DEBIAN_FRONTEND=noninteractive dpkg -i /usr/share/czctl/ota-tools/cz-rpi-libcamera.deb >/dev/null 2>&1 || true
+    fi
+fi
+if [[ -f /usr/share/czctl/ota-tools/camera-app.deb ]]; then
+    if ! dpkg-divert --list /usr/bin/camera_app 2>/dev/null | grep -q '/usr/bin/camera_app'; then
+        dpkg-divert --local --rename --divert /usr/lib/cz-kali/camera_app.real --add /usr/bin/camera_app >/dev/null 2>&1 || true
+    fi
+    want_cam_ver="$(dpkg-deb -f /usr/share/czctl/ota-tools/camera-app.deb Version 2>/dev/null || true)"
+    cur_cam_ver="$(dpkg-query -W -f='${Version}' camera 2>/dev/null || true)"
+    if [[ -n "$want_cam_ver" && "$cur_cam_ver" != "$want_cam_ver" ]]; then
+        DEBIAN_FRONTEND=noninteractive dpkg -i --force-overwrite /usr/share/czctl/ota-tools/camera-app.deb >/dev/null 2>&1 || true
+    fi
+    if ! head -c 2 /usr/bin/camera_app 2>/dev/null | grep -q '^#!'; then
+        cat > /usr/bin/camera_app <<'WRAPEOF'
+#!/bin/sh
+R=/opt/rpi-libcamera
+L=$R/usr/lib/aarch64-linux-gnu
+export LD_LIBRARY_PATH="$L${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LIBCAMERA_IPA_MODULE_PATH="$L/libcamera/ipa"
+export LIBCAMERA_IPA_PROXY_PATH="$R/usr/libexec/aarch64-linux-gnu/libcamera"
+export LIBCAMERA_IPA_CONFIG_PATH="$R/usr/share/libcamera/ipa"
+export LIBCAMERA_RPI_CONFIG_FILE="${LIBCAMERA_RPI_CONFIG_FILE:-$R/usr/share/libcamera/pipeline/rpi/vc4/rpi_apps.yaml}"
+export CAMERA_APP_FB_DEVICE="${CAMERA_APP_FB_DEVICE:-/dev/fb_lcd}"
+export LV_LINUX_FBDEV_DEVICE="${LV_LINUX_FBDEV_DEVICE:-/dev/fb_lcd}"
+export CAMERA_APP_KEYBOARD_GRAB="${CAMERA_APP_KEYBOARD_GRAB:-0}"
+exec /usr/lib/cz-kali/camera_app.real "$@"
+WRAPEOF
+        chmod 755 /usr/bin/camera_app
+    fi
+fi
 
 ln -sfn /etc/systemd/system/czctl.service /etc/systemd/system/flipctl.service
 [[ -f /etc/systemd/system/cz-stealth.service ]] && \

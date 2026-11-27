@@ -106,10 +106,10 @@
       ],
       "asset_regex": "^(CameraApp|Camera)_[^/]+_m5stack1_arm64\\.deb$",
       "locked": {
-        "tag": "v1.0.3",
-        "filename": "Camera_1.0.3_m5stack1_arm64.deb",
-        "url": "https://github.com/CardputerZero/Camera/releases/download/v1.0.3/Camera_1.0.3_m5stack1_arm64.deb",
-        "sha256": "1f0f0394d3d850762db840ae4c0f3fc242c55b1eb8c8367fba0f8daa39f94330"
+        "tag": "v1.0.4",
+        "filename": "Camera_1.0.4_m5stack1_arm64.deb",
+        "url": "https://github.com/CardputerZero/Camera/releases/download/v1.0.4/Camera_1.0.4_m5stack1_arm64.deb",
+        "sha256": "9fab11fb9a01a481e301bbe4213ef59bcd53386047ef9208683b1d57cab6b280"
       }
     },
     {

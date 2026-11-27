@@ -21,12 +21,6 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PREBUILT_DIR="${PREBUILT_SHELL_DIR:-$REPO_ROOT/work/prebuilt-shell}"
 CAM_CACHE_DIR="$REPO_ROOT/cache/camera"
 
-LIBCAM07_DEB="libcamera0.7_0.7.2+rpt20261009-1_arm64.deb"
-LIBCAM07_SHA="371424b861f0a6611babab81561c66e7c8cb8160798fe31a2f011826673ff549"
-LIBCAM_IPA07_DEB="libcamera-ipa_0.7.2+rpt20261009-1_arm64.deb"
-LIBCAM_IPA07_SHA="0ee197e03669f755dc437d5a1784b10eb12369fad299f5ef87dbc1bbc43a386f"
-RPI_LIBCAM_POOL="https://archive.raspberrypi.com/debian/pool/main/libc/libcamera"
-
 TARGET=""
 REBUILD=0
 SKIP_APT=0
@@ -66,21 +60,12 @@ if [[ "$need_build" -eq 1 ]]; then
     PREBUILT_SHELL_DIR="$PREBUILT_DIR" "$REPO_ROOT/scripts/build-cz-shell.sh"
 fi
 
-# Ensure SHA256-verified RPi libcamera 0.7.2 runtime packages are cached locally for live camera repair
-mkdir -p "$CAM_CACHE_DIR"
-for pair in "$LIBCAM07_DEB:$LIBCAM07_SHA" "$LIBCAM_IPA07_DEB:$LIBCAM_IPA07_SHA"; do
-    deb="${pair%%:*}"
-    want_sha="${pair##*:}"
-    if [[ ! -f "$CAM_CACHE_DIR/$deb" ]] || [[ "$(sha256sum "$CAM_CACHE_DIR/$deb" | awk '{print $1}')" != "$want_sha" ]]; then
-        curl -fsSL --retry 3 -o "$CAM_CACHE_DIR/$deb" "$RPI_LIBCAM_POOL/$deb"
-    fi
-    actual_sha="$(sha256sum "$CAM_CACHE_DIR/$deb" | awk '{print $1}')"
-    if [[ "$actual_sha" != "$want_sha" ]]; then
-        echo "ERROR: SHA256 mismatch for $CAM_CACHE_DIR/$deb ($actual_sha != $want_sha)" >&2
-        rm -f "$CAM_CACHE_DIR/$deb"
-        exit 1
-    fi
-done
+# Ensure SHA256-verified M5 CameraApp 1.0.4+ & full transitive RPi libcamera runtime debs are cached locally
+python3 "$REPO_ROOT/scripts/resolve-upstream.py" resolve-camera \
+    --lock-file "$REPO_ROOT/upstream.lock.json" \
+    --cache-dir "$REPO_ROOT/cache"
+CAMERA_APP_DEB="$(ls "$REPO_ROOT/cache/apps/active/"*[Cc]amera*_arm64.deb "$REPO_ROOT/cache/apps/locked/"*[Cc]amera*_arm64.deb 2>/dev/null | head -n1)"
+[[ -n "$CAMERA_APP_DEB" && -f "$CAMERA_APP_DEB" ]] || { echo "ERROR: Camera app .deb missing in cache/apps" >&2; exit 1; }
 
 TMP_BUNDLE="$(mktemp -d)"
 trap 'rm -rf "$TMP_BUNDLE"' EXIT
@@ -161,7 +146,39 @@ cp -a "$REPO_ROOT/overlays/btrfs-tools/hooks/"* "$TMP_BUNDLE/etc/kernel/install.
 cp -a "$REPO_ROOT/overlays/btrfs-tools/systemd/"* "$TMP_BUNDLE/usr/lib/systemd/system/"
 cp -a "$REPO_ROOT/overlays/btrfs-tools/apt/80-flipper-apt-backup" "$TMP_BUNDLE/etc/apt/apt.conf.d/80-flipper-apt-backup"
 
-cp -a "$CAM_CACHE_DIR/$LIBCAM07_DEB" "$CAM_CACHE_DIR/$LIBCAM_IPA07_DEB" "$TMP_BUNDLE/camera-debs/"
+mkdir -p "$TMP_BUNDLE/camera-debs/runtime"
+cp -a "$CAM_CACHE_DIR/"*.deb "$TMP_BUNDLE/camera-debs/runtime/"
+cp -a "$CAMERA_APP_DEB" "$TMP_BUNDLE/camera-debs/camera-app.deb"
+
+SHIM_UNPACK="$TMP_BUNDLE/cam-rt-probe"
+mkdir -p "$SHIM_UNPACK"
+for rdeb in "$CAM_CACHE_DIR/libcamera0."*.deb; do
+    [[ -f "$rdeb" ]] && dpkg-deb -x "$rdeb" "$SHIM_UNPACK"
+done
+SONAME_VER="$(basename "$(ls "$SHIM_UNPACK/usr/lib/aarch64-linux-gnu/libcamera.so."0.*.* 2>/dev/null | sort -V | tail -n1)" 2>/dev/null | sed 's/^libcamera\.so\.//')"
+SONAME_VER="${SONAME_VER:-0.8.0}"
+ABI_XY="$(printf '%s' "$SONAME_VER" | cut -d. -f1-2)"
+rm -rf "$SHIM_UNPACK"
+
+SHIM_STAGE="$TMP_BUNDLE/cz-rpi-libcamera-shim"
+mkdir -p "$SHIM_STAGE/DEBIAN" "$SHIM_STAGE/usr/share/doc/cz-rpi-libcamera"
+cat > "$SHIM_STAGE/DEBIAN/control" <<SHIMEOF
+Package: cz-rpi-libcamera
+Version: ${SONAME_VER}-2
+Section: libs
+Priority: optional
+Architecture: arm64
+Maintainer: Kali Cyberdeck Edition <noreply@kali.org>
+Depends: libc6, libdw1t64, libgcc-s1, libgnutls30t64, liblttng-ust1t64, libstdc++6, libudev1, libyaml-0-2
+Provides: libcamera${ABI_XY} (= ${SONAME_VER}), libcamera0.8 (= 0.8.0), libcamera0.7 (= 0.7.2), libcamera-ipa (= ${SONAME_VER})
+Description: Isolated Raspberry Pi libcamera runtime virtual provider
+ Satisfies M5 CameraApp libcamera0.x dpkg dependencies via /opt/rpi-libcamera
+ without conflicting with Kali Rolling system Boost, Abseil, or libcamera packages.
+SHIMEOF
+printf 'Isolated Raspberry Pi libcamera runtime (/opt/rpi-libcamera).\n' > "$SHIM_STAGE/usr/share/doc/cz-rpi-libcamera/README"
+dpkg-deb --root-owner-group -Zxz --build "$SHIM_STAGE" "$TMP_BUNDLE/camera-debs/cz-rpi-libcamera.deb" >/dev/null
+rm -rf "$SHIM_STAGE"
+
 cat > "$TMP_BUNDLE/camera-debs/camera_app.wrapper" <<'CAMWRAP'
 #!/bin/sh
 R=/opt/rpi-libcamera
@@ -401,13 +418,26 @@ EOF
         --lock-png /usr/share/APPLaunch/share/images/lockscreen.png
 fi
 
-# 7. Repair /opt/rpi-libcamera 0.7.2 SONAME alignment & /usr/bin/camera_app wrapper
-if [[ -x /usr/lib/cz-kali/camera_app.real && -d /opt/rpi-libcamera && -d camera-debs ]]; then
-    rm -f /opt/rpi-libcamera/usr/lib/aarch64-linux-gnu/libcamera*.so.0.8*
-    for d in camera-debs/*.deb; do
+# 7. Install isolated /opt/rpi-libcamera 0.8 runtime, cz-rpi-libcamera shim, CameraApp 1.0.4+ & wrapper
+if [[ -d camera-debs/runtime ]]; then
+    rm -rf /opt/rpi-libcamera
+    mkdir -p /opt/rpi-libcamera /usr/lib/cz-kali
+    for d in camera-debs/runtime/*.deb; do
         [[ -f "\$d" ]] && dpkg-deb -x "\$d" /opt/rpi-libcamera
     done
     rm -rf /opt/rpi-libcamera/usr/share/doc /opt/rpi-libcamera/usr/share/lintian
+    if [[ -f camera-debs/cz-rpi-libcamera.deb ]]; then
+        DEBIAN_FRONTEND=noninteractive dpkg -i camera-debs/cz-rpi-libcamera.deb >/dev/null
+    fi
+    if ! dpkg-divert --list /usr/bin/camera_app 2>/dev/null | grep -q '/usr/bin/camera_app'; then
+        if [[ -f /usr/bin/camera_app && -f /usr/lib/cz-kali/camera_app.real ]]; then
+            rm -f /usr/bin/camera_app
+        fi
+        dpkg-divert --local --rename --divert /usr/lib/cz-kali/camera_app.real --add /usr/bin/camera_app
+    fi
+    if [[ -f camera-debs/camera-app.deb ]]; then
+        DEBIAN_FRONTEND=noninteractive dpkg -i --force-overwrite camera-debs/camera-app.deb >/dev/null
+    fi
     install -m 755 camera-debs/camera_app.wrapper /usr/bin/camera_app
 fi
 
