@@ -1,0 +1,10 @@
+[Unit]
+Description=Ensure a primary LCD shell (czctl or APPLaunch) is active on CardputerZero
+After=systemd-udev-settle.service systemd-logind.service czctl.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cz-ui-mode ensure
+
+[Install]
+WantedBy=multi-user.target

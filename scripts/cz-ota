@@ -409,6 +409,8 @@ PY
     install -d -m 755 /etc/systemd/system/multi-user.target.wants
     [[ -f /etc/systemd/system/cz-stealth.service ]] && \
         ln -sfn /etc/systemd/system/cz-stealth.service /etc/systemd/system/multi-user.target.wants/cz-stealth.service
+    [[ -f /etc/systemd/system/cz-ui-ensure.service ]] && \
+        ln -sfn /etc/systemd/system/cz-ui-ensure.service /etc/systemd/system/multi-user.target.wants/cz-ui-ensure.service
 
     udevadm control --reload-rules 2>/dev/null || true
     systemctl daemon-reload
@@ -434,6 +436,8 @@ PY
             touch /run/cz-ota-commit.done
             exit 1
         fi
+    elif [[ "${CZ_OTA_NO_RESTART:-0}" != "1" ]] && [[ -x /usr/local/bin/cz-ui-mode ]]; then
+        /usr/local/bin/cz-ui-mode ensure >/dev/null 2>&1 || true
     fi
 
     echo "ok" > /run/cz-ota-commit.status

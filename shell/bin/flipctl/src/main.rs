@@ -9367,9 +9367,13 @@ fn panel(
                         }
                         demo::Act::SwitchApplaunch => {
                             eprintln!("action         switching primary UI to M5 APPLaunch");
-                            let _ = std::process::Command::new("sudo")
-                                .args(["-n", "/usr/local/bin/cz-ui-mode", "applaunch"])
-                                .spawn();
+                            let _ = std::thread::Builder::new()
+                                .name("cz-ui-switch".into())
+                                .spawn(|| {
+                                    let _ = std::process::Command::new("sudo")
+                                        .args(["-n", "/usr/local/bin/cz-ui-mode", "applaunch"])
+                                        .status();
+                                });
                         }
                         demo::Act::Nothing
                         | demo::Act::Airplane

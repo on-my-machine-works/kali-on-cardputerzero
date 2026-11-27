@@ -2,22 +2,131 @@
 # cz-ui-mode - Switch M5Stack CardputerZero primary 320x170 LCD shell between:
 #   czctl     - Kali Cyberdeck Shell (default; alias: flipctl)
 #   applaunch - Official M5Stack APPLaunch carousel (includes Kali Deck card)
+#   ensure    - Boot self-heal: restore czctl if neither primary LCD UI is enabled
 #   status    - Show active LCD owner, Stealth Mode, and :8899 Web KVM state
 
 set -euo pipefail
 
 require_root() {
     if [[ $EUID -ne 0 ]]; then
-        exec sudo "$0" "$@"
+        exec sudo -n "$0" "$@" 2>/dev/null || exec sudo "$0" "$@"
     fi
 }
 
-user_systemctl() {
-    if id kali >/dev/null 2>&1; then
-        local uid
-        uid="$(id -u kali)"
-        runuser -u kali -- env XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user "$@" 2>/dev/null || true
+# Escape czctl.service / flipctl.service / APPLaunch.service cgroups before stopping
+# any UI service so systemd's control-group SIGTERM never kills this switcher mid-flight.
+detach_from_ui_cgroup() {
+    [[ "${CZ_UI_DETACHED:-0}" == "1" ]] && return 0
+    local cg=""
+    [[ -r /proc/$$/cgroup ]] && cg="$(cat /proc/$$/cgroup 2>/dev/null || true)"
+    if [[ "$cg" =~ (czctl|flipctl|APPLaunch)\.service ]]; then
+        if systemctl is-active --quiet cz-ui-mode-switch.service 2>/dev/null; then
+            exit 0
+        fi
+        systemctl reset-failed cz-ui-mode-switch.service 2>/dev/null || true
+        exec systemd-run --quiet --collect --no-block \
+            --unit=cz-ui-mode-switch \
+            --property=KillMode=process \
+            /usr/bin/env CZ_UI_DETACHED=1 /usr/local/bin/cz-ui-mode "$@"
     fi
+}
+
+ensure_kali_user_manager() {
+    if ! id kali >/dev/null 2>&1; then
+        return 1
+    fi
+    local uid
+    uid="$(id -u kali)"
+    install -d -m 755 /var/lib/systemd/linger
+    : > /var/lib/systemd/linger/kali
+    systemctl start "user@${uid}.service" 2>/dev/null || true
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        [[ -S "/run/user/${uid}/bus" ]] && return 0
+        sleep 0.2
+    done
+    return 0
+}
+
+user_systemctl() {
+    if ! id kali >/dev/null 2>&1; then
+        return 1
+    fi
+    local uid
+    uid="$(id -u kali)"
+    if [[ $EUID -eq "$uid" ]]; then
+        env \
+            HOME=/home/kali \
+            XDG_RUNTIME_DIR="/run/user/$uid" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+            systemctl --user "$@"
+    else
+        runuser -u kali -- env \
+            HOME=/home/kali \
+            XDG_RUNTIME_DIR="/run/user/$uid" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+            systemctl --user "$@"
+    fi
+}
+
+wake_lcd_backlight() {
+    local bl="/sys/class/backlight/backlight"
+    if [[ -d "$bl" ]]; then
+        [[ -w "$bl/bl_power" ]] && echo 0 > "$bl/bl_power" 2>/dev/null || true
+        if [[ -r "$bl/brightness" && -w "$bl/brightness" ]]; then
+            local cur
+            cur="$(tr -d '[:space:]' < "$bl/brightness" 2>/dev/null || echo 60)"
+            if [[ "$cur" == "0" ]]; then
+                echo 60 > "$bl/brightness" 2>/dev/null || true
+            fi
+        fi
+    fi
+}
+
+enable_czctl_links() {
+    install -d -m 755 /etc/systemd/system/multi-user.target.wants \
+                      /etc/systemd/system/graphical.target.wants
+    if [[ -f /etc/systemd/system/flipctl.service && ! -L /etc/systemd/system/flipctl.service ]]; then
+        systemctl disable --now flipctl.service 2>/dev/null || true
+        rm -f /etc/systemd/system/flipctl.service
+    fi
+    ln -sfn /etc/systemd/system/czctl.service /etc/systemd/system/flipctl.service
+    ln -sfn /etc/systemd/system/czctl.service /etc/systemd/system/multi-user.target.wants/czctl.service
+    ln -sfn /etc/systemd/system/czctl.service /etc/systemd/system/graphical.target.wants/czctl.service
+}
+
+disable_czctl_links() {
+    rm -f /etc/systemd/system/flipctl.service \
+          /etc/systemd/system/multi-user.target.wants/czctl.service \
+          /etc/systemd/system/graphical.target.wants/czctl.service \
+          /etc/systemd/system/multi-user.target.wants/flipctl.service \
+          /etc/systemd/system/graphical.target.wants/flipctl.service
+}
+
+enable_applaunch_links() {
+    install -d -m 755 -o kali -g kali \
+        /home/kali/.config \
+        /home/kali/.config/systemd \
+        /home/kali/.config/systemd/user \
+        /home/kali/.config/systemd/user/default.target.wants
+    ln -sfn /usr/lib/systemd/user/APPLaunch.service \
+        /home/kali/.config/systemd/user/default.target.wants/APPLaunch.service
+    chown -h kali:kali /home/kali/.config/systemd/user/default.target.wants/APPLaunch.service
+}
+
+disable_applaunch_links() {
+    rm -f /home/kali/.config/systemd/user/default.target.wants/APPLaunch.service \
+          /etc/systemd/user/default.target.wants/APPLaunch.service
+}
+
+czctl_is_enabled() {
+    [[ -L /etc/systemd/system/multi-user.target.wants/czctl.service ]] || \
+    [[ -L /etc/systemd/system/graphical.target.wants/czctl.service ]]
+}
+
+applaunch_is_enabled() {
+    [[ -L /home/kali/.config/systemd/user/default.target.wants/APPLaunch.service ]] || \
+    [[ -L /etc/systemd/user/default.target.wants/APPLaunch.service ]]
 }
 
 web_kvm_summary() {
@@ -48,49 +157,128 @@ web_kvm_summary() {
     esac
 }
 
+switch_to_czctl() {
+    # Fast path when APPLaunch was opened temporarily as a foreground child of czctl
+    if systemctl is-active --quiet czctl.service 2>/dev/null && \
+       ! (user_systemctl is-active --quiet APPLaunch.service 2>/dev/null) && \
+       pgrep -f '^/usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch' >/dev/null 2>&1; then
+        enable_czctl_links
+        disable_applaunch_links
+        systemctl daemon-reload 2>/dev/null || true
+        user_systemctl daemon-reload 2>/dev/null || true
+        pkill -f '^/usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch' 2>/dev/null || true
+        wake_lcd_backlight
+        echo "Returned foreground LCD control to: czctl"
+        return 0
+    fi
+
+    # 1. Persist czctl boot symlinks FIRST so power loss never leaves both UIs disabled
+    enable_czctl_links
+    systemctl daemon-reload
+
+    # 2. Disable & stop APPLaunch + boot splash so /dev/fb_lcd and SPI0 DRM are free
+    systemctl stop fb_load.service 2>/dev/null || true
+    disable_applaunch_links
+    user_systemctl daemon-reload 2>/dev/null || true
+    user_systemctl stop APPLaunch.service 2>/dev/null || true
+    pkill -f '^/usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch' 2>/dev/null || true
+
+    # 3. Start czctl and verify it acquires the panel
+    systemctl reset-failed czctl.service 2>/dev/null || true
+    systemctl start czctl.service
+    wake_lcd_backlight
+    echo "Primary LCD UI set to: czctl (Kali Cyberdeck Shell; Web KVM: $(web_kvm_summary))"
+}
+
+switch_to_applaunch() {
+    if [[ ! -f /usr/lib/systemd/user/APPLaunch.service || ! -x /usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch ]] || ! id kali >/dev/null 2>&1; then
+        echo "ERROR: M5 APPLaunch is not installed; keeping czctl.service active" >&2
+        exit 1
+    fi
+
+    # 1. Ensure kali user manager + boot linger are active before touching czctl
+    ensure_kali_user_manager
+
+    # 2. Persist APPLaunch boot symlink FIRST so at least one UI is always enabled on disk
+    enable_applaunch_links
+    user_systemctl daemon-reload 2>/dev/null || true
+
+    # 3. Disable & stop czctl + boot splash to release SPI0 DRM master
+    systemctl stop fb_load.service 2>/dev/null || true
+    disable_czctl_links
+    systemctl daemon-reload
+    systemctl stop czctl.service 2>/dev/null || true
+
+    # 4. Start APPLaunch and verify it stays up; auto-rollback to czctl on failure
+    wake_lcd_backlight
+    user_systemctl reset-failed APPLaunch.service 2>/dev/null || true
+    if ! user_systemctl restart APPLaunch.service 2>/dev/null; then
+        user_systemctl start APPLaunch.service 2>/dev/null || true
+    fi
+
+    local ok=0 i
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        if user_systemctl is-active --quiet APPLaunch.service 2>/dev/null && \
+           pgrep -f '^/usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch' >/dev/null 2>&1; then
+            ok=1
+            break
+        fi
+        sleep 0.3
+    done
+
+    if (( ! ok )); then
+        echo "ERROR: APPLaunch.service failed to start; rolling back to czctl.service" >&2
+        user_systemctl stop APPLaunch.service 2>/dev/null || true
+        disable_applaunch_links
+        user_systemctl daemon-reload 2>/dev/null || true
+        enable_czctl_links
+        systemctl daemon-reload
+        systemctl reset-failed czctl.service 2>/dev/null || true
+        systemctl start czctl.service
+        wake_lcd_backlight
+        exit 1
+    fi
+
+    echo "Primary LCD UI set to: M5 APPLaunch"
+}
+
 cmd="${1:-status}"
 case "$cmd" in
     czctl|flipctl)
         require_root "$@"
-        systemctl stop fb_load.service 2>/dev/null || true
-        user_systemctl stop APPLaunch.service
-        user_systemctl disable APPLaunch.service
-        rm -f /home/kali/.config/systemd/user/default.target.wants/APPLaunch.service
-        if systemctl is-active --quiet czctl.service 2>/dev/null && pgrep -f M5CardputerZero-APPLaunch >/dev/null 2>&1; then
-            # If APPLaunch was launched as a foreground child from czctl, exiting it returns cleanly to czctl
-            pkill -f M5CardputerZero-APPLaunch 2>/dev/null || true
-        else
-            pkill -f M5CardputerZero-APPLaunch 2>/dev/null || true
-            if [[ -f /etc/systemd/system/flipctl.service && ! -L /etc/systemd/system/flipctl.service ]]; then
-                systemctl disable --now flipctl.service 2>/dev/null || true
-                rm -f /etc/systemd/system/flipctl.service
-            fi
-            ln -sfn /etc/systemd/system/czctl.service /etc/systemd/system/flipctl.service
-            systemctl daemon-reload
-            systemctl enable --now czctl.service
-        fi
-        echo "Primary LCD UI set to: czctl (Kali Cyberdeck Shell; Web KVM: $(web_kvm_summary))"
+        detach_from_ui_cgroup "$@"
+        switch_to_czctl
         ;;
     applaunch)
         require_root "$@"
-        systemctl disable --now czctl.service 2>/dev/null || true
-        systemctl disable --now flipctl.service 2>/dev/null || true
-        if [[ -f /usr/lib/systemd/user/APPLaunch.service ]] && id kali >/dev/null 2>&1; then
-            install -d -m 755 -o kali -g kali /home/kali/.config/systemd/user/default.target.wants
-            ln -sfn /usr/lib/systemd/user/APPLaunch.service \
-                /home/kali/.config/systemd/user/default.target.wants/APPLaunch.service
-            chown -h kali:kali /home/kali/.config/systemd/user/default.target.wants/APPLaunch.service
-            user_systemctl daemon-reload
-            user_systemctl start APPLaunch.service
+        detach_from_ui_cgroup "$@"
+        switch_to_applaunch
+        ;;
+    ensure)
+        require_root "$@"
+        if czctl_is_enabled; then
+            if ! systemctl is-active --quiet czctl.service 2>/dev/null; then
+                systemctl start czctl.service 2>/dev/null || true
+            fi
+            exit 0
         fi
-        echo "Primary LCD UI set to: M5 APPLaunch"
+        if applaunch_is_enabled && [[ -x /usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch ]] && id kali >/dev/null 2>&1; then
+            ensure_kali_user_manager
+            if ! user_systemctl is-active --quiet APPLaunch.service 2>/dev/null; then
+                user_systemctl start APPLaunch.service 2>/dev/null || true
+            fi
+            exit 0
+        fi
+        echo "cz-ui-mode ensure: neither czctl nor APPLaunch enabled; restoring czctl.service" >&2
+        switch_to_czctl
         ;;
     status)
         echo "czctl.service     : $(systemctl is-active czctl.service 2>/dev/null || true) ($(systemctl is-enabled czctl.service 2>/dev/null || true))"
         if id kali >/dev/null 2>&1; then
-            uid="$(id -u kali)"
-            app_st="$(runuser -u kali -- env XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user is-active APPLaunch.service 2>/dev/null || true)"
-            echo "APPLaunch.service : ${app_st:-inactive}"
+            app_st="$(user_systemctl is-active APPLaunch.service 2>/dev/null || true)"
+            app_en="disabled"
+            applaunch_is_enabled && app_en="enabled"
+            echo "APPLaunch.service : ${app_st:-inactive} (${app_en})"
         fi
         echo "LCD DRM node      : $(ls -l /dev/dri/cardputer-zero-internal 2>/dev/null || echo missing)"
         echo "LCD fbdev node    : $(ls -l /dev/fb_lcd 2>/dev/null || echo missing)"
@@ -102,7 +290,7 @@ case "$cmd" in
         echo "Web KVM (:8899)   : $(web_kvm_summary)"
         ;;
     *)
-        echo "Usage: $0 {czctl|flipctl|applaunch|status}" >&2
+        echo "Usage: $0 {czctl|flipctl|applaunch|ensure|status}" >&2
         exit 1
         ;;
 esac

@@ -172,6 +172,15 @@ modprobe uinput 2>/dev/null || true
 ln -sfn /etc/systemd/system/czctl.service /etc/systemd/system/flipctl.service
 [[ -f /etc/systemd/system/cz-stealth.service ]] && \
     ln -sfn /etc/systemd/system/cz-stealth.service /etc/systemd/system/multi-user.target.wants/cz-stealth.service
+[[ -f /etc/systemd/system/cz-ui-ensure.service ]] && \
+    ln -sfn /etc/systemd/system/cz-ui-ensure.service /etc/systemd/system/multi-user.target.wants/cz-ui-ensure.service
+if [[ ! -L /etc/systemd/system/multi-user.target.wants/czctl.service ]] && \
+   [[ ! -L /home/kali/.config/systemd/user/default.target.wants/APPLaunch.service ]] && \
+   [[ ! -L /etc/systemd/user/default.target.wants/APPLaunch.service ]]; then
+    install -d -m 755 /etc/systemd/system/graphical.target.wants
+    ln -sfn /etc/systemd/system/czctl.service /etc/systemd/system/multi-user.target.wants/czctl.service
+    ln -sfn /etc/systemd/system/czctl.service /etc/systemd/system/graphical.target.wants/czctl.service
+fi
 sysctl --system >/dev/null 2>&1 || sysctl -qw "net.ipv4.ping_group_range=0 2147483647" 2>/dev/null || true
 if [[ -x /usr/bin/ping ]] && command -v setcap >/dev/null 2>&1; then
     setcap cap_net_raw+ep /usr/bin/ping 2>/dev/null || true
@@ -182,6 +191,7 @@ chmod 755 "$PAYLOAD/usr/share/czctl/ota-tools/postinstall.sh"
 install -m 644 "$REPO_ROOT/overlays/etc/umtprd/umtprd.conf" "$PAYLOAD/etc/umtprd/umtprd.conf"
 install -m 644 "$REPO_ROOT/overlays/systemd/czctl.service" "$PAYLOAD/etc/systemd/system/czctl.service"
 install -m 644 "$REPO_ROOT/overlays/systemd/cz-stealth.service" "$PAYLOAD/etc/systemd/system/cz-stealth.service"
+install -m 644 "$REPO_ROOT/overlays/systemd/cz-ui-ensure.service" "$PAYLOAD/etc/systemd/system/cz-ui-ensure.service"
 install -m 644 "$REPO_ROOT/overlays/systemd/72-seat-cardputer-czctl.rules" "$PAYLOAD/etc/udev/rules.d/72-seat-cardputer-czctl.rules"
 
 cat > "$PAYLOAD/etc/udev/rules.d/70-cardputerzero-peripherals.rules" <<'EOF'

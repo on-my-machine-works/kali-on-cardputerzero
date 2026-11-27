@@ -1331,11 +1331,13 @@ DOCEOF
         fi
     fi
 
-    # Install czctl.service (with Alias=flipctl.service), cz-stealth.service, and activate DEFAULT_UI
+    # Install czctl.service (with Alias=flipctl.service), cz-stealth.service, cz-ui-ensure.service, and activate DEFAULT_UI
     install -m 644 "$SCRIPT_DIR/overlays/systemd/czctl.service" "$MNT_ROOT/etc/systemd/system/czctl.service"
     install -m 644 "$SCRIPT_DIR/overlays/systemd/cz-stealth.service" "$MNT_ROOT/etc/systemd/system/cz-stealth.service"
+    install -m 644 "$SCRIPT_DIR/overlays/systemd/cz-ui-ensure.service" "$MNT_ROOT/etc/systemd/system/cz-ui-ensure.service"
     ln -sfn /etc/systemd/system/czctl.service "$MNT_ROOT/etc/systemd/system/flipctl.service"
     ln -sfn /etc/systemd/system/cz-stealth.service "$MNT_ROOT/etc/systemd/system/multi-user.target.wants/cz-stealth.service"
+    ln -sfn /etc/systemd/system/cz-ui-ensure.service "$MNT_ROOT/etc/systemd/system/multi-user.target.wants/cz-ui-ensure.service"
     install -d -m 755 "$MNT_ROOT/etc/default"
     cat > "$MNT_ROOT/etc/default/cz-stealth" <<'EOF'
 # CardputerZero Hostile-Network Stealth Mode: on | off
