@@ -11,7 +11,7 @@ Cyberdeck Edition brings together the best of three worlds: **[Kali Linux](https
 Instead of treating the 1.9" SPI screen as a secondary status display, the image boots straight into a native **`320x170` RGB565 DRM/KMS shell (`czctl`)** built with [Slint](https://github.com/slint-ui/slint). It pairs `czctl` with a built-in **`:8899` Browser Web KVM**, **12 hosted Wayland offensive and hardware apps**, a **[ProFont](https://tobiasjung.name/profont/) multi-zoom terminal (`cz-term`)**, and a **composite USB-C OTG Arsenal**, while keeping full M5Stack hardware and Cap support, optional [`APPLaunch`](https://github.com/CardputerZero/launcher) switching, and an on-demand HDMI LXDE desktop within ~118 MiB idle RAM.
 
 <p align="center">
-  <img src="docs/media/czctl-demo.gif" width="641" alt="Animated walkthrough of Kali Linux Cyberdeck Edition on CardputerZero" />
+  <img src="docs/media/czctl-demo.gif" width="662" alt="Animated walkthrough of Kali Linux Cyberdeck Edition on CardputerZero" />
 </p>
 
 <table>
